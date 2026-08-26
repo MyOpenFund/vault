@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: vault_postgres
+    environment:
+      POSTGRES_USER: docuser
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in .env — see .env.example}
+      POSTGRES_DB: documents
+    volumes:
+      - ${POSTGRES_DATA_DIR:?set it in .env — see .env.example}:/var/lib/postgresql/data
+    # No published port: Metabase and the API reach Postgres over the
+    # internal compose network. For ad-hoc psql access, use
+    # `docker compose exec postgres psql -U docuser documents`.
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U docuser -d documents
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  metabase:
+    image: metabase/metabase:latest
+    container_name: vault_metabase
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: docuser
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 3000:3000
+    volumes:
+      - ${METABASE_DATA_DIR:?set it in .env — see .env.example}:/metabase-data
+    restart: unless-stopped
+  ingestion:
+    build: ./ingestion
+    container_name: vault_ingestion
+    environment:
+      DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
+      DATA_DIR: /data
+      SWEEP_MAX_DELETE_FRACTION: ${SWEEP_MAX_DELETE_FRACTION:-0.05}
+      CORPUS: ${CORPUS:-central-bank}
+    volumes:
+      - ${MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # only the .jsonl manifests, no need for raw/
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Run on demand: `docker compose run --rm ingestion`
+    # (no restart policy, this is not a long-running service)
+  api:
+    build: ./api
+    container_name: vault_api
+    environment:
+      DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
+      RAW_DATA_DIR: /data/raw
+    volumes:
+      - ${RAW_DIR:?set it in .env — see .env.example}:/data/raw:ro   # needed to serve actual file downloads
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+networks: {}
