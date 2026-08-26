@@ -1,0 +1,8 @@
+setup.py
+vaultctl.py
+vaultctl.egg-info/PKG-INFO
+vaultctl.egg-info/SOURCES.txt
+vaultctl.egg-info/dependency_links.txt
+vaultctl.egg-info/entry_points.txt
+vaultctl.egg-info/requires.txt
+vaultctl.egg-info/top_level.txt

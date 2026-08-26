@@ -1,0 +1,2 @@
+[console_scripts]
+vaultctl = vaultctl:app

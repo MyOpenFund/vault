@@ -8,6 +8,10 @@ services:
       POSTGRES_DB: documents
     volumes:
       - ${POSTGRES_DATA_DIR:?set it in .env — see .env.example}:/var/lib/postgresql/data
+      # First-boot only (empty data dir): creates Metabase's app database —
+      # without it a fresh `compose up` leaves Metabase crash-looping on
+      # "database metabase does not exist".
+      - ./deploy/initdb:/docker-entrypoint-initdb.d:ro
     # No published port: Metabase and the API reach Postgres over the
     # internal compose network. For ad-hoc psql access, use
     # `docker compose exec postgres psql -U docuser documents`.
