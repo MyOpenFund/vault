@@ -24,6 +24,10 @@ partially synced share exposing only a subset of the manifests must
 not mass-soft-delete the corpus. Set the variable to 1.0 to force a
 legitimate large deletion wave through. The sweep only ever touches rows
 of this service's corpus.
+
+After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
+the `cadence` table as a full replace (see ingest_cadence.py for the
+transactional semantics).
 """
 
 import json
@@ -35,6 +39,7 @@ from datetime import datetime, timezone
 
 import psycopg2
 from psycopg2.extras import execute_values
+import ingest_cadence
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +126,57 @@ CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year);
 CREATE INDEX IF NOT EXISTS idx_documents_language ON documents(language);
 CREATE INDEX IF NOT EXISTS idx_documents_provenance ON documents(provenance);
 CREATE INDEX IF NOT EXISTS idx_documents_deleted_at ON documents(deleted_at);
+
+-- Facts feeding the RAG OCR policy. Filled by the orchestrator's probe pass
+-- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
+-- from the manifest upsert: manifests never carry them, and upserting them
+-- would null probed values on every nightly run.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+
+-- RAG ingestion state: current-state row per (doc_id, collection), upserted by
+-- the RAG orchestrator over plain SQL (INSERT ... ON CONFLICT DO UPDATE).
+-- Cross-model history lives in the collection dimension (one fresh collection
+-- per re-embed campaign). The vault owns this DDL; the orchestrator only needs
+-- INSERT/UPDATE/SELECT rights.
+CREATE TABLE IF NOT EXISTS rag_ingestions (
+    doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
+    collection        TEXT NOT NULL,
+    corpus            TEXT NOT NULL,
+    source_code       TEXT,
+    embedding_model   TEXT NOT NULL,
+    embedding_version TEXT,
+    chunk_count       INTEGER NOT NULL,
+    ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, collection)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
+    ON rag_ingestions(collection);
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_corpus_source
+    ON rag_ingestions(corpus, source_code);
+
+-- cadence table, owned and populated by ingest_cadence.py. Included here too
+-- so the full target schema exists after any service run's DDL train, even
+-- on a deployment with no cadence producer (e.g. a docs-only run before
+-- cadence.jsonl ever shows up). ingest_cadence.run() also issues this same
+-- CREATE TABLE IF NOT EXISTS so the module stays usable standalone; the
+-- duplication between the two is deliberate, not drift.
+CREATE TABLE IF NOT EXISTS cadence (
+    corpus            TEXT NOT NULL,
+    source_code       TEXT NOT NULL,
+    doc_type          TEXT NOT NULL,
+    last              DATE,
+    interval_days     INTEGER,
+    next_expected     DATE,
+    days_until        INTEGER,
+    status            TEXT,
+    expected_per_year INTEGER,
+    n_3y              INTEGER,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    extra             JSONB,
+    PRIMARY KEY (corpus, source_code, doc_type)
+);
 """
 
 UPSERT_SQL = """
@@ -183,8 +239,18 @@ def should_sweep(candidates, live, max_fraction):
     return candidates / live <= max_fraction
 
 
+# Files the documents scan must never treat as manifests: the cadence report
+# (ingested by ingest_cadence.py into its own table) and the cadence watchdog's
+# private state file (never enters the vault).
+EXCLUDED_BASENAMES = frozenset({"cadence.jsonl", "cadence_state.jsonl"})
+
+
 def find_jsonl_files(root):
-    return sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+    return sorted(
+        p
+        for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
+        if os.path.basename(p) not in EXCLUDED_BASENAMES
+    )
 
 
 def resolve_corpus(manifest_value, default_corpus):
@@ -263,11 +329,18 @@ def main():
         sys.exit(1)
 
     jsonl_files = find_jsonl_files(data_dir)
-    if not jsonl_files:
-        log.warning(f"No .jsonl files found under {data_dir}")
-        sys.exit(0)
+    if jsonl_files:
+        log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
+    else:
+        # No manifests this run (e.g. a deployment fed only cadence.jsonl, or
+        # a torn share sync). Do NOT exit: the DDL train and the cadence pass
+        # still need to run. The documents loop below naturally no-ops on an
+        # empty file list, total_rows stays 0, and the existing zero-rows
+        # guard further down skips the sweep — the torn-share protection is
+        # unchanged, it just now also covers "zero manifests found" rather
+        # than exiting before ever reaching it.
+        log.warning(f"No .jsonl manifest files found under {data_dir} — skipping the documents pass")
 
-    log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
     run_ts = datetime.now(timezone.utc)
     counters = {"corpus_conflict": 0}
 
@@ -334,11 +407,19 @@ def main():
                     "manifest (kept in DB with deleted_at set)"
                 )
 
-        log.info(f"Done — processed {total_rows} rows in total")
+        cadence_rows = ingest_cadence.run(conn, data_dir, default_corpus, run_ts)
+
+        log.info(
+            f"Done — processed {total_rows} document rows and "
+            f"{cadence_rows} cadence rows"
+        )
 
     except Exception:
         conn.rollback()
-        log.exception("Ingestion failed, transaction rolled back")
+        log.exception(
+            "Run failed; uncommitted work rolled back "
+            "(committed document batches are unaffected)"
+        )
         raise
     finally:
         conn.close()
