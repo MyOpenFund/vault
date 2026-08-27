@@ -29,6 +29,46 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
 
+## Schema
+
+### Table `documents`
+
+Central registry of documents across all ingested corpora. Keyed on `doc_id` (globally unique per corpus); one row per document sourced from the manifest `.jsonl` files. Columns: `doc_id` (PK), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `pdf_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB).
+
+Write contract (the ingestion service is the only writer):
+
+    INSERT INTO documents (doc_id, corpus, source_code, doc_type, ..., last_seen_at)
+    VALUES (...)
+    ON CONFLICT (doc_id) DO UPDATE SET
+        ... = EXCLUDED.?, ..., deleted_at = NULL;
+
+Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs.
+
+### Table `rag_ingestions`
+
+Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by the RAG orchestrator over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
+
+Write contract (the orchestrator is the only writer):
+
+    INSERT INTO rag_ingestions (doc_id, collection, corpus, source_code,
+        embedding_model, embedding_version, chunk_count)
+    VALUES (...)
+    ON CONFLICT (doc_id, collection) DO UPDATE SET
+        corpus = EXCLUDED.corpus, source_code = EXCLUDED.source_code,
+        embedding_model = EXCLUDED.embedding_model,
+        embedding_version = EXCLUDED.embedding_version,
+        chunk_count = EXCLUDED.chunk_count, ingested_at = now();
+
+"Documents not yet in the RAG" is the anti-join on this table; drift between the vault and Qdrant becomes a SQL query. Cross-model history lives in the collection dimension: each re-embed campaign targets a fresh collection.
+
+### Table `cadence`
+
+Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan.
+
+### Fact columns on `documents`
+
+`has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by the orchestrator's probe pass only — manifests never carry them and the manifest upsert never touches them.
+
 ## API
 
 `GET /health` · `GET /documents` (filters: corpus, source, type, dates, pagination) ·
