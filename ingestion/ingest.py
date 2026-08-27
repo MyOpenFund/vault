@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 
 import psycopg2
 from psycopg2.extras import execute_values
+import ingest_cadence
 
 logging.basicConfig(
     level=logging.INFO,
@@ -373,7 +374,12 @@ def main():
                     "manifest (kept in DB with deleted_at set)"
                 )
 
-        log.info(f"Done — processed {total_rows} rows in total")
+        cadence_rows = ingest_cadence.run(conn, data_dir, default_corpus, run_ts)
+
+        log.info(
+            f"Done — processed {total_rows} document rows and "
+            f"{cadence_rows} cadence rows"
+        )
 
     except Exception:
         conn.rollback()

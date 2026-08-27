@@ -134,3 +134,38 @@ def test_contradicting_corpus_line_is_rejected(clean_db, tmp_path, monkeypatch):
 
     rows = fetch_all(clean_db, "SELECT doc_id FROM documents")
     assert rows == [("ok1",)]
+
+
+def test_service_run_ingests_documents_and_cadence(
+    clean_db, tmp_path, monkeypatch
+):
+    import json
+
+    write_manifest(tmp_path, "us.jsonl", [make_doc("d1")])
+    (tmp_path / "cadence.jsonl").write_text(
+        json.dumps({
+            "bank_code": "us", "doc_type": "C1", "last": "2026-08-01",
+            "interval_days": 14, "next_expected": "2026-08-15",
+            "days_until": -12, "status": "overdue",
+            "expected_per_year": 26, "n_3y": 78,
+        }) + "\n"
+    )
+    # The state file must be ignored by both passes.
+    (tmp_path / "cadence_state.jsonl").write_text(
+        '{"bank_code": "us", "doc_type": "C1", "overdue": true}\n'
+    )
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS cadence")
+    conn.close()
+
+    run_ingest(monkeypatch, clean_db, tmp_path)
+
+    docs = fetch_all(clean_db, "SELECT doc_id FROM documents")
+    assert docs == [("d1",)]
+    cadence = fetch_all(
+        clean_db, "SELECT corpus, source_code, doc_type, status FROM cadence"
+    )
+    assert cadence == [("central-bank", "us", "C1", "overdue")]
