@@ -183,8 +183,18 @@ def should_sweep(candidates, live, max_fraction):
     return candidates / live <= max_fraction
 
 
+# Files the documents scan must never treat as manifests: the cadence report
+# (ingested by ingest_cadence.py into its own table) and the cadence watchdog's
+# private state file (never enters the vault).
+EXCLUDED_BASENAMES = frozenset({"cadence.jsonl", "cadence_state.jsonl"})
+
+
 def find_jsonl_files(root):
-    return sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+    return sorted(
+        p
+        for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
+        if os.path.basename(p) not in EXCLUDED_BASENAMES
+    )
 
 
 def resolve_corpus(manifest_value, default_corpus):

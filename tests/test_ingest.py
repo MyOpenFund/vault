@@ -93,3 +93,20 @@ def test_unknown_fields_go_to_extra():
 def test_empty_date_becomes_none():
     row = parse_line(make_line(date=""), "f.jsonl", 1, RUN_TS, CORPUS)
     assert row[7] is None  # date position (shifted by corpus/source_code)
+
+
+# --- documents-scan exclusion of cadence files ---------------------------
+
+def test_find_jsonl_files_excludes_cadence_files(tmp_path):
+    from ingest import find_jsonl_files
+
+    (tmp_path / "us.jsonl").write_text("{}\n")
+    (tmp_path / "cadence.jsonl").write_text("{}\n")
+    (tmp_path / "cadence_state.jsonl").write_text("{}\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "cadence.jsonl").write_text("{}\n")
+    (tmp_path / "sub" / "fr.jsonl").write_text("{}\n")
+
+    found = find_jsonl_files(str(tmp_path))
+    basenames = sorted(p.split("/")[-1] for p in found)
+    assert basenames == ["fr.jsonl", "us.jsonl"]
