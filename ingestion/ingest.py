@@ -24,6 +24,10 @@ partially synced share exposing only a subset of the manifests must
 not mass-soft-delete the corpus. Set the variable to 1.0 to force a
 legitimate large deletion wave through. The sweep only ever touches rows
 of this service's corpus.
+
+After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
+the `cadence` table as a full replace (see ingest_cadence.py for the
+transactional semantics).
 """
 
 import json
@@ -151,6 +155,28 @@ CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
     ON rag_ingestions(collection);
 CREATE INDEX IF NOT EXISTS idx_rag_ingestions_corpus_source
     ON rag_ingestions(corpus, source_code);
+
+-- cadence table, owned and populated by ingest_cadence.py. Included here too
+-- so the full target schema exists after any service run's DDL train, even
+-- on a deployment with no cadence producer (e.g. a docs-only run before
+-- cadence.jsonl ever shows up). ingest_cadence.run() also issues this same
+-- CREATE TABLE IF NOT EXISTS so the module stays usable standalone; the
+-- duplication between the two is deliberate, not drift.
+CREATE TABLE IF NOT EXISTS cadence (
+    corpus            TEXT NOT NULL,
+    source_code       TEXT NOT NULL,
+    doc_type          TEXT NOT NULL,
+    last              DATE,
+    interval_days     INTEGER,
+    next_expected     DATE,
+    days_until        INTEGER,
+    status            TEXT,
+    expected_per_year INTEGER,
+    n_3y              INTEGER,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    extra             JSONB,
+    PRIMARY KEY (corpus, source_code, doc_type)
+);
 """
 
 UPSERT_SQL = """
@@ -303,11 +329,18 @@ def main():
         sys.exit(1)
 
     jsonl_files = find_jsonl_files(data_dir)
-    if not jsonl_files:
-        log.warning(f"No .jsonl files found under {data_dir}")
-        sys.exit(0)
+    if jsonl_files:
+        log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
+    else:
+        # No manifests this run (e.g. a deployment fed only cadence.jsonl, or
+        # a torn share sync). Do NOT exit: the DDL train and the cadence pass
+        # still need to run. The documents loop below naturally no-ops on an
+        # empty file list, total_rows stays 0, and the existing zero-rows
+        # guard further down skips the sweep — the torn-share protection is
+        # unchanged, it just now also covers "zero manifests found" rather
+        # than exiting before ever reaching it.
+        log.warning(f"No .jsonl manifest files found under {data_dir} — skipping the documents pass")
 
-    log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
     run_ts = datetime.now(timezone.utc)
     counters = {"corpus_conflict": 0}
 
@@ -383,7 +416,10 @@ def main():
 
     except Exception:
         conn.rollback()
-        log.exception("Ingestion failed, transaction rolled back")
+        log.exception(
+            "Run failed; uncommitted work rolled back "
+            "(committed document batches are unaffected)"
+        )
         raise
     finally:
         conn.close()

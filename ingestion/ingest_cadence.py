@@ -19,7 +19,6 @@ vault; ingest.py excludes both basenames from the documents manifest scan.
 import json
 import logging
 import os
-from datetime import datetime, timezone
 
 from psycopg2.extras import execute_values
 
