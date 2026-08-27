@@ -33,14 +33,11 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 ### Table `documents`
 
-Central registry of documents across all ingested corpora. Keyed on `doc_id` (globally unique per corpus); one row per document sourced from the manifest `.jsonl` files. Columns: `doc_id` (PK), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `pdf_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB).
+Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); upsert key is `doc_id` (TEXT UNIQUE NOT NULL, the ON CONFLICT target). Columns: `id` (PK), `doc_id` (unique, upsert key), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `pdf_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB).
 
 Write contract (the ingestion service is the only writer):
 
-    INSERT INTO documents (doc_id, corpus, source_code, doc_type, ..., last_seen_at)
-    VALUES (...)
-    ON CONFLICT (doc_id) DO UPDATE SET
-        ... = EXCLUDED.?, ..., deleted_at = NULL;
+Every manifest column (corpus, source_code, doc_type, title, pdf_url, source_url, date, year, language, provenance, mime_type, sha256, local_path, extra) is overwritten from the manifest on upsert; deleted_at is cleared to NULL (row resurrection); id and created_at are never updated.
 
 Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs.
 
