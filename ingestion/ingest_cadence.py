@@ -94,3 +94,52 @@ def parse_cadence_line(line, source_file, line_num, run_ts, default_corpus):
         run_ts,
         json.dumps(extra) if extra else None,
     )
+
+
+def load_cadence_rows(path, run_ts, default_corpus):
+    """Parse every line of a cadence snapshot file into insert-ready rows."""
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, start=1):
+            row = parse_cadence_line(line, path, i, run_ts, default_corpus)
+            if row:
+                rows.append(row)
+    return rows
+
+
+def run(conn, data_dir, default_corpus, run_ts):
+    """Replace this corpus's cadence rows with the current snapshot.
+
+    Returns the number of rows written (0 when skipped). The DELETE and the
+    INSERTs share one transaction: a failure mid-replace rolls back to the
+    previous snapshot.
+    """
+    path = os.environ.get("CADENCE_PATH") or os.path.join(
+        data_dir, "cadence.jsonl"
+    )
+    if not os.path.exists(path):
+        log.info(f"No cadence snapshot at {path} — skipping")
+        return 0
+
+    rows = load_cadence_rows(path, run_ts, default_corpus)
+    if not rows:
+        log.warning(
+            f"{path} yielded 0 valid rows — leaving the cadence table "
+            "untouched (possible torn/partial regeneration)"
+        )
+        return 0
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(CREATE_CADENCE_SQL)
+            cur.execute(
+                "DELETE FROM cadence WHERE corpus = %s", (default_corpus,)
+            )
+            execute_values(cur, INSERT_CADENCE_SQL, rows, page_size=500)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    log.info(f"cadence: replaced snapshot with {len(rows)} row(s)")
+    return len(rows)

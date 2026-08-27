@@ -62,3 +62,23 @@ def test_corrupt_json_line_skips():
 
 def test_blank_line_skips():
     assert parse_cadence_line("   ", "cadence.jsonl", 4, RUN_TS, CORPUS) is None
+
+
+# --- file loading --------------------------------------------------------
+
+def test_load_cadence_rows_reads_all_valid_lines(tmp_path):
+    from ingest_cadence import load_cadence_rows
+
+    path = tmp_path / "cadence.jsonl"
+    path.write_text(make_line() + "\n" + make_line(bank_code="fr") + "\n")
+    rows = load_cadence_rows(str(path), RUN_TS, CORPUS)
+    assert [r[1] for r in rows] == ["us", "fr"]
+
+
+def test_load_cadence_rows_skips_bad_lines_keeps_good(tmp_path):
+    from ingest_cadence import load_cadence_rows
+
+    path = tmp_path / "cadence.jsonl"
+    path.write_text("{corrupt\n" + make_line() + "\n\n")
+    rows = load_cadence_rows(str(path), RUN_TS, CORPUS)
+    assert len(rows) == 1
