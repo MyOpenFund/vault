@@ -169,3 +169,51 @@ def test_service_run_ingests_documents_and_cadence(
         clean_db, "SELECT corpus, source_code, doc_type, status FROM cadence"
     )
     assert cadence == [("central-bank", "us", "C1", "overdue")]
+
+
+def test_zero_manifest_run_ddls_and_ingests_cadence_only(
+    clean_db, tmp_path, monkeypatch, caplog
+):
+    # DATA_DIR contains only cadence.jsonl — no manifests at all. This must
+    # not sys.exit before the DDL train and the cadence pass: only the
+    # documents-related work is skipped.
+    import json
+
+    (tmp_path / "cadence.jsonl").write_text(
+        json.dumps({
+            "bank_code": "us", "doc_type": "C1", "last": "2026-08-01",
+            "interval_days": 14, "next_expected": "2026-08-15",
+            "days_until": -12, "status": "overdue",
+            "expected_per_year": 26, "n_3y": 78,
+        }) + "\n"
+    )
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS cadence")
+    conn.close()
+
+    caplog.set_level("INFO")
+    run_ingest(monkeypatch, clean_db, tmp_path)  # must not raise / must not exit
+
+    # DDL ran: documents table exists...
+    (exists,) = fetch_all(
+        clean_db, "SELECT to_regclass('documents') IS NOT NULL"
+    )[0]
+    assert exists is True
+    # ...and is empty (no manifests were processed).
+    (doc_count,) = fetch_all(clean_db, "SELECT COUNT(*) FROM documents")[0]
+    assert doc_count == 0
+
+    cadence = fetch_all(
+        clean_db, "SELECT corpus, source_code, doc_type, status FROM cadence"
+    )
+    assert cadence == [("central-bank", "us", "C1", "overdue")]
+
+    # No sweep occurred: the zero-manifest path must skip straight past the
+    # sweep logic, never reaching the "blocked" or "soft-deleted" branches.
+    assert "skipping the documents pass" in caplog.text
+    assert "skipping the soft-delete sweep" in caplog.text
+    assert "SWEEP BLOCKED" not in caplog.text
+    assert "Soft-deleted" not in caplog.text

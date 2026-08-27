@@ -38,6 +38,28 @@ def test_source_code_field_takes_precedence_over_bank_code():
     assert row[1] == "ecb"
 
 
+def test_singleton_series_parses_with_null_optional_fields():
+    # A series with a single distinct date has no interval to compute: the
+    # producer omits interval_days/next_expected/days_until/status entirely
+    # rather than emitting them as explicit JSON nulls. A line missing these
+    # optional fields must still parse, with None in those tuple positions.
+    obj = {
+        "bank_code": "us",
+        "doc_type": "C1",
+        "last": "2026-08-01",
+        "expected_per_year": 26,
+        "n_3y": 1,
+    }
+    row = parse_cadence_line(
+        json.dumps(obj), "cadence.jsonl", 1, RUN_TS, CORPUS
+    )
+    assert row == (
+        "central-bank", "us", "C1", "2026-08-01",
+        None, None, None, None,  # interval_days, next_expected, days_until, status
+        26, 1, RUN_TS, None,
+    )
+
+
 def test_unknown_fields_go_to_extra():
     row = parse_cadence_line(
         make_line(muted=True), "cadence.jsonl", 1, RUN_TS, CORPUS
