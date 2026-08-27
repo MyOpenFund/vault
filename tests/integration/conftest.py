@@ -69,6 +69,7 @@ def clean_db(pg_url):
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS rag_ingestions")
         cur.execute("DROP TABLE IF EXISTS documents")
     conn.close()
     return pg_url

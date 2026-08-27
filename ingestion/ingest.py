@@ -121,6 +121,35 @@ CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year);
 CREATE INDEX IF NOT EXISTS idx_documents_language ON documents(language);
 CREATE INDEX IF NOT EXISTS idx_documents_provenance ON documents(provenance);
 CREATE INDEX IF NOT EXISTS idx_documents_deleted_at ON documents(deleted_at);
+
+-- Facts feeding the RAG OCR policy. Filled by the orchestrator's probe pass
+-- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
+-- from the manifest upsert: manifests never carry them, and upserting them
+-- would null probed values on every nightly run.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+
+-- RAG ingestion state: current-state row per (doc_id, collection), upserted by
+-- the RAG orchestrator over plain SQL (INSERT ... ON CONFLICT DO UPDATE).
+-- Cross-model history lives in the collection dimension (one fresh collection
+-- per re-embed campaign). The vault owns this DDL; the orchestrator only needs
+-- INSERT/UPDATE/SELECT rights.
+CREATE TABLE IF NOT EXISTS rag_ingestions (
+    doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
+    collection        TEXT NOT NULL,
+    corpus            TEXT NOT NULL,
+    source_code       TEXT,
+    embedding_model   TEXT NOT NULL,
+    embedding_version TEXT,
+    chunk_count       INTEGER NOT NULL,
+    ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, collection)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
+    ON rag_ingestions(collection);
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_corpus_source
+    ON rag_ingestions(corpus, source_code);
 """
 
 UPSERT_SQL = """
