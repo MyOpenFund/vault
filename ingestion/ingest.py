@@ -177,6 +177,26 @@ CREATE TABLE IF NOT EXISTS cadence (
     extra             JSONB,
     PRIMARY KEY (corpus, source_code, doc_type)
 );
+
+-- Run telemetry: one row per producer run (central-bank-corpus via
+-- data/runs.jsonl handoff; the RAG orchestrator writes directly). Append-only:
+-- ingestion is INSERT ... ON CONFLICT (run_id) DO NOTHING, so producer-side
+-- file rotation is always safe.
+CREATE TABLE IF NOT EXISTS runs (
+    run_id      TEXT PRIMARY KEY,
+    tool        TEXT NOT NULL,
+    command     TEXT,
+    started_at  TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    outcome     TEXT,
+    exit_code   INTEGER,
+    totals      JSONB,
+    sources     JSONB,
+    extra       JSONB,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
 """
 
 UPSERT_SQL = """
@@ -240,9 +260,10 @@ def should_sweep(candidates, live, max_fraction):
 
 
 # Files the documents scan must never treat as manifests: the cadence report
-# (ingested by ingest_cadence.py into its own table) and the cadence watchdog's
-# private state file (never enters the vault).
-EXCLUDED_BASENAMES = frozenset({"cadence.jsonl", "cadence_state.jsonl"})
+# (ingested by ingest_cadence.py into its own table), the cadence watchdog's
+# private state file (never enters the vault), and the runs telemetry report
+# (ingested by ingest_runs.py into its own table).
+EXCLUDED_BASENAMES = frozenset({"cadence.jsonl", "cadence_state.jsonl", "runs.jsonl"})
 
 
 def find_jsonl_files(root):
