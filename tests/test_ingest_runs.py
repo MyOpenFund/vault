@@ -62,3 +62,59 @@ def test_runs_jsonl_excluded_from_documents_scan(tmp_path):
     (tmp_path / "runs.jsonl").write_text("{}\n")
     found = find_jsonl_files(str(tmp_path))
     assert [f.split("/")[-1] for f in found] == ["us.jsonl"]
+
+
+# --- Type-corrupt (JSON-valid, shape-invalid) lines -------------------------
+#
+# A JSON-decodable but type-corrupt line (e.g. exit_code as a string) must
+# never reach execute_values: the batch insert would raise, roll back the
+# *whole* batch (good rows included), and since runs.jsonl is append-only,
+# the same bad line would re-poison every future ingestion cycle forever.
+
+
+def test_type_corrupt_exit_code_skips():
+    assert parse_run_line(make_line(exit_code="three"), "runs.jsonl", 1) is None
+
+
+def test_bool_exit_code_skips():
+    # bool is a subclass of int in Python; must not sneak past the int check.
+    assert parse_run_line(make_line(exit_code=True), "runs.jsonl", 1) is None
+
+
+def test_garbage_timestamp_skips():
+    assert (
+        parse_run_line(make_line(started_at="never o'clock"), "runs.jsonl", 1)
+        is None
+    )
+
+
+def test_sources_as_string_skips():
+    assert parse_run_line(make_line(sources="oops"), "runs.jsonl", 1) is None
+
+
+def test_type_corrupt_exit_code_line_skipped_good_line_kept(tmp_path):
+    p = tmp_path / "runs.jsonl"
+    p.write_text(
+        make_line(exit_code="three") + "\n" + make_line(run_id="2" * 36) + "\n"
+    )
+    rows = load_run_rows(str(p))
+    assert [r[0] for r in rows] == ["2" * 36]
+
+
+def test_garbage_timestamp_line_skipped_good_line_kept(tmp_path):
+    p = tmp_path / "runs.jsonl"
+    p.write_text(
+        make_line(started_at="never o'clock") + "\n"
+        + make_line(run_id="3" * 36) + "\n"
+    )
+    rows = load_run_rows(str(p))
+    assert [r[0] for r in rows] == ["3" * 36]
+
+
+def test_sources_as_string_line_skipped_good_line_kept(tmp_path):
+    p = tmp_path / "runs.jsonl"
+    p.write_text(
+        make_line(sources="oops") + "\n" + make_line(run_id="4" * 36) + "\n"
+    )
+    rows = load_run_rows(str(p))
+    assert [r[0] for r in rows] == ["4" * 36]

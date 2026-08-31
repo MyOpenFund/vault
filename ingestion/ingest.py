@@ -182,7 +182,12 @@ CREATE TABLE IF NOT EXISTS cadence (
 -- Run telemetry: one row per producer run (central-bank-corpus via
 -- data/runs.jsonl handoff; the RAG orchestrator writes directly). Append-only:
 -- ingestion is INSERT ... ON CONFLICT (run_id) DO NOTHING, so producer-side
--- file rotation is always safe.
+-- file rotation is always safe. Owned and populated by ingest_runs.py.
+-- Included here too so the full target schema exists after any service run's
+-- DDL train, even on a deployment with no runs producer. ingest_runs.run()
+-- also issues this same CREATE TABLE IF NOT EXISTS (index included) so the
+-- module stays usable standalone; the duplication between the two is
+-- deliberate, not drift.
 CREATE TABLE IF NOT EXISTS runs (
     run_id      TEXT PRIMARY KEY,
     tool        TEXT NOT NULL,
@@ -434,7 +439,7 @@ def main():
 
         log.info(
             f"Done — processed {total_rows} document rows, "
-            f"{cadence_rows} cadence rows, and {runs_rows} run-report rows"
+            f"{cadence_rows} cadence rows, and {runs_rows} run-report rows offered"
         )
 
     except Exception:

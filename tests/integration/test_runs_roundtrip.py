@@ -41,16 +41,8 @@ def _run(pg_url, data_dir):
 
     conn = psycopg2.connect(pg_url)
     try:
-        # DDL train normally runs in ingest.main(); create here for isolation.
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, "
-                "tool TEXT NOT NULL, command TEXT, started_at TIMESTAMPTZ, "
-                "finished_at TIMESTAMPTZ, outcome TEXT, exit_code INTEGER, "
-                "totals JSONB, sources JSONB, extra JSONB, "
-                "ingested_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-            )
-        conn.commit()
+        # ingest_runs.run() issues its own CREATE TABLE IF NOT EXISTS, so no
+        # hand-written DDL is needed here (avoids drifting from the module).
         return ingest_runs.run(conn, str(data_dir))
     finally:
         conn.close()
@@ -80,6 +72,25 @@ def test_corrupt_line_skipped_good_kept(clean_runs, tmp_path):
         fh.write(json.dumps(make_report("r2")) + "\n")
     _run(clean_runs, tmp_path)
     assert len(_rows(clean_runs, "SELECT run_id FROM runs")) == 2
+
+
+def test_type_corrupt_line_does_not_poison_the_batch(clean_runs, tmp_path):
+    # A JSON-valid but type-corrupt line (bad exit_code + garbage timestamp)
+    # must not make execute_values raise and roll back the whole batch —
+    # otherwise, since runs.jsonl is append-only, this line would poison
+    # every future ingestion cycle. The good row must land with no exception.
+    directory = tmp_path
+    directory.mkdir(parents=True, exist_ok=True)
+    bad = make_report("bad-1")
+    bad["exit_code"] = "three"
+    bad["started_at"] = "never o'clock"
+    good = make_report("good-1")
+    (directory / "runs.jsonl").write_text(
+        json.dumps(bad) + "\n" + json.dumps(good) + "\n", encoding="utf-8"
+    )
+    offered = _run(clean_runs, directory)
+    assert offered == 1
+    assert _rows(clean_runs, "SELECT run_id FROM runs") == [("good-1",)]
 
 
 def test_unknown_fields_land_in_extra(clean_runs, tmp_path):
