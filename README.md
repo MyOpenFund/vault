@@ -62,6 +62,21 @@ Write contract (the orchestrator is the only writer):
 
 Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan.
 
+### Table `runs`
+
+Run telemetry for every stack tool: one row per run, append-only
+(`INSERT ... ON CONFLICT (run_id) DO NOTHING` — producer-side file rotation is
+always safe). Columns: `run_id` (PK), `tool`, `command`, `started_at`,
+`finished_at`, `outcome` (`ok` | `degraded` | `failed`), `exit_code`,
+`totals` (JSONB), `sources` (JSONB array of per-source stats incl. the
+`truncated` flag), `extra`.
+
+Producers: `central-bank-corpus` appends `data/runs.jsonl` (ingested by this
+service, same handoff as `cadence.jsonl`); the RAG orchestrator inserts its
+row directly over its existing connection. The per-source `truncated` flag is
+the load-bearing signal: a discovery that stopped on a fetch failure says so
+explicitly instead of looking like a completed listing.
+
 ### Fact columns on `documents`
 
 `has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by the orchestrator's probe pass only — manifests never carry them and the manifest upsert never touches them.
