@@ -203,6 +203,13 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+
+-- Producer rename (2026-09-02): the RAG orchestrator's `tool` identity was
+-- renamed from 'rag-orchestrator' to 'data-orchestrator'; rows it already
+-- wrote under the old identity are relabeled so telemetry history isn't
+-- split across two `tool` values for the same producer. No-op once applied,
+-- and on any deployment that never saw the old identity.
+UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
 """
 
 UPSERT_SQL = """

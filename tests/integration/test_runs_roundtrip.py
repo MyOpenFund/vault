@@ -115,3 +115,73 @@ def test_service_run_chains_documents_cadence_runs(clean_db, tmp_path, monkeypat
     run_ingest(monkeypatch, clean_db, tmp_path)
     assert _rows(clean_db, "SELECT run_id FROM runs") == [("r1",)]
     assert _rows(clean_db, "SELECT doc_id FROM documents") == [("d1",)]
+
+
+def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
+    clean_db, tmp_path, monkeypatch
+):
+    # The RAG orchestrator was renamed to data-orchestrator (2026-09-02); rows
+    # it already wrote under the old identity must be relabeled so telemetry
+    # history isn't split across two `tool` values for the same producer.
+    # Unrelated producers (e.g. central-bank-corpus) must be left untouched.
+    from .conftest import run_ingest
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS runs")
+    conn.close()
+
+    run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO runs (run_id, tool) VALUES (%s, %s)",
+            ("legacy-1", "rag-orchestrator"),
+        )
+        cur.execute(
+            "INSERT INTO runs (run_id, tool) VALUES (%s, %s)",
+            ("cbc-1", "central-bank-corpus"),
+        )
+    conn.close()
+
+    run_ingest(monkeypatch, clean_db, tmp_path)  # train runs again: migration fires
+
+    rows = dict(_rows(clean_db, "SELECT run_id, tool FROM runs"))
+    assert rows["legacy-1"] == "data-orchestrator"
+    assert rows["cbc-1"] == "central-bank-corpus"
+
+
+def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
+    # Every service run re-executes the full DDL train, so the rename UPDATE
+    # must be safe to run repeatedly: once rows are relabeled, later runs
+    # must not touch row count or values again.
+    from .conftest import run_ingest
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS runs")
+    conn.close()
+
+    run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only
+
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO runs (run_id, tool) VALUES (%s, %s)",
+            ("legacy-1", "rag-orchestrator"),
+        )
+    conn.close()
+
+    run_ingest(monkeypatch, clean_db, tmp_path)  # first migration
+    first = _rows(clean_db, "SELECT run_id, tool FROM runs ORDER BY run_id")
+
+    run_ingest(monkeypatch, clean_db, tmp_path)  # second run: must be a no-op
+    second = _rows(clean_db, "SELECT run_id, tool FROM runs ORDER BY run_id")
+
+    assert second == first
+    assert first == [("legacy-1", "data-orchestrator")]

@@ -72,10 +72,12 @@ always safe). Columns: `run_id` (PK), `tool`, `command`, `started_at`,
 `truncated` flag), `extra`.
 
 Producers: `central-bank-corpus` appends `data/runs.jsonl` (ingested by this
-service, same handoff as `cadence.jsonl`); the RAG orchestrator inserts its
-row directly over its existing connection. The per-source `truncated` flag is
-the load-bearing signal: a discovery that stopped on a fetch failure says so
-explicitly instead of looking like a completed listing.
+service, same handoff as `cadence.jsonl`); `data-orchestrator` writes rows
+directly over SQL (`tool = "data-orchestrator"`; rows written under the
+pre-rename identity `rag-orchestrator` are renamed by the DDL train). The
+per-source `truncated` flag is the load-bearing signal: a discovery that
+stopped on a fetch failure says so explicitly instead of looking like a
+completed listing.
 
 ### Fact columns on `documents`
 
