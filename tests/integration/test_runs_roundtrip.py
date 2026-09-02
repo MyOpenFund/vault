@@ -149,9 +149,11 @@ def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
 
     run_ingest(monkeypatch, clean_db, tmp_path)  # train runs again: migration fires
 
-    rows = dict(_rows(clean_db, "SELECT run_id, tool FROM runs"))
-    assert rows["legacy-1"] == "data-orchestrator"
-    assert rows["cbc-1"] == "central-bank-corpus"
+    rows = _rows(clean_db, "SELECT run_id, tool FROM runs ORDER BY run_id")
+    assert rows == [
+        ("cbc-1", "central-bank-corpus"),
+        ("legacy-1", "data-orchestrator"),
+    ]
 
 
 def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
