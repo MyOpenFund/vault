@@ -3,8 +3,9 @@
 The API is the only public surface of the vault: everything downstream —
 dashboards, the RAG orchestrator, humans — reads the corpus through these
 routes. Its filters, its pagination and its sort allowlist are all glued to
-hand-built SQL, so the behaviours worth pinning are the ones that only show
-up once a request has travelled all the way to the database and back.
+hand-built SQL, and its download route hands out files from disk, so the
+behaviours worth pinning are the ones that only show up once a request has
+travelled all the way to the database and back.
 
 The app is pointed at the throwaway Postgres by patching `db.DATABASE_URL`
 (read inside `get_conn` on every call) rather than by mocking the driver.
@@ -53,6 +54,33 @@ def api_db(clean_db, tmp_path, monkeypatch):
     run_ingest(monkeypatch, clean_db, manifests)
 
     monkeypatch.setattr(db, "DATABASE_URL", clean_db)
+    return clean_db
+
+
+@pytest.fixture()
+def download_db(clean_db, tmp_path, monkeypatch):
+    """Corpus of engineered local_paths, plus a real RAW_DATA_DIR on disk."""
+    import db
+    import main as api_main
+
+    raw_dir = tmp_path / "raw"
+    (raw_dir / "us" / "C1" / "2010").mkdir(parents=True)
+    (raw_dir / "us" / "C1" / "2010" / "good.pdf").write_bytes(b"%PDF-1.4 fixture\n")
+
+    manifests = tmp_path / "manifests"
+    write_manifest(
+        manifests,
+        "corpus.jsonl",
+        [
+            make_doc("good", local_path="data/raw/us/C1/2010/good.pdf"),
+            make_doc("traversal", local_path="data/raw/../../etc/passwd"),
+            make_doc("absolute", local_path="/etc/passwd"),
+        ],
+    )
+    run_ingest(monkeypatch, clean_db, manifests)
+
+    monkeypatch.setattr(db, "DATABASE_URL", clean_db)
+    monkeypatch.setattr(api_main, "RAW_DATA_DIR", raw_dir.resolve())
     return clean_db
 
 
@@ -129,3 +157,32 @@ def test_stats_summary_counts_only_live_documents(api_db, client):
     assert dict(
         (item["key"], item["count"]) for item in body["by_source_code"]
     ) == {"us": 3, "fr": 1}
+
+
+@pytest.mark.parametrize("doc_id", ["traversal", "absolute"])
+def test_download_document_file_rejects_path_traversal_through_the_endpoint(
+    download_db, client, doc_id
+):
+    """A local_path that escapes RAW_DATA_DIR must be refused, not served.
+
+    local_path comes from a manifest written by an upstream corpus builder,
+    so it is untrusted input reaching a filesystem read. Both a relative
+    escape ("data/raw/../../etc/passwd") and an absolute path outside the
+    tree must stop at the guard with 400 — a 404 would mean the request was
+    resolved against the filesystem and merely missed.
+    """
+    response = client.get(f"/documents/{doc_id}/file")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid file path"
+
+
+def test_download_document_file_serves_a_file_under_the_raw_data_dir(
+    download_db, client
+):
+    """The guard must not break the happy path: a legitimate file downloads."""
+    response = client.get("/documents/good/file")
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-1.4 fixture\n"
+    assert "good.pdf" in response.headers["content-disposition"]
