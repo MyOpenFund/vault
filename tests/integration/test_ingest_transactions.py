@@ -8,12 +8,35 @@ never half-applies the deletion sweep or the cadence replace on the strength
 of a partial read of the share.
 """
 
+import json
+
 import psycopg2
 import pytest
 
 from .conftest import fetch_all, make_doc, run_ingest, write_manifest
 
 pytestmark = pytest.mark.integration
+
+
+def write_cadence(directory, status):
+    """Write a one-series cadence snapshot, the shape ingest_cadence expects."""
+    (directory / "cadence.jsonl").write_text(
+        json.dumps(
+            {
+                "bank_code": "us",
+                "doc_type": "C1",
+                "last": "2026-08-01",
+                "interval_days": 14,
+                "next_expected": "2026-08-15",
+                "days_until": -12,
+                "status": status,
+                "expected_per_year": 26,
+                "n_3y": 78,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture()
@@ -48,3 +71,42 @@ def test_ingest_main_rolls_back_and_reraises_on_mid_run_db_failure(
 
     (count,) = fetch_all(fresh_db, "SELECT COUNT(*) FROM documents")[0]
     assert count == 0
+
+
+def test_ingest_main_partial_multi_file_run_leaves_earlier_files_committed(
+    fresh_db, tmp_path, monkeypatch
+):
+    """A failing manifest keeps earlier files, and cancels the whole post-pass.
+
+    Manifests are committed one file at a time on purpose: a bad file must not
+    cost the operator the good ones. But everything that depends on having
+    seen the WHOLE share — the soft-delete sweep and the cadence full replace
+    — must not run on a partial read, or a single unreadable manifest would
+    tombstone live documents and overwrite the cadence snapshot with a torn
+    one. Here file 1 lands, file 2 dies at the DB layer, and neither the
+    sweep nor the cadence replace is allowed to happen.
+    """
+    # Run 1 — one manifest and one cadence snapshot, both committed.
+    write_manifest(tmp_path, "a_first.jsonl", [make_doc("stale1")])
+    write_cadence(tmp_path, status="overdue")
+    run_ingest(monkeypatch, fresh_db, tmp_path)
+
+    # Run 2 — stale1 has vanished from the manifests (so the sweep, whose
+    # fraction guard run_ingest disables, would tombstone it), a second
+    # manifest carries a DB-invalid date, and a newer cadence snapshot waits.
+    write_manifest(tmp_path, "a_first.jsonl", [make_doc("kept1")])
+    write_manifest(
+        tmp_path, "b_second.jsonl", [make_doc("lost1", date="not-a-date")]
+    )
+    write_cadence(tmp_path, status="on-track")
+
+    with pytest.raises(psycopg2.DataError):
+        run_ingest(monkeypatch, fresh_db, tmp_path)
+
+    rows = dict(fetch_all(fresh_db, "SELECT doc_id, deleted_at FROM documents"))
+    assert set(rows) == {"stale1", "kept1"}  # file 2's row never landed
+    assert rows["kept1"] is None  # file 1's commit survived the abort
+    assert rows["stale1"] is None  # deleted_at still NULL: the sweep never ran
+
+    cadence = fetch_all(fresh_db, "SELECT source_code, status FROM cadence")
+    assert cadence == [("us", "overdue")]  # the cadence replace never ran
