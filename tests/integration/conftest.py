@@ -100,6 +100,31 @@ def make_doc(doc_id, source="us", **overrides):
     return doc
 
 
+def make_entry(**overrides):
+    obj = {
+        "bank_code": "us",
+        "doc_type": "C1",
+        "last": "2026-08-01",
+        "interval_days": 14,
+        "next_expected": "2026-08-15",
+        "days_until": -12,
+        "status": "overdue",
+        "expected_per_year": 26,
+        "n_3y": 78,
+    }
+    obj.update(overrides)
+    return obj
+
+
+def write_cadence(directory, entries):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "cadence.jsonl"
+    path.write_text(
+        "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8"
+    )
+    return path
+
+
 def run_ingest(monkeypatch, pg_url, data_dir, corpus="central-bank", sweep="1.0"):
     import ingest
 

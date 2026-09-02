@@ -8,35 +8,19 @@ never half-applies the deletion sweep or the cadence replace on the strength
 of a partial read of the share.
 """
 
-import json
-
 import psycopg2
 import pytest
 
-from .conftest import fetch_all, make_doc, run_ingest, write_manifest
+from .conftest import (
+    fetch_all,
+    make_doc,
+    make_entry,
+    run_ingest,
+    write_cadence,
+    write_manifest,
+)
 
 pytestmark = pytest.mark.integration
-
-
-def write_cadence(directory, status):
-    """Write a one-series cadence snapshot, the shape ingest_cadence expects."""
-    (directory / "cadence.jsonl").write_text(
-        json.dumps(
-            {
-                "bank_code": "us",
-                "doc_type": "C1",
-                "last": "2026-08-01",
-                "interval_days": 14,
-                "next_expected": "2026-08-15",
-                "days_until": -12,
-                "status": status,
-                "expected_per_year": 26,
-                "n_3y": 78,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 @pytest.fixture()
@@ -51,7 +35,7 @@ def fresh_db(clean_db):
 
 
 def test_ingest_main_rolls_back_and_reraises_on_mid_run_db_failure(
-    fresh_db, tmp_path, monkeypatch
+    clean_db, tmp_path, monkeypatch
 ):
     """A DB failure mid-batch must abort the run and leave nothing behind.
 
@@ -67,9 +51,9 @@ def test_ingest_main_rolls_back_and_reraises_on_mid_run_db_failure(
     write_manifest(tmp_path, "us.jsonl", docs)
 
     with pytest.raises(psycopg2.DataError):
-        run_ingest(monkeypatch, fresh_db, tmp_path)
+        run_ingest(monkeypatch, clean_db, tmp_path)
 
-    (count,) = fetch_all(fresh_db, "SELECT COUNT(*) FROM documents")[0]
+    (count,) = fetch_all(clean_db, "SELECT COUNT(*) FROM documents")[0]
     assert count == 0
 
 
@@ -88,7 +72,7 @@ def test_ingest_main_partial_multi_file_run_leaves_earlier_files_committed(
     """
     # Run 1 — one manifest and one cadence snapshot, both committed.
     write_manifest(tmp_path, "a_first.jsonl", [make_doc("stale1")])
-    write_cadence(tmp_path, status="overdue")
+    write_cadence(tmp_path, [make_entry(status="overdue")])
     run_ingest(monkeypatch, fresh_db, tmp_path)
 
     # Run 2 — stale1 has vanished from the manifests (so the sweep, whose
@@ -98,7 +82,7 @@ def test_ingest_main_partial_multi_file_run_leaves_earlier_files_committed(
     write_manifest(
         tmp_path, "b_second.jsonl", [make_doc("lost1", date="not-a-date")]
     )
-    write_cadence(tmp_path, status="on-track")
+    write_cadence(tmp_path, [make_entry(status="on-track")])
 
     with pytest.raises(psycopg2.DataError):
         run_ingest(monkeypatch, fresh_db, tmp_path)

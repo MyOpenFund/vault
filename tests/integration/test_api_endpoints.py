@@ -67,6 +67,14 @@ def download_db(clean_db, tmp_path, monkeypatch):
     (raw_dir / "us" / "C1" / "2010").mkdir(parents=True)
     (raw_dir / "us" / "C1" / "2010" / "good.pdf").write_bytes(b"%PDF-1.4 fixture\n")
 
+    # A directory symlink INSIDE the raw tree pointing out of it: the relative
+    # path holds no ".." at all, so only resolving it against the filesystem
+    # reveals the escape.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("classified\n", encoding="utf-8")
+    (raw_dir / "link").symlink_to(outside, target_is_directory=True)
+
     manifests = tmp_path / "manifests"
     write_manifest(
         manifests,
@@ -75,6 +83,7 @@ def download_db(clean_db, tmp_path, monkeypatch):
             make_doc("good", local_path="data/raw/us/C1/2010/good.pdf"),
             make_doc("traversal", local_path="data/raw/../../etc/passwd"),
             make_doc("absolute", local_path="/etc/passwd"),
+            make_doc("symlinked", local_path="data/raw/link/secret.txt"),
         ],
     )
     run_ingest(monkeypatch, clean_db, manifests)
@@ -159,17 +168,20 @@ def test_stats_summary_counts_only_live_documents(api_db, client):
     ) == {"us": 3, "fr": 1}
 
 
-@pytest.mark.parametrize("doc_id", ["traversal", "absolute"])
+@pytest.mark.parametrize("doc_id", ["traversal", "absolute", "symlinked"])
 def test_download_document_file_rejects_path_traversal_through_the_endpoint(
     download_db, client, doc_id
 ):
     """A local_path that escapes RAW_DATA_DIR must be refused, not served.
 
     local_path comes from a manifest written by an upstream corpus builder,
-    so it is untrusted input reaching a filesystem read. Both a relative
-    escape ("data/raw/../../etc/passwd") and an absolute path outside the
-    tree must stop at the guard with 400 — a 404 would mean the request was
-    resolved against the filesystem and merely missed.
+    so it is untrusted input reaching a filesystem read. Each case must stop
+    with 400 — a 404 would mean the path had been resolved against the
+    filesystem and merely missed. The three cases fall to different guards
+    on purpose: the relative escape and the absolute path are rejected by
+    resolve_raw_relative, while the symlinked one carries no ".." and is
+    only caught by the containment check on the resolved path — the one
+    guard the other two never reach.
     """
     response = client.get(f"/documents/{doc_id}/file")
 
