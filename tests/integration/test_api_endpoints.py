@@ -85,7 +85,7 @@ def download_db(clean_db, tmp_path, monkeypatch):
 
 
 def test_list_documents_applies_filters_and_pagination(api_db, client):
-    """Filter, sort and window must be applied together, and total must ignore the window.
+    """Filter, sort and window apply together; total ignores the window.
 
     Callers page through the corpus by trusting `total` to describe the
     filtered set, not the page: an offset leaking into the count, or a filter
