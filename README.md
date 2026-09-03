@@ -43,9 +43,9 @@ Soft-delete semantics: rows absent from all manifests in a run are marked with `
 
 ### Table `rag_ingestions`
 
-Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by the RAG orchestrator over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
+Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
 
-Write contract (the orchestrator is the only writer):
+Write contract (`data-orchestrator` is the only writer):
 
     INSERT INTO rag_ingestions (doc_id, collection, corpus, source_code,
         embedding_model, embedding_version, chunk_count)
@@ -72,14 +72,16 @@ always safe). Columns: `run_id` (PK), `tool`, `command`, `started_at`,
 `truncated` flag), `extra`.
 
 Producers: `central-bank-corpus` appends `data/runs.jsonl` (ingested by this
-service, same handoff as `cadence.jsonl`); the RAG orchestrator inserts its
-row directly over its existing connection. The per-source `truncated` flag is
-the load-bearing signal: a discovery that stopped on a fetch failure says so
-explicitly instead of looking like a completed listing.
+service, same handoff as `cadence.jsonl`); `data-orchestrator` writes rows
+directly over SQL (`tool = "data-orchestrator"`; rows written under the
+pre-rename identity `rag-orchestrator` are renamed by the DDL train). The
+per-source `truncated` flag is the load-bearing signal: a discovery that
+stopped on a fetch failure says so explicitly instead of looking like a
+completed listing.
 
 ### Fact columns on `documents`
 
-`has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by the orchestrator's probe pass only — manifests never carry them and the manifest upsert never touches them.
+`has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by `data-orchestrator`'s probe pass only — manifests never carry them and the manifest upsert never touches them.
 
 ## API
 

@@ -3,7 +3,7 @@
 Ingest run-reports (data/runs.jsonl) into the `runs` table.
 
 Producers append one JSON line per run (central-bank-corpus writes the file;
-the RAG orchestrator writes the table directly). This ingester is APPEND-ONLY:
+data-orchestrator writes the table directly). This ingester is APPEND-ONLY:
 `INSERT ... ON CONFLICT (run_id) DO NOTHING`, so re-ingesting the same file is
 a no-op and file rotation on the producer side is always safe.
 

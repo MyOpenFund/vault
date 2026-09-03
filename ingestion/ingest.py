@@ -128,7 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_language ON documents(language);
 CREATE INDEX IF NOT EXISTS idx_documents_provenance ON documents(provenance);
 CREATE INDEX IF NOT EXISTS idx_documents_deleted_at ON documents(deleted_at);
 
--- Facts feeding the RAG OCR policy. Filled by the orchestrator's probe pass
+-- Facts feeding the RAG OCR policy. Filled by data-orchestrator's probe pass
 -- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
 -- from the manifest upsert: manifests never carry them, and upserting them
 -- would null probed values on every nightly run.
@@ -136,9 +136,9 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
 
 -- RAG ingestion state: current-state row per (doc_id, collection), upserted by
--- the RAG orchestrator over plain SQL (INSERT ... ON CONFLICT DO UPDATE).
+-- data-orchestrator over plain SQL (INSERT ... ON CONFLICT DO UPDATE).
 -- Cross-model history lives in the collection dimension (one fresh collection
--- per re-embed campaign). The vault owns this DDL; the orchestrator only needs
+-- per re-embed campaign). The vault owns this DDL; data-orchestrator only needs
 -- INSERT/UPDATE/SELECT rights.
 CREATE TABLE IF NOT EXISTS rag_ingestions (
     doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS cadence (
 );
 
 -- Run telemetry: one row per producer run (central-bank-corpus via
--- data/runs.jsonl handoff; the RAG orchestrator writes directly). Append-only:
+-- data/runs.jsonl handoff; data-orchestrator writes directly). Append-only:
 -- ingestion is INSERT ... ON CONFLICT (run_id) DO NOTHING, so producer-side
 -- file rotation is always safe. Owned and populated by ingest_runs.py.
 -- Included here too so the full target schema exists after any service run's
@@ -203,6 +203,13 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+
+-- Producer rename (2026-09-02): the RAG orchestrator's `tool` identity was
+-- renamed from 'rag-orchestrator' to 'data-orchestrator'; rows it already
+-- wrote under the old identity are relabeled so telemetry history isn't
+-- split across two `tool` values for the same producer. No-op once applied,
+-- and on any deployment that never saw the old identity.
+UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
 """
 
 UPSERT_SQL = """
