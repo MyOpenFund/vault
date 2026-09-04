@@ -69,8 +69,9 @@ def clean_db(pg_url):
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS rag_ingestions")
-        cur.execute("DROP TABLE IF EXISTS documents")
+        # CASCADE: the DDL train creates views over documents/runs/cadence.
+        cur.execute("DROP TABLE IF EXISTS rag_ingestions CASCADE")
+        cur.execute("DROP TABLE IF EXISTS documents CASCADE")
     conn.close()
     return pg_url
 

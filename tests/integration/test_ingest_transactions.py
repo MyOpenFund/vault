@@ -29,7 +29,7 @@ def fresh_db(clean_db):
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS cadence")
+        cur.execute("DROP TABLE IF EXISTS cadence CASCADE")
     conn.close()
     return clean_db
 

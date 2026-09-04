@@ -31,7 +31,7 @@ def clean_runs(pg_url):
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
     return pg_url
 
@@ -107,7 +107,7 @@ def test_service_run_chains_documents_cadence_runs(clean_db, tmp_path, monkeypat
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs; DROP TABLE IF EXISTS cadence;")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE; DROP TABLE IF EXISTS cadence CASCADE;")
     conn.close()
 
     write_manifest(tmp_path, "us.jsonl", [make_doc("d1")])
@@ -129,7 +129,7 @@ def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
 
     run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only
@@ -165,7 +165,7 @@ def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
 
     run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only

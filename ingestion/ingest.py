@@ -242,6 +242,71 @@ CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at)
 -- split across two `tool` values for the same producer. No-op once applied,
 -- and on any deployment that never saw the old identity.
 UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
+
+-- ---------------------------------------------------------------------------
+-- Views. Dropped and recreated on every run, in dependency order, so the
+-- train stays idempotent under schema evolution (CREATE OR REPLACE VIEW
+-- cannot drop a column). No CASCADE on purpose: an object outside this
+-- train depending on a view must fail loudly, not vanish. Rule: nothing
+-- outside the train may depend on these views (Metabase and the agent
+-- reference them by name at query time, which is fine).
+-- Forward-compat: once a view references documents, a future
+-- ALTER COLUMN ... TYPE on a referenced column must be wrapped in a
+-- drop/recreate of the views.
+DROP VIEW IF EXISTS source_health;
+DROP VIEW IF EXISTS sources_without_cadence;
+DROP VIEW IF EXISTS rag_backlog_any;
+DROP VIEW IF EXISTS rag_backlog;
+DROP VIEW IF EXISTS runs_sources;
+
+-- One row per (run, source). The base view every runs-shaped card and the
+-- agent detector build on; no time window, so consumers choose their own.
+-- Defensive casts: a producer writing a non-integer counter, an object where
+-- an array belongs, or a NULL must not make the view raise.
+CREATE VIEW runs_sources AS
+SELECT r.run_id, r.tool, r.command, r.corpus,
+       r.started_at, r.finished_at, r.outcome, r.exit_code,
+       s ->> 'source_code' AS source_code,
+       CASE WHEN s ->> 'docs_seen'    ~ '^-?[0-9]+$' THEN (s ->> 'docs_seen')::int    END AS docs_seen,
+       CASE WHEN s ->> 'docs_new'     ~ '^-?[0-9]+$' THEN (s ->> 'docs_new')::int     END AS docs_new,
+       CASE WHEN s ->> 'docs_failed'  ~ '^-?[0-9]+$' THEN (s ->> 'docs_failed')::int  END AS docs_failed,
+       CASE WHEN s ->> 'fetch_errors' ~ '^-?[0-9]+$' THEN (s ->> 'fetch_errors')::int END AS fetch_errors,
+       CASE WHEN jsonb_typeof(s -> 'truncated') = 'boolean'
+            THEN (s ->> 'truncated')::boolean ELSE FALSE END AS truncated,
+       CASE WHEN jsonb_typeof(s -> 'error_samples') = 'array'
+            THEN s -> 'error_samples' ELSE '[]'::jsonb END AS error_samples
+FROM runs r
+CROSS JOIN LATERAL jsonb_array_elements(
+    CASE WHEN jsonb_typeof(r.sources) = 'array' THEN r.sources ELSE '[]'::jsonb END
+) AS s;
+
+-- Per-collection RAG backlog: one row per (document, collection) gap. This is
+-- the campaign view -- during a re-embed, "missing" is relative to the NEW
+-- collection and presence in the old one is irrelevant. EMPTY on a database
+-- with no rag_ingestions rows (no collection to enumerate): see rag_backlog_any.
+CREATE VIEW rag_backlog AS
+WITH collections AS (SELECT DISTINCT collection FROM rag_ingestions)
+SELECT c.collection,
+       d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
+       d.local_path, d.mime_type, d.pdf_url, d.source_url,
+       d.page_count, d.has_text_layer,
+       d.updated_at AS document_updated_at
+FROM documents d
+CROSS JOIN collections c
+LEFT JOIN rag_ingestions r ON r.doc_id = d.doc_id AND r.collection = c.collection
+WHERE d.deleted_at IS NULL AND r.doc_id IS NULL;
+
+-- Absolute backlog: live documents in NO collection at all. Correct on a
+-- fresh deployment. Pair any backlog card with a live-document count:
+-- backlog 0 with documents 0 means "no data", not "done".
+CREATE VIEW rag_backlog_any AS
+SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
+       d.local_path, d.mime_type, d.pdf_url, d.source_url,
+       d.page_count, d.has_text_layer,
+       d.updated_at AS document_updated_at
+FROM documents d
+WHERE d.deleted_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r WHERE r.doc_id = d.doc_id);
 """
 
 UPSERT_SQL = """

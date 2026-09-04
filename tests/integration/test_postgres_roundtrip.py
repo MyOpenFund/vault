@@ -158,7 +158,7 @@ def test_service_run_ingests_documents_and_cadence(
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS cadence")
+        cur.execute("DROP TABLE IF EXISTS cadence CASCADE")
     conn.close()
 
     run_ingest(monkeypatch, clean_db, tmp_path)
@@ -191,7 +191,7 @@ def test_zero_manifest_run_ddls_and_ingests_cadence_only(
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS cadence")
+        cur.execute("DROP TABLE IF EXISTS cadence CASCADE")
     conn.close()
 
     caplog.set_level("INFO")
