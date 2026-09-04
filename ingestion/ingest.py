@@ -129,6 +129,28 @@ CREATE INDEX IF NOT EXISTS idx_documents_language ON documents(language);
 CREATE INDEX IF NOT EXISTS idx_documents_provenance ON documents(provenance);
 CREATE INDEX IF NOT EXISTS idx_documents_deleted_at ON documents(deleted_at);
 
+-- Live-aggregation index: the drill-down shape of the Metabase coverage
+-- cards. Partial on the deleted_at IS NULL every card carries. Measured:
+-- index-only scan, 3.2 -> 0.52 ms on a per-source aggregation at 40k rows.
+-- It does NOT help the whole-corpus rollup (97% of rows are live -> seq
+-- scan is correct).
+CREATE INDEX IF NOT EXISTS idx_documents_live_agg
+    ON documents (corpus, source_code, doc_type, year)
+    WHERE deleted_at IS NULL;
+
+-- doc_type is free text and collides across corpora (central-bank A1 = rate
+-- decision, company A1 = annual report). The corpus-scoped query must be the
+-- fast path. Unused while one corpus exists; 2x once two do.
+CREATE INDEX IF NOT EXISTS idx_documents_corpus_doc_type
+    ON documents (corpus, doc_type);
+
+-- Containment lookups into `extra` (entity_key, date_precision, ...).
+-- jsonb_path_ops: smaller and faster than the default opclass for the @>
+-- queries we issue. NOTE: it does not accelerate `extra ->> 'k' = 'v'`; the
+-- documented consumer contract is @> containment.
+CREATE INDEX IF NOT EXISTS idx_documents_extra_gin
+    ON documents USING GIN (extra jsonb_path_ops);
+
 -- Facts feeding the RAG OCR policy. Filled by data-orchestrator's probe pass
 -- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
 -- from the manifest upsert: manifests never carry them, and upserting them
