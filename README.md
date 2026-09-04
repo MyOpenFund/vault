@@ -69,7 +69,10 @@ Run telemetry for every stack tool: one row per run, append-only
 always safe). Columns: `run_id` (PK), `tool`, `command`, `started_at`,
 `finished_at`, `outcome` (`ok` | `degraded` | `failed`), `exit_code`,
 `totals` (JSONB), `sources` (JSONB array of per-source stats incl. the
-`truncated` flag), `extra`.
+`truncated` flag), `corpus`, `extra`. `corpus` is the ingesting service's
+`CORPUS` for rows arriving through `runs.jsonl` (a line carrying a
+contradicting `corpus` is rejected, not guessed); the corpus-agnostic
+`data-orchestrator` leaves it NULL.
 
 Producers: `central-bank-corpus` appends `data/runs.jsonl` (ingested by this
 service, same handoff as `cadence.jsonl`); `data-orchestrator` writes rows

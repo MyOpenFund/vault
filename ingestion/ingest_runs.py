@@ -18,11 +18,13 @@ import re
 
 from psycopg2.extras import execute_values
 
+from common import resolve_corpus
+
 log = logging.getLogger("ingest_runs")
 
 KNOWN_FIELDS = {
     "run_id", "tool", "command", "started_at", "finished_at",
-    "outcome", "exit_code", "totals", "sources",
+    "outcome", "exit_code", "totals", "sources", "corpus",
 }
 
 # Liberal ISO-8601 prefix: "YYYY-MM-DD" + ("T" or " ") + "HH:MM:SS". A prefix
@@ -80,6 +82,10 @@ def _shape_error(obj):
     if sources is not None and not isinstance(sources, list):
         return "sources must be null or an array"
 
+    corpus = obj.get("corpus")
+    if corpus is not None and not isinstance(corpus, str):
+        return "corpus must be a string or null"
+
     return None
 
 
@@ -103,18 +109,27 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+
+-- Corpus attribution (2026-09-04). Producers writing runs.jsonl into a
+-- corpus's data/ get the ingesting service's CORPUS; the data-orchestrator
+-- is corpus-agnostic and leaves it NULL. Rows ingested before the column
+-- existed carried `corpus` inside extra (unknown-field rule): backfilled.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+UPDATE runs SET corpus = extra ->> 'corpus'
+ WHERE corpus IS NULL AND extra ? 'corpus';
+CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
 """
 
 INSERT_RUNS_SQL = """
 INSERT INTO runs (
     run_id, tool, command, started_at, finished_at,
-    outcome, exit_code, totals, sources, extra
+    outcome, exit_code, totals, sources, corpus, extra
 ) VALUES %s
 ON CONFLICT (run_id) DO NOTHING
 """
 
 
-def parse_run_line(line, source_file, line_num):
+def parse_run_line(line, source_file, line_num, default_corpus, counters=None):
     line = line.strip()
     if not line:
         return None
@@ -134,6 +149,15 @@ def parse_run_line(line, source_file, line_num):
             f"Skipping invalid line ({source_file}:{line_num}): {shape_error}"
         )
         return None
+    corpus = resolve_corpus(obj.get("corpus"), default_corpus)
+    if corpus is None:
+        log.warning(
+            f"Skipping line ({source_file}:{line_num}): corpus "
+            f"{obj.get('corpus')!r} contradicts this service's {default_corpus!r}"
+        )
+        if counters is not None:
+            counters["corpus_conflict"] = counters.get("corpus_conflict", 0) + 1
+        return None
     extra = {k: v for k, v in obj.items() if k not in KNOWN_FIELDS}
     return (
         run_id,
@@ -145,27 +169,34 @@ def parse_run_line(line, source_file, line_num):
         obj.get("exit_code"),
         json.dumps(obj.get("totals")) if obj.get("totals") is not None else None,
         json.dumps(obj.get("sources")) if obj.get("sources") is not None else None,
+        corpus,
         json.dumps(extra) if extra else None,
     )
 
 
-def load_run_rows(path):
+def load_run_rows(path, default_corpus, counters=None):
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
-            row = parse_run_line(line, path, i)
+            row = parse_run_line(line, path, i, default_corpus, counters)
             if row:
                 rows.append(row)
     return rows
 
 
-def run(conn, data_dir):
+def run(conn, data_dir, default_corpus):
     """Ingest the runs file append-only. Returns rows offered (dupes are no-ops)."""
     path = os.environ.get("RUNS_PATH") or os.path.join(data_dir, "runs.jsonl")
     if not os.path.exists(path):
         log.info(f"No runs file at {path} — skipping")
         return 0
-    rows = load_run_rows(path)
+    counters = {"corpus_conflict": 0}
+    rows = load_run_rows(path, default_corpus, counters)
+    if counters["corpus_conflict"]:
+        log.warning(
+            f"runs: rejected {counters['corpus_conflict']} line(s) with a "
+            f"corpus contradicting this service's '{default_corpus}'"
+        )
     if not rows:
         return 0
     try:

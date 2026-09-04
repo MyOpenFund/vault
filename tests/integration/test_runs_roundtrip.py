@@ -43,7 +43,7 @@ def _run(pg_url, data_dir):
     try:
         # ingest_runs.run() issues its own CREATE TABLE IF NOT EXISTS, so no
         # hand-written DDL is needed here (avoids drifting from the module).
-        return ingest_runs.run(conn, str(data_dir))
+        return ingest_runs.run(conn, str(data_dir), "central-bank")
     finally:
         conn.close()
 
@@ -187,3 +187,35 @@ def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
 
     assert second == first
     assert first == [("legacy-1", "data-orchestrator")]
+
+
+def test_runs_corpus_column_and_backfill(clean_runs, tmp_path):
+    # A row ingested before the column existed carried corpus inside extra;
+    # the train promotes it. New rows get the service corpus directly.
+    conn = psycopg2.connect(clean_runs)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, tool TEXT NOT NULL, "
+            "command TEXT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, "
+            "outcome TEXT, exit_code INTEGER, totals JSONB, sources JSONB, "
+            "extra JSONB, ingested_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        cur.execute(
+            "INSERT INTO runs (run_id, tool, extra) VALUES (%s, %s, %s)",
+            ("old-1", "central-bank-corpus", json.dumps({"corpus": "central-bank", "host": "nas"})),
+        )
+    conn.close()
+    write_runs(tmp_path, [make_report("new-1")])
+    _run(clean_runs, tmp_path)
+    rows = _rows(clean_runs, "SELECT run_id, corpus, extra FROM runs ORDER BY run_id")
+    assert rows == [
+        ("new-1", "central-bank", None),
+        ("old-1", "central-bank", {"corpus": "central-bank", "host": "nas"}),
+    ]
+
+
+def test_contradicting_corpus_line_is_rejected(clean_runs, tmp_path):
+    write_runs(tmp_path, [make_report("a", corpus="company"), make_report("b")])
+    _run(clean_runs, tmp_path)
+    assert _rows(clean_runs, "SELECT run_id, corpus FROM runs") == [("b", "central-bank")]

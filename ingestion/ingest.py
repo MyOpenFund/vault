@@ -41,6 +41,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import ingest_cadence
 import ingest_runs
+from common import resolve_corpus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -204,6 +205,15 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
 
+-- Corpus attribution (2026-09-04). Producers writing runs.jsonl into a
+-- corpus's data/ get the ingesting service's CORPUS; the data-orchestrator
+-- is corpus-agnostic and leaves it NULL. Rows ingested before the column
+-- existed carried `corpus` inside extra (unknown-field rule): backfilled.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+UPDATE runs SET corpus = extra ->> 'corpus'
+ WHERE corpus IS NULL AND extra ? 'corpus';
+CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
+
 -- Producer rename (2026-09-02): the RAG orchestrator's `tool` identity was
 -- renamed from 'rag-orchestrator' to 'data-orchestrator'; rows it already
 -- wrote under the old identity are relabeled so telemetry history isn't
@@ -294,22 +304,6 @@ def find_jsonl_files(root):
         for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
         if os.path.basename(p) not in EXCLUDED_BASENAMES
     )
-
-
-def resolve_corpus(manifest_value, default_corpus):
-    """Resolve a line's corpus against the service's expectation.
-
-    Absent manifest field -> the service default applies. Present and
-    equal -> accepted (self-describing manifest; the env var acts as a
-    consistency check). Present and different -> None, meaning the line
-    must be rejected: this service is being fed another corpus's
-    manifests, and guessing would corrupt the registry.
-    """
-    if manifest_value is None:
-        return default_corpus
-    if manifest_value == default_corpus:
-        return manifest_value
-    return None
 
 
 def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
@@ -451,7 +445,7 @@ def main():
                 )
 
         cadence_rows = ingest_cadence.run(conn, data_dir, default_corpus, run_ts)
-        runs_rows = ingest_runs.run(conn, data_dir)
+        runs_rows = ingest_runs.run(conn, data_dir, default_corpus)
 
         log.info(
             f"Done — processed {total_rows} document rows, "
