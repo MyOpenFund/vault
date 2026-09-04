@@ -17,7 +17,11 @@ file yielding zero valid rows leaves the table untouched; a file that
 SHRANK below DISCOVERY_ERRORS_MIN_RETAIN_FRACTION of the rows held for this
 corpus leaves the table untouched (the producer never truncates, so a
 shrink is a torn read, not a fix — set the fraction to 0.0 to accept a
-legitimate rotation). Corrupt lines are skipped with a warning and counted.
+legitimate rotation). Corrupt lines are skipped with a warning and counted,
+including type-corrupt ones (a dict where a TEXT column expects a string):
+the file is append-only, so one unadaptable value would otherwise fail the
+service every night forever. Both tunables are read from the environment at
+call time, so a `docker compose run -e ...` override actually applies.
 """
 
 import hashlib
@@ -41,13 +45,36 @@ KNOWN_FIELDS = {
     "error_class", "http_status", "run_id", "ts",
 }
 
+# Fields that land in a TEXT column verbatim. A producer bug emitting a dict or
+# a list here would reach execute_values as an unadaptable Python object ("can't
+# adapt type 'dict'"), blow up the batch and make run() re-raise — and because
+# the trail file is append-only, that one line would fail the service every
+# night forever. They are type-checked before any row is built (`corpus` is not
+# listed: resolve_corpus already rejects anything that is not the expected
+# string, `url` has its own non-empty-string check).
+STRING_FIELDS = ("bank", "source_code", "context", "doc_type", "error_class")
+
 # "ReadTimeout: pool timed out" -> "ReadTimeout"; dotted paths allowed.
 ERROR_CLASS_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):\s")
 FINGERPRINT_FIELDS = ("corpus", "source_code", "context", "url", "error_class")
 
-# Tunables — documented defaults, overridable per deployment.
-MAX_ERROR_CHARS = int(os.environ.get("DISCOVERY_ERROR_MAX_CHARS", "2000"))
-MIN_RETAIN_FRACTION = float(os.environ.get("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION", "0.5"))
+# Tunables — documented defaults, overridable per deployment. The environment
+# is read at CALL time, never at import time: the runbook's
+# `docker compose run --rm -e DISCOVERY_ERRORS_MIN_RETAIN_FRACTION=0.0 ingestion`
+# override must reach the guard, and an import-time constant would freeze the
+# value the container started with.
+DEFAULT_MAX_ERROR_CHARS = 2000
+DEFAULT_MIN_RETAIN_FRACTION = 0.5
+
+
+def _max_error_chars():
+    return int(os.environ.get("DISCOVERY_ERROR_MAX_CHARS") or DEFAULT_MAX_ERROR_CHARS)
+
+
+def _min_retain_fraction():
+    return float(
+        os.environ.get("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION") or DEFAULT_MIN_RETAIN_FRACTION
+    )
 
 CREATE_ERRORS_SQL = """
 CREATE TABLE IF NOT EXISTS discovery_errors (
@@ -125,8 +152,12 @@ def _count(counters, key):
         counters[key] = counters.get(key, 0) + 1
 
 
-def parse_error_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
-    """One JSONL line -> one aggregation-ready record, or None (logged, counted)."""
+def parse_error_line(line, source_file, line_num, run_ts, default_corpus,
+                     counters=None, max_error_chars=None):
+    """One JSONL line -> one aggregation-ready record, or None (logged, counted).
+
+    max_error_chars defaults to DISCOVERY_ERROR_MAX_CHARS resolved at call time.
+    """
     line = line.strip()
     if not line:
         return None
@@ -145,6 +176,15 @@ def parse_error_line(line, source_file, line_num, run_ts, default_corpus, counte
         log.warning(f"Skipping line without url ({source_file}:{line_num})")
         _count(counters, "invalid_lines")
         return None
+    for field in STRING_FIELDS:
+        value = obj.get(field)
+        if value is not None and not isinstance(value, str):
+            log.warning(
+                f"Skipping line ({source_file}:{line_num}): {field} must be a "
+                f"string or null, got {type(value).__name__}"
+            )
+            _count(counters, "invalid_lines")
+            return None
     corpus = resolve_corpus(obj.get("corpus"), default_corpus)
     if corpus is None:
         log.warning(
@@ -154,11 +194,29 @@ def parse_error_line(line, source_file, line_num, run_ts, default_corpus, counte
         _count(counters, "corpus_conflict")
         return None
 
-    error_class, message = split_error(obj.get("error") if isinstance(obj.get("error"), str) else None)
+    raw_error = obj.get("error")
+    if raw_error is None or isinstance(raw_error, str):
+        error_class, message = split_error(raw_error)
+    else:
+        # A structured error (the producer switching to an object, a bare
+        # number, ...) must not collapse to "": keep it verbatim as JSON.
+        # The class stays None — it is never guessed from a non-string.
+        error_class, message = None, json.dumps(raw_error, ensure_ascii=False)
     if isinstance(obj.get("error_class"), str) and obj["error_class"]:
         error_class = obj["error_class"]
-    message = message[:MAX_ERROR_CHARS]
-    event_ts = _parse_ts(obj.get("ts"))
+    if max_error_chars is None:
+        max_error_chars = _max_error_chars()
+    message = message[:max_error_chars]
+    raw_ts = obj.get("ts")
+    event_ts = _parse_ts(raw_ts)
+    if raw_ts is not None and event_ts is None:
+        # Present but unusable. Silently treating it as absent would hide a
+        # producer regression behind a plausible-looking ingestion timestamp.
+        log.warning(
+            f"Unparseable ts {raw_ts!r} ({source_file}:{line_num}) — "
+            "falling back to ingestion time"
+        )
+        _count(counters, "bad_ts")
     http_status = obj.get("http_status")
     if isinstance(http_status, bool) or not isinstance(http_status, int):
         http_status = None
@@ -175,15 +233,33 @@ def parse_error_line(line, source_file, line_num, run_ts, default_corpus, counte
         "run_id": obj.get("run_id") if isinstance(obj.get("run_id"), str) else None,
         "event_ts": event_ts or run_ts,
         "seen_at_is_ingestion_time": event_ts is None,
+        "line_index": line_num,
         "extra": extra or None,
     }
 
 
+def _latest_key(rec):
+    """Ordering of "which record describes this fingerprint best".
+
+    (ts_present, event_ts, line_index), highest wins:
+
+    1. ts_present first, because a ts-less record's event_ts is INGESTION time
+       (now) and would otherwise beat every real producer timestamp forever.
+       At cutover — the producer starting to emit `ts` mid-file — the
+       ts-carrying lines must win over the legacy ones they follow.
+    2. event_ts among records of the same kind: the newest event wins.
+    3. line_index breaks the remaining ties, which is every tie in a fully
+       legacy file (all its records share run_ts): last line in the file wins.
+    """
+    return (not rec["seen_at_is_ingestion_time"], rec["event_ts"], rec.get("line_index", 0))
+
+
 def aggregate(records):
     """Fold the WHOLE FILE into one row per fingerprint. occurrences = count
-    in file (assigned), first_seen_at = min, last_seen_at = max; error,
-    error_class, http_status, doc_type, extra and last_run_id come from the
-    latest record, first_run_id from the earliest."""
+    in file (assigned), first_seen_at = min over all records; error,
+    error_class, http_status, doc_type, extra, last_seen_at, last_run_id and
+    seen_at_is_ingestion_time come from the latest record (see _latest_key),
+    first_run_id from the earliest."""
     folded = {}
     for rec in records:
         fp = fingerprint(*(rec[f] for f in FINGERPRINT_FIELDS))
@@ -191,13 +267,17 @@ def aggregate(records):
         if cur is None:
             folded[fp] = {**rec, "fingerprint": fp, "occurrences": 1,
                           "first_seen_at": rec["event_ts"], "last_seen_at": rec["event_ts"],
-                          "first_run_id": rec["run_id"], "last_run_id": rec["run_id"]}
+                          "first_run_id": rec["run_id"], "last_run_id": rec["run_id"],
+                          "latest_key": _latest_key(rec)}
             continue
         cur["occurrences"] += 1
         cur["first_seen_at"] = min(cur["first_seen_at"], rec["event_ts"])
-        if rec["event_ts"] >= cur["last_seen_at"]:
+        key = _latest_key(rec)
+        if key >= cur["latest_key"]:
+            cur["latest_key"] = key
             cur["last_seen_at"] = rec["event_ts"]
-            for k in ("doc_type", "error", "http_status", "extra", "seen_at_is_ingestion_time"):
+            for k in ("doc_type", "error", "http_status", "extra",
+                      "seen_at_is_ingestion_time"):
                 cur[k] = rec[k]
             cur["last_run_id"] = rec["run_id"] or cur["last_run_id"]
         if cur["first_run_id"] is None:
@@ -212,11 +292,14 @@ def aggregate(records):
     ]
 
 
-def load_error_rows(path, run_ts, default_corpus, counters=None):
+def load_error_rows(path, run_ts, default_corpus, counters=None, max_error_chars=None):
+    if max_error_chars is None:
+        max_error_chars = _max_error_chars()
     records = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f, start=1):
-            rec = parse_error_line(line, str(path), i, run_ts, default_corpus, counters)
+            rec = parse_error_line(line, str(path), i, run_ts, default_corpus,
+                                   counters, max_error_chars)
             if rec:
                 records.append(rec)
     return aggregate(records)
@@ -238,26 +321,32 @@ def run(conn, data_dir, default_corpus, run_ts):
         log.info(f"No discovery-error trail at {path} — skipping")
         return 0
     counters = {}
-    rows = load_error_rows(path, run_ts, default_corpus, counters)
+    rows = load_error_rows(path, run_ts, default_corpus, counters, _max_error_chars())
     for key, label in (("invalid_lines", "invalid"), ("corpus_conflict", "corpus-contradicting")):
         if counters.get(key):
             log.warning(f"discovery_errors: skipped {counters[key]} {label} line(s) in {path}")
+    if counters.get("bad_ts"):
+        log.warning(
+            f"discovery_errors: {counters['bad_ts']} line(s) in {path} carry an "
+            "unparseable ts — kept, with ingestion time as event time"
+        )
     if not rows:
         log.warning(
             f"{path} yielded 0 valid rows — leaving discovery_errors untouched "
             "(possible torn/partial read)"
         )
         return 0
+    min_retain_fraction = _min_retain_fraction()
     try:
         with conn.cursor() as cur:
             cur.execute(CREATE_ERRORS_SQL)
             cur.execute(HELD_ROWS_SQL, (default_corpus,))
             (held,) = cur.fetchone()
-            if not should_replace(len(rows), held, MIN_RETAIN_FRACTION):
+            if not should_replace(len(rows), held, min_retain_fraction):
                 log.warning(
                     f"discovery_errors: file holds {len(rows)} fingerprint(s) against "
                     f"{held} stored for '{default_corpus}' (below "
-                    f"DISCOVERY_ERRORS_MIN_RETAIN_FRACTION={MIN_RETAIN_FRACTION}) — "
+                    f"DISCOVERY_ERRORS_MIN_RETAIN_FRACTION={min_retain_fraction}) — "
                     "leaving the table untouched (the producer never truncates, so a "
                     "shrink is a torn read; set the fraction to 0.0 to accept a rotation)"
                 )

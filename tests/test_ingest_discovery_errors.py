@@ -65,7 +65,7 @@ def test_torn_lines_are_skipped_and_good_lines_aggregate(tmp_path):  # U9
     rows = ide.load_error_rows(p, RUN_TS, "central-bank", counters)
     assert {r[5] for r in rows} == {"https://x", "https://y"}
     fed = [r for r in rows if r[5] == "https://y"][0]
-    assert len(fed[7]) == ide.MAX_ERROR_CHARS
+    assert len(fed[7]) == ide.DEFAULT_MAX_ERROR_CHARS
     assert counters.get("invalid_lines", 0) == 5
 
 
@@ -90,7 +90,126 @@ def test_corpus_contradiction_is_rejected_and_counted():
     assert rec is None and counters["corpus_conflict"] == 1
 
 
-def test_shrink_guard(monkeypatch):  # U11 — pure decision function
+# --- Type-corrupt (JSON-valid, shape-invalid) lines -------------------------
+#
+# The trail file is append-only: a line whose `bank`/`source_code`/`context`/
+# `doc_type`/`error_class` is a dict or a list would reach execute_values as an
+# unadaptable Python object, blow up the batch, make run() re-raise and thereby
+# fail the service EVERY night forever. Reject it here instead.
+
+
+@pytest.mark.parametrize("field, value", [
+    ("bank", {"code": "ecb"}),
+    ("source_code", ["ecb"]),
+    ("context", ["listing", "index"]),
+    ("doc_type", {"t": "A1"}),
+    ("error_class", ["ReadTimeout"]),
+])
+def test_non_string_identity_field_rejects_the_line(field, value):
+    counters = {}
+    obj = {"bank": "ecb", "context": "c", "url": "https://x", "error": "A: b"}
+    obj[field] = value
+    rec = ide.parse_error_line(json.dumps(obj), "f", 1, RUN_TS, "central-bank", counters)
+    assert rec is None
+    assert counters["invalid_lines"] == 1
+
+
+def test_null_identity_fields_are_still_accepted():
+    rec = ide.parse_error_line(
+        json.dumps({"bank": None, "context": None, "doc_type": None,
+                    "url": "https://x", "error": "A: b"}),
+        "f", 1, RUN_TS, "central-bank")
+    assert rec is not None and rec["source_code"] is None and rec["context"] is None
+
+
+@pytest.mark.parametrize("bad_ts", ["yesterday", 12345, "", {"at": "now"}])
+def test_malformed_ts_is_counted_and_falls_back_to_ingestion_time(bad_ts):
+    counters = {}
+    rec = ide.parse_error_line(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://x",
+                    "error": "A: b", "ts": bad_ts}),
+        "f", 1, RUN_TS, "central-bank", counters)
+    assert rec is not None                        # the line is kept…
+    assert rec["event_ts"] == RUN_TS              # …with the honest fallback
+    assert rec["seen_at_is_ingestion_time"] is True
+    assert counters["bad_ts"] == 1
+
+
+def test_absent_ts_is_not_counted_as_malformed():
+    counters = {}
+    ide.parse_error_line(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://x", "error": "A: b"}),
+        "f", 1, RUN_TS, "central-bank", counters)
+    assert "bad_ts" not in counters
+
+
+@pytest.mark.parametrize("value", [
+    {"type": "ReadTimeout", "detail": "pool"},
+    ["ReadTimeout", "pool"],
+    503,
+])
+def test_non_string_error_is_serialised_not_dropped(value):
+    rec = ide.parse_error_line(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://x", "error": value}),
+        "f", 1, RUN_TS, "central-bank")
+    assert rec["error"] == json.dumps(value, ensure_ascii=False)
+    assert rec["error_class"] is None             # never guessed from a non-string
+
+
+def test_non_string_error_keeps_an_explicit_error_class():
+    rec = ide.parse_error_line(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://x",
+                    "error": {"detail": "pool"}, "error_class": "ReadTimeout"}),
+        "f", 1, RUN_TS, "central-bank")
+    assert rec["error_class"] == "ReadTimeout"
+
+
+# --- The "latest record" ordering rule (cutover) ----------------------------
+
+
+def _line(**over):
+    obj = {"bank": "ecb", "context": "listing", "url": "https://x", "error": "A: b"}
+    obj.update(over)
+    return json.dumps(obj) + "\n"
+
+
+def test_ts_carrying_line_beats_a_legacy_ts_less_one(tmp_path):
+    # Cutover: a ts-less line's event_ts is ingestion time (now), which would
+    # otherwise always beat a real producer timestamp from the past.
+    p = tmp_path / "discovery_errors.jsonl"
+    p.write_text(_line(error="A: legacy") + _line(error="A: with-ts", ts="2026-09-01T02:00:00+00:00"))
+    (row,) = ide.load_error_rows(p, RUN_TS, "central-bank")
+    assert row[7] == "A: with-ts"
+    assert row[13] is False                       # seen_at_is_ingestion_time
+    assert row[14] == 2                           # both lines still counted
+
+
+def test_ts_less_lines_are_broken_by_file_order(tmp_path):
+    p = tmp_path / "discovery_errors.jsonl"
+    p.write_text(_line(error="A: first") + _line(error="A: second"))
+    (row,) = ide.load_error_rows(p, RUN_TS, "central-bank")
+    assert row[7] == "A: second"
+    assert row[13] is True
+
+
+# --- Tunables are resolved at call time, never at import time ---------------
+
+
+def test_max_error_chars_is_read_from_the_environment_at_call_time(monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ERROR_MAX_CHARS", "10")
+    rec = ide.parse_error_line(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://x", "error": "A: " + "y" * 500}),
+        "f", 1, RUN_TS, "central-bank")
+    assert len(rec["error"]) == 10
+
+
+def test_min_retain_fraction_is_read_from_the_environment_at_call_time(monkeypatch):
+    assert ide._min_retain_fraction() == ide.DEFAULT_MIN_RETAIN_FRACTION
+    monkeypatch.setenv("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION", "0.0")
+    assert ide._min_retain_fraction() == 0.0
+
+
+def test_shrink_guard():  # U11 — pure decision function
     assert ide.should_replace(file_rows=1, held_rows=100, min_retain_fraction=0.5) is False
     assert ide.should_replace(file_rows=60, held_rows=100, min_retain_fraction=0.5) is True
     assert ide.should_replace(file_rows=1, held_rows=100, min_retain_fraction=0.0) is True
