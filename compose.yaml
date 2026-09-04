@@ -48,6 +48,8 @@ services:
       DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
       DATA_DIR: /data
       SWEEP_MAX_DELETE_FRACTION: ${SWEEP_MAX_DELETE_FRACTION:-0.05}
+      DISCOVERY_ERROR_MAX_CHARS: ${DISCOVERY_ERROR_MAX_CHARS:-2000}
+      DISCOVERY_ERRORS_MIN_RETAIN_FRACTION: ${DISCOVERY_ERRORS_MIN_RETAIN_FRACTION:-0.5}
       CORPUS: ${CORPUS:-central-bank}
       # Optional overrides for the three root-level producer files (default:
       # <DATA_DIR>/<name>.jsonl). Empty values fall back to the default.

@@ -45,6 +45,42 @@ def test_torn_file_never_empties_the_table(clean_db, tmp_path, monkeypatch):  # 
     run_ingest(monkeypatch, clean_db, tmp_path)          # 1 row vs 3 held -> shrink guard
     assert len(_counts(clean_db)) == 3
 
+    # A type-corrupt line (dict `bank`) beside good ones: it would reach
+    # execute_values as an unadaptable object and make the whole run raise.
+    # The run must still complete and the good rows must land.
+    shutil.copy(FIX, tmp_path / "discovery_errors.jsonl")
+    with open(tmp_path / "discovery_errors.jsonl", "a") as fh:
+        fh.write(json.dumps({"bank": {"code": "ecb"}, "context": "c",
+                             "url": "https://poison", "error": "A: b"}) + "\n")
+        fh.write(json.dumps({"bank": "fed", "context": "c", "url": "https://good",
+                             "error": {"detail": "structured"}, "ts": "yesterday"}) + "\n")
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    urls = [u for u, *_ in _counts(clean_db)]
+    assert "https://poison" not in urls
+    assert "https://good" in urls
+
+    # The shrink guard is an operator-overridable tunable, and the override
+    # only works because run() reads the environment at call time.
+    (tmp_path / "discovery_errors.jsonl").write_text(
+        json.dumps({"bank": "ecb", "context": "c", "url": "https://after-rotation", "error": "A: b"}) + "\n")
+    monkeypatch.setenv("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION", "0.0")
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    rotated = {u: o for u, o, *_ in _counts(clean_db)}
+    assert "https://after-rotation" in rotated              # the shrunken file went through
+    assert ECB_URL in rotated                               # the upsert never deletes
+
+
+def test_discovery_errors_path_override_is_honoured(clean_db, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.copy(FIX, elsewhere / "trail.jsonl")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()                                       # default location: empty
+    monkeypatch.setenv("DISCOVERY_ERRORS_PATH", str(elsewhere / "trail.jsonl"))
+    run_ingest(monkeypatch, clean_db, data_dir)
+    assert len(_counts(clean_db)) == 3
+    assert not (data_dir / "discovery_errors.jsonl").exists()
+
 
 def test_trail_beside_manifests_adds_no_documents(clean_db, tmp_path, monkeypatch):  # I16
     write_manifest(tmp_path / "manifest", "us.jsonl", [make_doc("d1")])

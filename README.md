@@ -114,9 +114,9 @@ Consumer contract:
 
 ### Migration (2026-09 substrate)
 
-Additive. Run `docker compose run --rm ingestion` once after deploying: the train adds the indexes, `runs.corpus` (+ backfill), `discovery_errors` and the views, then the documents pass refreshes `extra` (expect a large `updated_at` churn on that first run; row counts do not change). Check `/stats/summary` total, `SELECT count(*) FROM source_health` (one row per cadence series) and `SELECT count(*) FROM discovery_errors` (non-zero only if the mount reaches the corpus `data/` root). Metabase needs Admin → Databases → Sync schema to see the views.
+Additive. Run `docker compose run --rm ingestion` once after deploying: the train adds the indexes, `runs.corpus` (+ backfill), `discovery_errors` and the views, then the documents pass refreshes `extra` (on that first run `extra` is rewritten on every live row; `updated_at` moves as it does on every run; row counts do not change). Check `/stats/summary` total, `SELECT count(*) FROM source_health` (one row per cadence series) and `SELECT count(*) FROM discovery_errors` (non-zero only if the mount reaches the corpus `data/` root). Metabase needs Admin → Databases → Sync schema to see the views.
 
-Runbook: if the producer legitimately rotates (truncates) `discovery_errors.jsonl`, the retain-fraction guard above will otherwise leave the table stuck on the pre-rotation snapshot — run the ingestion once with `DISCOVERY_ERRORS_MIN_RETAIN_FRACTION=0.0` to accept the drop, then revert to the default.
+Runbook: if the producer legitimately rotates (truncates) `discovery_errors.jsonl`, the retain-fraction guard above will otherwise leave the table stuck on the pre-rotation snapshot — run `docker compose run --rm -e DISCOVERY_ERRORS_MIN_RETAIN_FRACTION=0.0 ingestion` once to accept the drop (or set the variable in `.env`), then revert to the default. The upsert never deletes: after such a run, fingerprints absent from the new file keep the `occurrences` they had before the rotation, and only the fingerprints present in it are reset to their post-rotation count.
 
 ### Fact columns on `documents`
 
