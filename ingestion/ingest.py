@@ -232,6 +232,7 @@ ON CONFLICT (doc_id) DO UPDATE SET
     mime_type = EXCLUDED.mime_type,
     sha256 = EXCLUDED.sha256,
     local_path = EXCLUDED.local_path,
+    extra = EXCLUDED.extra,
     updated_at = EXCLUDED.updated_at,
     last_seen_at = EXCLUDED.last_seen_at,
     deleted_at = NULL;

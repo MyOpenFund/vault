@@ -110,3 +110,11 @@ def test_find_jsonl_files_excludes_cadence_files(tmp_path):
     found = find_jsonl_files(str(tmp_path))
     basenames = sorted(p.split("/")[-1] for p in found)
     assert basenames == ["fr.jsonl", "us.jsonl"]
+
+
+def test_upsert_refreshes_extra_on_conflict():
+    # vault #8/#2: `extra` used to be written at first insert only. The
+    # manifest is the truth for extra exactly as for every other column.
+    from ingest import UPSERT_SQL
+    set_clause = UPSERT_SQL.split("DO UPDATE SET", 1)[1]
+    assert "extra = EXCLUDED.extra" in set_clause
