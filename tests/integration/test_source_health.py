@@ -105,6 +105,20 @@ def test_sources_without_cadence_is_loud(clean_db, tmp_path, monkeypatch):
     assert rows == [("central-bank", "gb")]
 
 
+def test_last_run_tie_is_broken_by_run_id(clean_db, tmp_path, monkeypatch):
+    # Documented contract #4: ties on finished_at are broken by run_id, so the
+    # last_run_* columns are deterministic rather than plan-dependent.
+    _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
+    finished = NOW - timedelta(hours=1)
+    for run_id in ("r-a", "r-b"):
+        _exec(clean_db,
+              "INSERT INTO runs (run_id, tool, started_at, finished_at, outcome, exit_code, sources, corpus) "
+              "VALUES (%s, 'central-bank-corpus', %s, %s, 'ok', 0, %s, 'central-bank')",
+              (run_id, finished, finished, json.dumps([_src("ecb", 10, 3)])))
+    rows = fetch_all(clean_db, "SELECT last_run_id FROM source_health")
+    assert rows == [("r-b",)]
+
+
 def test_days_late_is_null_when_days_until_is_unknown(clean_db, tmp_path, monkeypatch):
     # A cadence entry with no next_expected has no days_until, so "how late is
     # it" is unknown -- not 0. Reporting 0 would make an unmeasurable series

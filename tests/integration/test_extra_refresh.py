@@ -1,14 +1,24 @@
-import json
-
+import psycopg2
 import pytest
 
-from .conftest import fetch_all, make_doc, run_ingest, write_manifest
+from .conftest import make_doc, run_ingest, write_manifest
 
 pytestmark = pytest.mark.integration
 
 
+def _fetch(pg_url, sql, params):
+    """conftest.fetch_all takes no parameters; doc_ids belong in a bind, not
+    in an f-string."""
+    conn = psycopg2.connect(pg_url)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 def _extra(pg_url, doc_id):
-    rows = fetch_all(pg_url, f"SELECT extra FROM documents WHERE doc_id = '{doc_id}'")
+    rows = _fetch(pg_url, "SELECT extra FROM documents WHERE doc_id = %s", (doc_id,))
     assert len(rows) == 1
     return rows[0][0]
 

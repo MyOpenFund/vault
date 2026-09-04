@@ -65,10 +65,12 @@ def test_runs_sources_never_raises_on_adversarial_sources(clean_db, tmp_path, mo
     # start from an empty table to keep the assertion below exact.
     _exec(clean_db, "DELETE FROM runs")
     bad = [{"source_code": "us", "docs_seen": "many", "docs_new": 2,
+            "docs_failed": "x", "fetch_errors": 7,
             "truncated": "yes", "error_samples": "oops"}]
     _exec(clean_db, "INSERT INTO runs (run_id, tool, sources) VALUES ('r1', 't', %s)", (json.dumps(bad),))
     _exec(clean_db, "INSERT INTO runs (run_id, tool, sources) VALUES ('r2', 't', %s)", (json.dumps({"a": 1}),))
     _exec(clean_db, "INSERT INTO runs (run_id, tool, sources) VALUES ('r3', 't', NULL)")
     _exec(clean_db, "INSERT INTO runs (run_id, tool, sources) VALUES ('r4', 't', '[]')")
-    rows = fetch_all(clean_db, "SELECT run_id, source_code, docs_seen, docs_new, truncated, error_samples FROM runs_sources")
-    assert rows == [("r1", "us", None, 2, False, [])]
+    rows = fetch_all(clean_db, "SELECT run_id, source_code, docs_seen, docs_new, docs_failed, "
+                               "fetch_errors, truncated, error_samples FROM runs_sources")
+    assert rows == [("r1", "us", None, 2, None, 7, False, [])]

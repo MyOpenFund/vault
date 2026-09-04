@@ -151,3 +151,20 @@ def test_corpus_contradiction_rejects_line_and_counts():
     )
     assert row is None
     assert counters["corpus_conflict"] == 1
+
+
+def test_corpus_contradiction_without_counters_does_not_raise():
+    # counters is optional (the standalone/no-telemetry call path); the
+    # rejection branch must not assume a dict is there.
+    assert parse_run_line(
+        make_line(corpus="company"), "runs.jsonl", 1, "central-bank"
+    ) is None
+
+
+def test_non_string_corpus_is_rejected_on_shape():
+    # `corpus` reaches a TEXT column: a number would either be coerced into a
+    # nonsense corpus label or blow up the batch. Rejected before any row.
+    assert parse_run_line(make_line(corpus=42), "runs.jsonl", 1, "central-bank") is None
+    assert parse_run_line(
+        make_line(corpus={"name": "central-bank"}), "runs.jsonl", 1, "central-bank"
+    ) is None

@@ -32,7 +32,7 @@ def test_roundtrip_idempotent_then_growing(clean_db, tmp_path, monkeypatch):  # 
     run_ingest(monkeypatch, clean_db, tmp_path)
     third = {u: (o, l) for u, o, _, l in _counts(clean_db)}
     assert third[ECB_URL][0] == 5
-    assert third[ECB_URL][1] >= dict((u, l) for u, _, _, l in second)[ECB_URL]  # last_seen_at monotone
+    assert third[ECB_URL][1] > dict((u, l) for u, _, _, l in second)[ECB_URL]   # last_seen_at advances
 
 
 def test_torn_file_never_empties_the_table(clean_db, tmp_path, monkeypatch):  # I15
