@@ -112,6 +112,34 @@ def test_find_jsonl_files_excludes_cadence_files(tmp_path):
     assert basenames == ["fr.jsonl", "us.jsonl"]
 
 
+def test_find_jsonl_files_skips_every_producer_root_file(tmp_path):
+    # U2 — the seven root-level .jsonl files the producer writes beside
+    # manifest/ must never be read as document manifests, at the root AND
+    # nested (the glob is recursive).
+    from ingest import EXCLUDED_BASENAMES, find_jsonl_files
+    expected = {
+        "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
+        "discovery_errors.jsonl", "download_errors.jsonl",
+        "download_quarantine.jsonl", "wp_dates_index.jsonl",
+    }
+    assert EXCLUDED_BASENAMES == frozenset(expected)
+    (tmp_path / "nested").mkdir()
+    for name in expected:
+        (tmp_path / name).write_text("{}\n")
+        (tmp_path / "nested" / name).write_text("{}\n")
+    (tmp_path / "manifest").mkdir()
+    (tmp_path / "manifest" / "us.jsonl").write_text("{}\n")
+    found = [p.rsplit("/", 1)[1] for p in find_jsonl_files(str(tmp_path))]
+    assert found == ["us.jsonl"]
+
+
+def test_find_jsonl_files_keeps_legacy_monolithic_manifest(tmp_path):
+    # U3 — data/manifest.jsonl is the legacy single-file manifest: in scope.
+    from ingest import find_jsonl_files
+    (tmp_path / "manifest.jsonl").write_text("{}\n")
+    assert [p.rsplit("/", 1)[1] for p in find_jsonl_files(str(tmp_path))] == ["manifest.jsonl"]
+
+
 def test_upsert_refreshes_extra_on_conflict():
     # vault #8/#2: `extra` used to be written at first insert only. The
     # manifest is the truth for extra exactly as for every other column.

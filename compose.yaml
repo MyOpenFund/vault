@@ -49,8 +49,13 @@ services:
       DATA_DIR: /data
       SWEEP_MAX_DELETE_FRACTION: ${SWEEP_MAX_DELETE_FRACTION:-0.05}
       CORPUS: ${CORPUS:-central-bank}
+      # Optional overrides for the three root-level producer files (default:
+      # <DATA_DIR>/<name>.jsonl). Empty values fall back to the default.
+      CADENCE_PATH: ${CADENCE_PATH:-}
+      RUNS_PATH: ${RUNS_PATH:-}
+      DISCOVERY_ERRORS_PATH: ${DISCOVERY_ERRORS_PATH:-}
     volumes:
-      - ${MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # only the .jsonl manifests, no need for raw/
+      - ${MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # the corpus data/ root: manifest/*.jsonl plus cadence.jsonl, runs.jsonl, discovery_errors.jsonl — never raw/
     depends_on:
       postgres:
         condition: service_healthy

@@ -273,11 +273,19 @@ def should_sweep(candidates, live, max_fraction):
     return candidates / live <= max_fraction
 
 
-# Files the documents scan must never treat as manifests: the cadence report
-# (ingested by ingest_cadence.py into its own table), the cadence watchdog's
-# private state file (never enters the vault), and the runs telemetry report
-# (ingested by ingest_runs.py into its own table).
-EXCLUDED_BASENAMES = frozenset({"cadence.jsonl", "cadence_state.jsonl", "runs.jsonl"})
+# Files the documents scan must never treat as manifests. All of them are
+# written by the producer at the data/ root, beside manifest/: the cadence
+# snapshot and the watchdog's private state (ingest_cadence.py; the state
+# file never enters the vault), the runs telemetry (ingest_runs.py), the
+# discovery-error trail (ingest_discovery_errors.py), and three producer
+# audit files nothing in the vault reads yet. Mounting data/ (so cadence and
+# runs can reach the ingester) is only safe with this list complete.
+# data/manifest.jsonl — the legacy monolithic manifest — stays IN scope.
+EXCLUDED_BASENAMES = frozenset({
+    "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
+    "discovery_errors.jsonl", "download_errors.jsonl",
+    "download_quarantine.jsonl", "wp_dates_index.jsonl",
+})
 
 
 def find_jsonl_files(root):
