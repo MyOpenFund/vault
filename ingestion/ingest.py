@@ -62,6 +62,20 @@ KNOWN_FIELDS = {
 }
 
 CREATE_TABLE_SQL = """
+-- Views first. They are dropped at the HEAD of the train and recreated at its
+-- tail, in dependency order, so every ALTER below is view-safe (an
+-- ALTER COLUMN ... TYPE on a column a view reads would otherwise fail) and so
+-- the train stays idempotent under schema evolution (CREATE OR REPLACE VIEW
+-- cannot drop a column). No CASCADE on purpose: an object outside this train
+-- depending on a view must fail loudly, not vanish. Rule: nothing outside the
+-- train may depend on these views (Metabase and the agent reference them by
+-- name at query time, which is fine).
+DROP VIEW IF EXISTS source_health;
+DROP VIEW IF EXISTS sources_without_cadence;
+DROP VIEW IF EXISTS rag_backlog_any;
+DROP VIEW IF EXISTS rag_backlog;
+DROP VIEW IF EXISTS runs_sources;
+
 CREATE TABLE IF NOT EXISTS documents (
     id SERIAL PRIMARY KEY,
     doc_id TEXT UNIQUE NOT NULL,
@@ -235,8 +249,13 @@ CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
 -- is corpus-agnostic and leaves it NULL. Rows ingested before the column
 -- existed carried `corpus` inside extra (unknown-field rule): backfilled.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+-- The type guard matters: `extra ->> 'corpus'` renders a JSON number or
+-- object as text, so an unguarded backfill would promote `{"corpus": 42}`
+-- into a corpus named '42'. The value is otherwise taken as-is -- this is a
+-- one-shot legacy path, not the ingestion path, so it deliberately does not
+-- run resolve_corpus's contradiction check against the service's CORPUS.
 UPDATE runs SET corpus = extra ->> 'corpus'
- WHERE corpus IS NULL AND extra ? 'corpus';
+ WHERE corpus IS NULL AND jsonb_typeof(extra -> 'corpus') = 'string';
 CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
 
 -- Producer rename (2026-09-02): the RAG orchestrator's `tool` identity was
@@ -286,20 +305,8 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
     ON discovery_errors (last_run_id);
 
 -- ---------------------------------------------------------------------------
--- Views. Dropped and recreated on every run, in dependency order, so the
--- train stays idempotent under schema evolution (CREATE OR REPLACE VIEW
--- cannot drop a column). No CASCADE on purpose: an object outside this
--- train depending on a view must fail loudly, not vanish. Rule: nothing
--- outside the train may depend on these views (Metabase and the agent
--- reference them by name at query time, which is fine).
--- Forward-compat: once a view references documents, a future
--- ALTER COLUMN ... TYPE on a referenced column must be wrapped in a
--- drop/recreate of the views.
-DROP VIEW IF EXISTS source_health;
-DROP VIEW IF EXISTS sources_without_cadence;
-DROP VIEW IF EXISTS rag_backlog_any;
-DROP VIEW IF EXISTS rag_backlog;
-DROP VIEW IF EXISTS runs_sources;
+-- Views, recreated at the tail of the train in dependency order (they were
+-- dropped at its head, before the first ALTER — see the block above).
 
 -- One row per (run, source). The base view every runs-shaped card and the
 -- agent detector build on; no time window, so consumers choose their own.
@@ -412,7 +419,9 @@ SELECT c.corpus, c.source_code, c.doc_type,
        c.expected_per_year, c.n_3y,
        c.last                                                   AS last_document_date,
        c.next_expected, c.days_until,
-       CASE WHEN c.days_until < 0 THEN -c.days_until ELSE 0 END AS days_late,
+       CASE WHEN c.days_until < 0 THEN -c.days_until
+            WHEN c.days_until IS NULL THEN NULL
+            ELSE 0 END                                           AS days_late,
        c.status                                                 AS cadence_status,
        c.updated_at                                             AS cadence_updated_at,
        lr.run_id                                    AS last_run_id,

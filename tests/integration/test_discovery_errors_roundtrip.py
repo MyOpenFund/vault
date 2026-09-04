@@ -1,7 +1,9 @@
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg2
 import pytest
 
 from .conftest import fetch_all, make_doc, run_ingest, write_manifest
@@ -80,6 +82,23 @@ def test_discovery_errors_path_override_is_honoured(clean_db, tmp_path, monkeypa
     run_ingest(monkeypatch, clean_db, data_dir)
     assert len(_counts(clean_db)) == 3
     assert not (data_dir / "discovery_errors.jsonl").exists()
+
+
+def test_standalone_module_ddl_creates_the_indexes(clean_db, tmp_path):
+    # ingest_discovery_errors.run() must leave the same schema the ingest.py
+    # train does, indexes included — the two DDL copies are kept identical.
+    import ingest_discovery_errors as ide
+
+    shutil.copy(FIX, tmp_path / "discovery_errors.jsonl")
+    conn = psycopg2.connect(clean_db)
+    try:
+        ide.run(conn, str(tmp_path), "central-bank", datetime.now(timezone.utc))
+    finally:
+        conn.close()
+    names = {r[0] for r in fetch_all(
+        clean_db, "SELECT indexname FROM pg_indexes WHERE tablename = 'discovery_errors'")}
+    assert {"idx_discovery_errors_corpus_source", "idx_discovery_errors_open",
+            "idx_discovery_errors_last_run"} <= names
 
 
 def test_trail_beside_manifests_adds_no_documents(clean_db, tmp_path, monkeypatch):  # I16

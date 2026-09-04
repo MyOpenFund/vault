@@ -76,9 +76,13 @@ def _min_retain_fraction():
         os.environ.get("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION") or DEFAULT_MIN_RETAIN_FRACTION
     )
 
+# Discovery-failure table, owned and populated by this module. Included here
+# too (verbatim, indexes included) so this module stays usable standalone,
+# mirroring ingest.py's DDL train — the duplication between the two is
+# deliberate, not drift (see ingest_runs.py for the same pattern).
 CREATE_ERRORS_SQL = """
 CREATE TABLE IF NOT EXISTS discovery_errors (
-    fingerprint   TEXT PRIMARY KEY,
+    fingerprint   TEXT PRIMARY KEY,  -- sha256(corpus|source_code|context|url|error_class)
     corpus        TEXT NOT NULL,
     source_code   TEXT,
     doc_type      TEXT,
@@ -96,6 +100,14 @@ CREATE TABLE IF NOT EXISTS discovery_errors (
     resolved_at   TIMESTAMPTZ,
     extra         JSONB
 );
+
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_corpus_source
+    ON discovery_errors (corpus, source_code);
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
+    ON discovery_errors (corpus, source_code, last_seen_at DESC)
+    WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
+    ON discovery_errors (last_run_id);
 """
 
 UPSERT_ERRORS_SQL = """

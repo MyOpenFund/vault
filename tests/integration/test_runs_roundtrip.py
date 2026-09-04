@@ -201,17 +201,27 @@ def test_runs_corpus_column_and_backfill(clean_runs, tmp_path):
             "outcome TEXT, exit_code INTEGER, totals JSONB, sources JSONB, "
             "extra JSONB, ingested_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
-        cur.execute(
-            "INSERT INTO runs (run_id, tool, extra) VALUES (%s, %s, %s)",
-            ("old-1", "central-bank-corpus", json.dumps({"corpus": "central-bank", "host": "nas"})),
-        )
+        for run_id, extra in (
+            ("old-1", {"corpus": "central-bank", "host": "nas"}),
+            ("old-2", {"corpus": None, "host": "nas"}),      # JSON null: nothing to promote
+            ("old-3", {"corpus": 42, "host": "nas"}),        # not a string: not a corpus
+        ):
+            cur.execute(
+                "INSERT INTO runs (run_id, tool, extra) VALUES (%s, %s, %s)",
+                (run_id, "central-bank-corpus", json.dumps(extra)),
+            )
     conn.close()
     write_runs(tmp_path, [make_report("new-1")])
     _run(clean_runs, tmp_path)
-    rows = _rows(clean_runs, "SELECT run_id, corpus, extra FROM runs ORDER BY run_id")
+    rows = _rows(clean_runs, "SELECT run_id, corpus FROM runs ORDER BY run_id")
     assert rows == [
-        ("new-1", "central-bank", None),
-        ("old-1", "central-bank", {"corpus": "central-bank", "host": "nas"}),
+        ("new-1", "central-bank"),
+        ("old-1", "central-bank"),
+        ("old-2", None),
+        ("old-3", None),
+    ]
+    assert _rows(clean_runs, "SELECT extra FROM runs WHERE run_id = 'old-1'") == [
+        ({"corpus": "central-bank", "host": "nas"},)          # the backfill leaves extra alone
     ]
 
 

@@ -115,8 +115,13 @@ CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
 -- is corpus-agnostic and leaves it NULL. Rows ingested before the column
 -- existed carried `corpus` inside extra (unknown-field rule): backfilled.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+-- The type guard matters: `extra ->> 'corpus'` renders a JSON number or
+-- object as text, so an unguarded backfill would promote `{"corpus": 42}`
+-- into a corpus named '42'. The value is otherwise taken as-is -- this is a
+-- one-shot legacy path, not the ingestion path, so it deliberately does not
+-- run resolve_corpus's contradiction check against the service's CORPUS.
 UPDATE runs SET corpus = extra ->> 'corpus'
- WHERE corpus IS NULL AND extra ? 'corpus';
+ WHERE corpus IS NULL AND jsonb_typeof(extra -> 'corpus') = 'string';
 CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
 """
 

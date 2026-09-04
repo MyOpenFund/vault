@@ -105,6 +105,18 @@ def test_sources_without_cadence_is_loud(clean_db, tmp_path, monkeypatch):
     assert rows == [("central-bank", "gb")]
 
 
+def test_days_late_is_null_when_days_until_is_unknown(clean_db, tmp_path, monkeypatch):
+    # A cadence entry with no next_expected has no days_until, so "how late is
+    # it" is unknown -- not 0. Reporting 0 would make an unmeasurable series
+    # indistinguishable from an on-time one.
+    _setup(monkeypatch, clean_db, tmp_path,
+           [make_entry(bank_code="ecb", doc_type="A1", next_expected=None, days_until=None,
+                       status="unknown"),
+            make_entry(bank_code="fed", doc_type="C1", days_until=5, status="ok")])
+    rows = fetch_all(clean_db, "SELECT source_code, days_late FROM source_health ORDER BY 1")
+    assert rows == [("ecb", None), ("fed", 0)]
+
+
 def test_source_health_counts_open_discovery_errors(clean_db, tmp_path, monkeypatch):
     _setup(monkeypatch, clean_db, tmp_path,
            [make_entry(bank_code="ecb", doc_type="A1"), make_entry(bank_code="fed", doc_type="C1")])
