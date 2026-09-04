@@ -17,6 +17,13 @@ def _counts(pg_url):
     return fetch_all(pg_url, "SELECT url, occurrences, first_seen_at, last_seen_at FROM discovery_errors ORDER BY url")
 
 
+def _stamps(pg_url):
+    return {u: (f, l, flag) for u, f, l, flag in fetch_all(
+        pg_url,
+        "SELECT url, first_seen_at, last_seen_at, seen_at_is_ingestion_time "
+        "FROM discovery_errors ORDER BY url")}
+
+
 def test_roundtrip_idempotent_then_growing(clean_db, tmp_path, monkeypatch):  # I14
     shutil.copy(FIX, tmp_path / "discovery_errors.jsonl")
     run_ingest(monkeypatch, clean_db, tmp_path)
@@ -33,6 +40,42 @@ def test_roundtrip_idempotent_then_growing(clean_db, tmp_path, monkeypatch):  # 
     third = {u: (o, l) for u, o, _, l in _counts(clean_db)}
     assert third[ECB_URL][0] == 5
     assert third[ECB_URL][1] > dict((u, l) for u, _, _, l in second)[ECB_URL]   # last_seen_at advances
+
+
+def test_ts_cutover_backwards_never_labels_ingestion_time_as_producer_time(
+        clean_db, tmp_path, monkeypatch):
+    """The producer starts stamping `ts` and rewrites the lines already on
+    disk with a stamp EARLIER than the ingestion time we had stored for them
+    (its clock is behind, or the events really are older than the night we
+    first read them). The stored stamp and its flag must move together: a
+    producer stamp outranks an ingestion-time fallback whatever their values,
+    so last_seen_at moves BACKWARDS once — a correction, not a regression —
+    and must never end up as the old fallback labelled as producer time."""
+    trail = tmp_path / "discovery_errors.jsonl"
+    lines = [{"bank": "ecb", "context": "listing", "url": ECB_URL, "error": "ReadTimeout: pool"},
+             {"bank": "fed", "context": "listing", "url": "https://fed/x", "error": "HTTPError: 503"}]
+    legacy = "".join(json.dumps(o) + "\n" for o in lines)
+
+    trail.write_text(legacy)                                   # 1. no `ts`: fallback stamps
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    first = _stamps(clean_db)
+    t1 = first[ECB_URL][1]
+    assert all(flag is True for _, _, flag in first.values())
+
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)              # 2. same lines, earlier `ts`
+    assert ts < t1
+    trail.write_text("".join(
+        json.dumps({**o, "ts": "2026-01-01T00:00:00+00:00"}) + "\n" for o in lines))
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    stamped = _stamps(clean_db)
+    assert len(stamped) == len(first)                           # no shrink, same fingerprints
+    for url, (first_seen, last_seen, flag) in stamped.items():
+        assert (last_seen, flag) == (ts, False), url            # never (t1, False)
+        assert first_seen == ts, url
+
+    trail.write_text(legacy)                                    # 3. legacy again: fallback loses
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    assert _stamps(clean_db) == stamped
 
 
 def test_torn_file_never_empties_the_table(clean_db, tmp_path, monkeypatch):  # I15

@@ -68,7 +68,18 @@ DEFAULT_MIN_RETAIN_FRACTION = 0.5
 
 
 def _max_error_chars():
-    return int(os.environ.get("DISCOVERY_ERROR_MAX_CHARS") or DEFAULT_MAX_ERROR_CHARS)
+    # Floored at 1: a truncation tunable must never be able to blank the column
+    # it truncates (DISCOVERY_ERROR_MAX_CHARS=0 would empty every message, and
+    # the trail is the only record of what failed). A non-numeric value is
+    # still a hard error — a typo must not silently fall back to the default —
+    # but the message names the variable so the operator knows what to fix.
+    value = os.environ.get("DISCOVERY_ERROR_MAX_CHARS") or DEFAULT_MAX_ERROR_CHARS
+    try:
+        return max(1, int(value))
+    except ValueError:
+        raise ValueError(
+            f"DISCOVERY_ERROR_MAX_CHARS must be an integer, got {value!r}"
+        ) from None
 
 
 def _min_retain_fraction():
@@ -123,8 +134,20 @@ ON CONFLICT (fingerprint) DO UPDATE SET
     first_run_id  = coalesce(discovery_errors.first_run_id, EXCLUDED.first_run_id),
     last_run_id   = coalesce(EXCLUDED.last_run_id, discovery_errors.last_run_id),
     first_seen_at = LEAST(discovery_errors.first_seen_at, EXCLUDED.first_seen_at),
-    last_seen_at  = GREATEST(discovery_errors.last_seen_at, EXCLUDED.last_seen_at),
-    seen_at_is_ingestion_time = EXCLUDED.seen_at_is_ingestion_time,
+    -- (last_seen_at, seen_at_is_ingestion_time) MOVE TOGETHER, ranked by the
+    -- same key as the Python _latest_key: `NOT flag` is "has a producer
+    -- stamp", so a producer stamp beats an ingestion-time fallback whatever
+    -- the two values are, and otherwise the later stamp wins (Postgres row
+    -- comparison, left to right). Taking the max of each column separately
+    -- would keep a fallback stamp while flipping the flag to FALSE — an
+    -- ingestion time labelled as producer time. Consequence: last_seen_at may
+    -- move BACKWARDS exactly once, fallback -> real ts, which is a correction.
+    last_seen_at = CASE WHEN (NOT EXCLUDED.seen_at_is_ingestion_time, EXCLUDED.last_seen_at)
+                          >= (NOT discovery_errors.seen_at_is_ingestion_time, discovery_errors.last_seen_at)
+                   THEN EXCLUDED.last_seen_at ELSE discovery_errors.last_seen_at END,
+    seen_at_is_ingestion_time = CASE WHEN (NOT EXCLUDED.seen_at_is_ingestion_time, EXCLUDED.last_seen_at)
+                          >= (NOT discovery_errors.seen_at_is_ingestion_time, discovery_errors.last_seen_at)
+                   THEN EXCLUDED.seen_at_is_ingestion_time ELSE discovery_errors.seen_at_is_ingestion_time END,
     occurrences   = EXCLUDED.occurrences,
     extra         = EXCLUDED.extra
 """

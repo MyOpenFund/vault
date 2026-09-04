@@ -203,6 +203,21 @@ def test_max_error_chars_is_read_from_the_environment_at_call_time(monkeypatch):
     assert len(rec["error"]) == 10
 
 
+def test_max_error_chars_has_a_floor_of_one(monkeypatch):
+    # 0 (or a negative) would blank EVERY message — a truncation tunable must
+    # never be able to destroy the column it truncates.
+    monkeypatch.setenv("DISCOVERY_ERROR_MAX_CHARS", "0")
+    assert ide._max_error_chars() == 1
+    monkeypatch.setenv("DISCOVERY_ERROR_MAX_CHARS", "-5")
+    assert ide._max_error_chars() == 1
+
+
+def test_max_error_chars_rejects_a_non_numeric_value_by_name(monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ERROR_MAX_CHARS", "lots")
+    with pytest.raises(ValueError, match=r"DISCOVERY_ERROR_MAX_CHARS must be an integer, got 'lots'"):
+        ide._max_error_chars()
+
+
 def test_min_retain_fraction_is_read_from_the_environment_at_call_time(monkeypatch):
     assert ide._min_retain_fraction() == ide.DEFAULT_MIN_RETAIN_FRACTION
     monkeypatch.setenv("DISCOVERY_ERRORS_MIN_RETAIN_FRACTION", "0.0")
