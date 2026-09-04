@@ -72,6 +72,7 @@ def clean_db(pg_url):
         # CASCADE: the DDL train creates views over documents/runs/cadence.
         cur.execute("DROP TABLE IF EXISTS rag_ingestions CASCADE")
         cur.execute("DROP TABLE IF EXISTS documents CASCADE")
+        cur.execute("DROP TABLE IF EXISTS discovery_errors CASCADE")
     conn.close()
     return pg_url
 

@@ -243,6 +243,45 @@ CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at)
 -- and on any deployment that never saw the old identity.
 UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
 
+-- Discovery failures, ingested from the producer's data/discovery_errors.jsonl
+-- by ingest_discovery_errors.py. The producer's file is append-only and is
+-- never truncated, so it is a FULL HISTORY snapshot: the ingester aggregates
+-- per fingerprint and ASSIGNS occurrences (never increments), which is what
+-- makes re-ingestion idempotent.
+--
+-- The nullable columns (doc_type, error_class, http_status, first/last_run_id)
+-- are filled the moment the producer emits them; until then
+-- seen_at_is_ingestion_time stays TRUE and last_seen_at is an approximation.
+-- resolved_at is NOT populated today: an unrotated file means a fixed URL's
+-- old lines never disappear, so "not seen this run" is never true.
+CREATE TABLE IF NOT EXISTS discovery_errors (
+    fingerprint   TEXT PRIMARY KEY,  -- sha256(corpus|source_code|context|url|error_class)
+    corpus        TEXT NOT NULL,
+    source_code   TEXT,
+    doc_type      TEXT,
+    context       TEXT,
+    url           TEXT,
+    error_class   TEXT,
+    error         TEXT,
+    http_status   INTEGER,
+    first_run_id  TEXT,
+    last_run_id   TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at  TIMESTAMPTZ NOT NULL,
+    seen_at_is_ingestion_time BOOLEAN NOT NULL DEFAULT TRUE,
+    occurrences   INTEGER NOT NULL DEFAULT 1,
+    resolved_at   TIMESTAMPTZ,
+    extra         JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_corpus_source
+    ON discovery_errors (corpus, source_code);
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
+    ON discovery_errors (corpus, source_code, last_seen_at DESC)
+    WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
+    ON discovery_errors (last_run_id);
+
 -- ---------------------------------------------------------------------------
 -- Views. Dropped and recreated on every run, in dependency order, so the
 -- train stays idempotent under schema evolution (CREATE OR REPLACE VIEW
@@ -354,7 +393,16 @@ last_run AS (
            corpus, source_code, run_id, finished_at, outcome, truncated
     FROM runs_sources
     WHERE finished_at IS NOT NULL
-    ORDER BY corpus, source_code, finished_at DESC
+    ORDER BY corpus, source_code, finished_at DESC, run_id DESC
+),
+open_errors AS (
+    SELECT corpus, source_code,
+           count(*)          AS open_discovery_errors,
+           sum(occurrences)  AS open_discovery_attempts,
+           max(last_seen_at) AS last_discovery_error_at
+    FROM discovery_errors
+    WHERE resolved_at IS NULL
+    GROUP BY 1, 2
 )
 SELECT c.corpus, c.source_code, c.doc_type,
        c.interval_days                                          AS expected_interval_days,
@@ -376,11 +424,15 @@ SELECT c.corpus, c.source_code, c.doc_type,
        coalesce(o.docs_seen_7d, 0)                  AS source_docs_seen_7d,
        coalesce(o.fetch_errors_7d, 0)               AS source_fetch_errors_7d,
        coalesce(b.runs_90d, 0)                      AS source_runs_90d,
-       b.docs_new_median_per_run_90d                AS source_docs_new_median_per_run_90d
+       b.docs_new_median_per_run_90d                AS source_docs_new_median_per_run_90d,
+       coalesce(e.open_discovery_errors, 0)         AS source_open_discovery_errors,
+       coalesce(e.open_discovery_attempts, 0)       AS source_open_discovery_attempts,
+       e.last_discovery_error_at                    AS source_last_discovery_error_at
 FROM cadence c
 LEFT JOIN obs_7d     o  ON o.corpus  = c.corpus AND o.source_code  = c.source_code
 LEFT JOIN base_90d   b  ON b.corpus  = c.corpus AND b.source_code  = c.source_code
-LEFT JOIN last_run   lr ON lr.corpus = c.corpus AND lr.source_code = c.source_code;
+LEFT JOIN last_run   lr ON lr.corpus = c.corpus AND lr.source_code = c.source_code
+LEFT JOIN open_errors e ON e.corpus  = c.corpus AND e.source_code  = c.source_code;
 """
 
 UPSERT_SQL = """

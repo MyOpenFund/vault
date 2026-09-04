@@ -103,3 +103,18 @@ def test_sources_without_cadence_is_loud(clean_db, tmp_path, monkeypatch):
     assert fetch_all(clean_db, "SELECT count(*) FROM source_health WHERE source_code = 'gb'")[0][0] == 0
     rows = fetch_all(clean_db, "SELECT corpus, source_code FROM sources_without_cadence")
     assert rows == [("central-bank", "gb")]
+
+
+def test_source_health_counts_open_discovery_errors(clean_db, tmp_path, monkeypatch):
+    _setup(monkeypatch, clean_db, tmp_path,
+           [make_entry(bank_code="ecb", doc_type="A1"), make_entry(bank_code="fed", doc_type="C1")])
+    _exec(clean_db,
+          "INSERT INTO discovery_errors (fingerprint, corpus, source_code, context, url, error, "
+          "first_seen_at, last_seen_at, occurrences) VALUES "
+          "('f1', 'central-bank', 'ecb', 'listing', 'https://x/a', 'ReadTimeout: x', now(), now(), 4), "
+          "('f2', 'central-bank', 'ecb', 'listing', 'https://x/b', 'HTTPError: 503', now(), now(), 1), "
+          "('f3', 'central-bank', 'fed', 'listing', 'https://y', 'x', now(), now(), 1)")
+    _exec(clean_db, "UPDATE discovery_errors SET resolved_at = now() WHERE fingerprint = 'f3'")
+    rows = fetch_all(clean_db, "SELECT source_code, source_open_discovery_errors, source_open_discovery_attempts "
+                               "FROM source_health ORDER BY 1")
+    assert rows == [("ecb", 2, 5), ("fed", 0, 0)]

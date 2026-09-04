@@ -9,6 +9,9 @@ EXPECTED_INDEXES = {
     "idx_documents_corpus_doc_type",
     "idx_documents_extra_gin",
     "idx_runs_corpus_finished",
+    "idx_discovery_errors_corpus_source",
+    "idx_discovery_errors_open",
+    "idx_discovery_errors_last_run",
 }
 
 EXPECTED_VIEWS = {
@@ -33,3 +36,9 @@ def test_views_exist_and_train_is_idempotent(clean_db, tmp_path, monkeypatch):
         run_ingest(monkeypatch, clean_db, tmp_path)
     names = _names(clean_db, "SELECT table_name FROM information_schema.views WHERE table_schema = current_schema()")
     assert EXPECTED_VIEWS <= names
+
+
+def test_discovery_errors_table_exists(clean_db, tmp_path, monkeypatch):
+    run_ingest(monkeypatch, clean_db, tmp_path)  # empty data dir: DDL only
+    names = _names(clean_db, "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()")
+    assert "discovery_errors" in names
