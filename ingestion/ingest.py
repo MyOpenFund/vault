@@ -27,7 +27,9 @@ of this service's corpus.
 
 After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
 the `cadence` table as a full replace (see ingest_cadence.py for the
-transactional semantics).
+transactional semantics), DATA_DIR/runs.jsonl append-only into `runs`
+(ingest_runs.py), and DATA_DIR/discovery_errors.jsonl into `discovery_errors`
+as a fingerprint-keyed snapshot upsert (ingest_discovery_errors.py).
 """
 
 import json
@@ -40,6 +42,7 @@ from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values
 import ingest_cadence
+import ingest_discovery_errors
 import ingest_runs
 from common import resolve_corpus
 
@@ -659,10 +662,14 @@ def main():
 
         cadence_rows = ingest_cadence.run(conn, data_dir, default_corpus, run_ts)
         runs_rows = ingest_runs.run(conn, data_dir, default_corpus)
+        errors_rows = ingest_discovery_errors.run(
+            conn, data_dir, default_corpus, run_ts
+        )
 
         log.info(
             f"Done — processed {total_rows} document rows, "
-            f"{cadence_rows} cadence rows, and {runs_rows} run-report rows offered"
+            f"{cadence_rows} cadence rows, {runs_rows} run-report rows offered, "
+            f"and {errors_rows} discovery-error fingerprints"
         )
 
     except Exception:
