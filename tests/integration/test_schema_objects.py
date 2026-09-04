@@ -11,7 +11,10 @@ EXPECTED_INDEXES = {
     "idx_runs_corpus_finished",
 }
 
-EXPECTED_VIEWS = {"runs_sources", "rag_backlog", "rag_backlog_any"}
+EXPECTED_VIEWS = {
+    "runs_sources", "rag_backlog", "rag_backlog_any",
+    "sources_without_cadence", "source_health",
+}
 
 
 def _names(pg_url, sql):

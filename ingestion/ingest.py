@@ -307,6 +307,80 @@ SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
 FROM documents d
 WHERE d.deleted_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM rag_ingestions r WHERE r.doc_id = d.doc_id);
+
+-- Sources that produce runs but have no cadence expectation. Empty is
+-- healthy; a non-empty result means source_health cannot see part of the
+-- pipeline (it is built FROM cadence).
+CREATE VIEW sources_without_cadence AS
+SELECT rs.corpus, rs.source_code, max(rs.finished_at) AS last_run_at
+FROM runs_sources rs
+WHERE rs.corpus IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM cadence c
+                   WHERE c.corpus = rs.corpus AND c.source_code = rs.source_code)
+GROUP BY 1, 2;
+
+-- Expected (cadence) x observed (runs) per series.
+-- Grain: (corpus, source_code, doc_type) -- the cadence grain.
+-- Every source_* column is SOURCE-grain (runs.sources carries no doc_type)
+-- and is therefore repeated identically across a source's doc_type rows.
+-- last_run_outcome is RUN-grain: a run is degraded if ANY source failed.
+-- Windows are fixed at 7d (recent) / 90d (baseline) and named in the
+-- columns; use runs_sources for any other window. No anomaly threshold here
+-- on purpose -- the detector owns it as a documented, testable config value.
+CREATE VIEW source_health AS
+WITH obs_7d AS (
+    SELECT corpus, source_code,
+           count(*)                                                  AS runs_7d,
+           count(*) FILTER (WHERE outcome IN ('degraded', 'failed'))  AS degraded_runs_7d,
+           count(*) FILTER (WHERE truncated)                          AS truncated_runs_7d,
+           count(*) FILTER (WHERE coalesce(docs_seen, 0) = 0)         AS zero_yield_runs_7d,
+           sum(coalesce(docs_new, 0))                                 AS docs_new_7d,
+           sum(coalesce(docs_seen, 0))                                AS docs_seen_7d,
+           sum(coalesce(fetch_errors, 0))                             AS fetch_errors_7d
+    FROM runs_sources
+    WHERE finished_at >= now() - interval '7 days'
+    GROUP BY 1, 2
+),
+base_90d AS (
+    SELECT corpus, source_code, count(*) AS runs_90d,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY coalesce(docs_new, 0))
+               AS docs_new_median_per_run_90d
+    FROM runs_sources
+    WHERE finished_at >= now() - interval '90 days'
+    GROUP BY 1, 2
+),
+last_run AS (
+    SELECT DISTINCT ON (corpus, source_code)
+           corpus, source_code, run_id, finished_at, outcome, truncated
+    FROM runs_sources
+    WHERE finished_at IS NOT NULL
+    ORDER BY corpus, source_code, finished_at DESC
+)
+SELECT c.corpus, c.source_code, c.doc_type,
+       c.interval_days                                          AS expected_interval_days,
+       c.expected_per_year, c.n_3y,
+       c.last                                                   AS last_document_date,
+       c.next_expected, c.days_until,
+       CASE WHEN c.days_until < 0 THEN -c.days_until ELSE 0 END AS days_late,
+       c.status                                                 AS cadence_status,
+       c.updated_at                                             AS cadence_updated_at,
+       lr.run_id                                    AS last_run_id,
+       lr.finished_at                               AS last_run_at,
+       lr.outcome                                   AS last_run_outcome,
+       lr.truncated                                 AS last_run_truncated,
+       coalesce(o.runs_7d, 0)                       AS source_runs_7d,
+       coalesce(o.degraded_runs_7d, 0)              AS source_degraded_runs_7d,
+       coalesce(o.truncated_runs_7d, 0)             AS source_truncated_runs_7d,
+       coalesce(o.zero_yield_runs_7d, 0)            AS source_zero_yield_runs_7d,
+       coalesce(o.docs_new_7d, 0)                   AS source_docs_new_7d,
+       coalesce(o.docs_seen_7d, 0)                  AS source_docs_seen_7d,
+       coalesce(o.fetch_errors_7d, 0)               AS source_fetch_errors_7d,
+       coalesce(b.runs_90d, 0)                      AS source_runs_90d,
+       b.docs_new_median_per_run_90d                AS source_docs_new_median_per_run_90d
+FROM cadence c
+LEFT JOIN obs_7d     o  ON o.corpus  = c.corpus AND o.source_code  = c.source_code
+LEFT JOIN base_90d   b  ON b.corpus  = c.corpus AND b.source_code  = c.source_code
+LEFT JOIN last_run   lr ON lr.corpus = c.corpus AND lr.source_code = c.source_code;
 """
 
 UPSERT_SQL = """
