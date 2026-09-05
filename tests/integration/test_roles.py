@@ -1,15 +1,14 @@
 import psycopg2
 import pytest
-from psycopg2 import sql
 
-from .conftest import run_ingest
+from .conftest import VAULT_ROLES, drop_vault_roles, role_conn, run_ingest
 
 pytestmark = pytest.mark.integration
 
 ORCH_PW = "orch-pw-A"
 RO_PW = "ro-pw-A"
 
-ROLES = ("vault_orchestrator", "vault_readonly")
+ROLES = VAULT_ROLES
 
 VIEWS = ("runs_sources", "rag_backlog", "rag_backlog_any",
          "sources_without_cadence", "source_health")
@@ -28,10 +27,6 @@ def train(monkeypatch, pg_url, data_dir, orch=ORCH_PW, ro=RO_PW):
     run_ingest(monkeypatch, pg_url, data_dir)
 
 
-def role_conn(pg_url, role, password):
-    return psycopg2.connect(f"postgresql://{role}:{password}@{pg_url.split('@', 1)[1]}")
-
-
 def scalar(pg_url, sql_text, params=None):
     conn = psycopg2.connect(pg_url)
     try:
@@ -48,21 +43,10 @@ def drop_the_roles_afterwards(pg_url):
 
     The container is module-scoped, so nothing this module creates can reach
     another module — but a role left behind would still outlive every test
-    here, so the module hands the cluster back the way it found it. DROP OWNED
-    BY first: it is what removes the grants and the ALTER DEFAULT PRIVILEGES
-    entries that would otherwise make DROP ROLE fail.
+    here, so the module hands the cluster back the way it found it.
     """
     yield
-    conn = psycopg2.connect(pg_url)
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        for role in ROLES:
-            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
-            if cur.fetchone():
-                ident = sql.Identifier(role)
-                cur.execute(sql.SQL("DROP OWNED BY {}").format(ident))
-                cur.execute(sql.SQL("DROP ROLE {}").format(ident))
-    conn.close()
+    drop_vault_roles(pg_url)
 
 
 def test_roles_exist_with_no_cluster_powers(clean_db, tmp_path, monkeypatch):
