@@ -472,7 +472,8 @@ ON CONFLICT (doc_id) DO UPDATE SET
     local_path = EXCLUDED.local_path,
     extra = EXCLUDED.extra,
     updated_at = EXCLUDED.updated_at,
-    last_seen_at = EXCLUDED.last_seen_at,
+    -- never rewind: a slower run carrying an older run timestamp must not make a live row look stale to a newer run's sweep (vault #3)
+    last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at),
     deleted_at = NULL;
 """
 

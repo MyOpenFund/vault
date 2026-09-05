@@ -146,3 +146,12 @@ def test_upsert_refreshes_extra_on_conflict():
     from ingest import UPSERT_SQL
     set_clause = UPSERT_SQL.split("DO UPDATE SET", 1)[1]
     assert "extra = EXCLUDED.extra" in set_clause
+
+
+def test_upsert_never_rewinds_last_seen_at():
+    # vault #3: a slow run committing an older run timestamp after a newer
+    # one must not move the stamp backwards (the sweep trusts it).
+    from ingest import UPSERT_SQL
+    set_clause = UPSERT_SQL.split("DO UPDATE SET", 1)[1]
+    assert "last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)" in set_clause
+    assert "last_seen_at = EXCLUDED.last_seen_at" not in set_clause
