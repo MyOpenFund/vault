@@ -3,9 +3,17 @@
 Ingest run-reports (data/runs.jsonl) into the `runs` table.
 
 Producers append one JSON line per run (central-bank-corpus writes the file;
-data-orchestrator writes the table directly). This ingester is APPEND-ONLY:
-`INSERT ... ON CONFLICT (run_id) DO NOTHING`, so re-ingesting the same file is
-a no-op and file rotation on the producer side is always safe.
+data-orchestrator writes the table directly). This ingester is APPEND-ONLY FOR
+CONTENT: `INSERT ... ON CONFLICT (run_id) DO UPDATE SET corpus = EXCLUDED.corpus
+WHERE runs.corpus IS NULL` never rewrites a stored column, so re-ingesting the
+same file leaves content untouched and file rotation on the producer side is
+always safe. The one exception is `corpus`, which is rewritten only when the
+stored row's `corpus` is NULL — a one-time repair of the rows ingested before
+the column existed (the producer has never emitted `corpus`, so under DO
+NOTHING those rows would stay NULL forever and stay invisible to
+`source_health`, which joins on `(corpus, source_code)`). The WHERE clause
+means every other re-offered row is a no-op update (no dead tuple written),
+not just a no-op on content.
 
 A missing file is a no-op (deployments without a producer). Corrupt lines are
 skipped with a warning. Unknown fields land in `extra` (JSONB).
@@ -130,7 +138,8 @@ INSERT INTO runs (
     run_id, tool, command, started_at, finished_at,
     outcome, exit_code, totals, sources, corpus, extra
 ) VALUES %s
-ON CONFLICT (run_id) DO NOTHING
+ON CONFLICT (run_id) DO UPDATE SET corpus = EXCLUDED.corpus
+    WHERE runs.corpus IS NULL
 """
 
 
@@ -180,27 +189,65 @@ def parse_run_line(line, source_file, line_num, default_corpus, counters=None):
 
 
 def load_run_rows(path, default_corpus, counters=None):
+    """Load the run rows of `path`, keeping the FIRST row for each run_id.
+
+    The in-batch dedupe is required by the DO UPDATE conflict clause:
+    execute_values raises "ON CONFLICT DO UPDATE command cannot affect row a
+    second time" when the same run_id appears twice in one VALUES list (the
+    old DO NOTHING clause tolerated it). That check fires before the DO
+    UPDATE's WHERE clause is ever evaluated, so guarding the update with
+    `WHERE runs.corpus IS NULL` does not relax the dedupe requirement.
+    Keeping the first occurrence matches the append-only semantics of the
+    table: the earliest report of a run wins, exactly as it would across two
+    separate ingestion cycles.
+    """
     rows = []
+    seen = set()
+    duplicates = 0
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
             row = parse_run_line(line, path, i, default_corpus, counters)
-            if row:
-                rows.append(row)
+            if not row:
+                continue
+            run_id = row[0]
+            if run_id in seen:
+                duplicates += 1
+                log.warning(
+                    f"Dropping duplicate run_id {run_id!r} ({path}:{i}); "
+                    f"keeping the first occurrence"
+                )
+                continue
+            seen.add(run_id)
+            rows.append(row)
+    if duplicates and counters is not None:
+        counters["duplicate_run_id"] = (
+            counters.get("duplicate_run_id", 0) + duplicates
+        )
     return rows
 
 
 def run(conn, data_dir, default_corpus):
-    """Ingest the runs file append-only. Returns rows offered (dupes are no-ops)."""
+    """Ingest the runs file. Returns rows offered.
+
+    Append-only for content (a re-offered run_id never rewrites a stored
+    column); a stored row's `corpus` is rewritten only when it is NULL,
+    repairing rows ingested before the column existed.
+    """
     path = os.environ.get("RUNS_PATH") or os.path.join(data_dir, "runs.jsonl")
     if not os.path.exists(path):
         log.info(f"No runs file at {path} — skipping")
         return 0
-    counters = {"corpus_conflict": 0}
+    counters = {"corpus_conflict": 0, "duplicate_run_id": 0}
     rows = load_run_rows(path, default_corpus, counters)
     if counters["corpus_conflict"]:
         log.warning(
             f"runs: rejected {counters['corpus_conflict']} line(s) with a "
             f"corpus contradicting this service's '{default_corpus}'"
+        )
+    if counters["duplicate_run_id"]:
+        log.warning(
+            f"runs: dropped {counters['duplicate_run_id']} line(s) repeating a "
+            f"run_id already seen in this file (first occurrence kept)"
         )
     if not rows:
         return 0
@@ -212,5 +259,8 @@ def run(conn, data_dir, default_corpus):
     except Exception:
         conn.rollback()
         raise
-    log.info(f"runs: offered {len(rows)} row(s) (append-only, dupes ignored)")
+    log.info(
+        f"runs: offered {len(rows)} row(s) "
+        f"(content append-only; corpus filled in where NULL)"
+    )
     return len(rows)

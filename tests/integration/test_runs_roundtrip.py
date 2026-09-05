@@ -229,3 +229,102 @@ def test_contradicting_corpus_line_is_rejected(clean_runs, tmp_path):
     write_runs(tmp_path, [make_report("a", corpus="company"), make_report("b")])
     _run(clean_runs, tmp_path)
     assert _rows(clean_runs, "SELECT run_id, corpus FROM runs") == [("b", "central-bank")]
+
+
+# --- corpus repair on conflict ----------------------------------------------
+#
+# The producer never emitted `corpus`, so every row ingested before the column
+# existed (260 of them on the NAS) stays NULL forever under DO NOTHING: the
+# file is re-offered nightly and never touched, and source_health's observed
+# half — which joins on (corpus, source_code) — stays empty. DO UPDATE ...
+# WHERE runs.corpus IS NULL repairs those rows once, without ever rewriting
+# content, and is a no-op (no dead tuple) for every already-repaired row.
+
+
+def _run_as(pg_url, data_dir, corpus):
+    import ingest_runs
+
+    conn = psycopg2.connect(pg_url)
+    try:
+        return ingest_runs.run(conn, str(data_dir), corpus)
+    finally:
+        conn.close()
+
+
+def _plant_pre_column_runs(pg_url, rows):
+    """Create `runs` as it was before the corpus column, then insert rows."""
+    conn = psycopg2.connect(pg_url)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, tool TEXT NOT NULL, "
+            "command TEXT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, "
+            "outcome TEXT, exit_code INTEGER, totals JSONB, sources JSONB, "
+            "extra JSONB, ingested_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        for run_id, outcome, totals, extra in rows:
+            cur.execute(
+                "INSERT INTO runs (run_id, tool, command, outcome, exit_code, "
+                "totals, sources, extra) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (run_id, "central-bank-corpus", "discover", outcome, 0,
+                 json.dumps(totals), json.dumps([]), json.dumps(extra)),
+            )
+    conn.close()
+
+
+def test_reoffered_row_gets_corpus_filled_content_untouched(clean_runs, tmp_path):
+    _plant_pre_column_runs(
+        clean_runs, [("old-1", "ok", {"docs_seen": 1}, {"host": "nas"})]
+    )
+    # The re-offered line deliberately DIFFERS from the stored row: only
+    # `corpus` may move, everything else keeps its ingested value.
+    write_runs(tmp_path, [make_report(
+        "old-1", outcome="failed", exit_code=9,
+        totals={"docs_seen": 999}, host="somewhere-else",
+    )])
+    _run(clean_runs, tmp_path)
+    rows = _rows(
+        clean_runs,
+        "SELECT corpus, outcome, exit_code, totals, extra FROM runs "
+        "WHERE run_id = 'old-1'",
+    )
+    assert rows == [
+        ("central-bank", "ok", 0, {"docs_seen": 1}, {"host": "nas"})
+    ]
+
+
+def test_row_with_a_corpus_is_never_relabelled(clean_runs, tmp_path):
+    _plant_pre_column_runs(
+        clean_runs,
+        [
+            # Backfilled from extra by the DDL train -> corpus 'central-bank'.
+            ("cb-1", "ok", {"docs_seen": 1}, {"corpus": "central-bank"}),
+            ("cb-2", "ok", {"docs_seen": 2}, {"corpus": "central-bank"}),
+        ],
+    )
+    # cb-1's line carries no corpus: it reaches the insert with the service's
+    # 'company', but the WHERE runs.corpus IS NULL guard skips the update
+    # since cb-1 already has 'central-bank' stored.
+    # cb-2's line contradicts 'company' outright and is rejected before insert.
+    write_runs(tmp_path, [
+        make_report("cb-1", outcome="failed"),
+        make_report("cb-2", corpus="central-bank", outcome="failed"),
+    ])
+    assert _run_as(clean_runs, tmp_path, "company") == 1  # cb-2 rejected
+    assert _rows(
+        clean_runs, "SELECT run_id, corpus, outcome FROM runs ORDER BY run_id"
+    ) == [("cb-1", "central-bank", "ok"), ("cb-2", "central-bank", "ok")]
+
+
+def test_duplicate_run_id_in_one_file_lands_one_row(clean_runs, tmp_path):
+    # execute_values + DO UPDATE would raise "cannot affect row a second time"
+    # without the in-batch dedupe.
+    write_runs(tmp_path, [
+        make_report("dup-1", outcome="ok"),
+        make_report("dup-1", outcome="failed"),
+        make_report("other-1"),
+    ])
+    assert _run(clean_runs, tmp_path) == 2
+    assert _rows(
+        clean_runs, "SELECT run_id, outcome FROM runs ORDER BY run_id"
+    ) == [("dup-1", "ok"), ("other-1", "ok")]
