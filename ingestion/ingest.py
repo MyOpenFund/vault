@@ -25,6 +25,12 @@ not mass-soft-delete the corpus. Set the variable to 1.0 to force a
 legitimate large deletion wave through. The sweep only ever touches rows
 of this service's corpus.
 
+Run-level mutual exclusion: the run holds two Postgres session-level
+advisory locks on its own connection — a global one around the DDL train,
+then a per-corpus one for the rest of the pass. An overlapping run of the
+same corpus waits (it never skips); a run of a different corpus is never
+blocked. See DDL_LOCK_KEY / corpus_lock_key below.
+
 After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
 the `cadence` table as a full replace (see ingest_cadence.py for the
 transactional semantics), DATA_DIR/runs.jsonl content-append-only into `runs`
@@ -472,7 +478,8 @@ ON CONFLICT (doc_id) DO UPDATE SET
     local_path = EXCLUDED.local_path,
     extra = EXCLUDED.extra,
     updated_at = EXCLUDED.updated_at,
-    last_seen_at = EXCLUDED.last_seen_at,
+    -- never rewind: a slower run carrying an older run timestamp must not make a live row look stale to a newer run's sweep (vault #3)
+    last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at),
     deleted_at = NULL;
 """
 
@@ -509,6 +516,41 @@ def should_sweep(candidates, live, max_fraction):
     if candidates == 0 or live == 0:
         return False
     return candidates / live <= max_fraction
+
+
+# Run-level mutual exclusion (vault #3). Session-level advisory locks on the
+# run's own connection: released on unlock or when the connection closes, so
+# a killed run never leaves one behind. Two runs of the SAME corpus
+# serialize; different corpora never block each other; the DDL train is
+# serialized across every service because CREATE TABLE IF NOT EXISTS races
+# on a fresh database.
+DDL_LOCK_KEY = "vault-ddl"
+CORPUS_LOCK_PREFIX = "vault-ingest-"
+
+
+def corpus_lock_key(corpus):
+    return f"{CORPUS_LOCK_PREFIX}{corpus}"
+
+
+def acquire_lock(conn, key):
+    """Take the advisory lock for `key`; wait (never skip) if another run holds it."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (key,))
+        (got,) = cur.fetchone()
+        if not got:
+            log.warning(f"another ingestion run holds lock {key!r} — waiting for it")
+            cur.execute("SELECT pg_advisory_lock(hashtext(%s))", (key,))
+    conn.commit()
+    log.info(f"lock {key!r} acquired")
+
+
+def release_lock(conn, key):
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
+        (released,) = cur.fetchone()
+    conn.commit()
+    if not released:
+        log.warning(f"lock {key!r} was not held at release time")
 
 
 # Files the documents scan must never treat as manifests. All of them are
@@ -583,10 +625,18 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
     )
 
 
-def main():
+def main(*, corpus=None, data_dir=None):
+    """Run one ingestion pass.
+
+    `corpus` and `data_dir` are a test seam: both default to None, in which
+    case the CORPUS / DATA_DIR env vars decide as in production. They exist
+    because the env is process-global, so concurrency tests cannot give two
+    threads different corpora through it.
+    """
     database_url = os.environ.get("DATABASE_URL")
-    data_dir = os.environ.get("DATA_DIR", "/data")
-    default_corpus = os.environ.get("CORPUS", "central-bank")
+    if data_dir is None:
+        data_dir = os.environ.get("DATA_DIR", "/data")
+    default_corpus = corpus if corpus is not None else os.environ.get("CORPUS", "central-bank")
     sweep_max_fraction = float(os.environ.get("SWEEP_MAX_DELETE_FRACTION", "0.05"))
 
     if not database_url:
@@ -611,10 +661,23 @@ def main():
 
     conn = psycopg2.connect(database_url)
     conn.autocommit = False
+    corpus_lock = corpus_lock_key(default_corpus)
+    held = []
     try:
+        # The DDL train races across services (CREATE/DROP VIEW, CREATE TABLE
+        # IF NOT EXISTS), so it is serialized globally; the corpus lock is
+        # taken only after the train released it, so a run waiting for its
+        # corpus never blocks another corpus's DDL.
+        acquire_lock(conn, DDL_LOCK_KEY)
+        held.append(DDL_LOCK_KEY)
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
         conn.commit()
+        release_lock(conn, DDL_LOCK_KEY)
+        held.remove(DDL_LOCK_KEY)
+
+        acquire_lock(conn, corpus_lock)
+        held.append(corpus_lock)
 
         total_rows = 0
         for filepath in jsonl_files:
@@ -685,13 +748,30 @@ def main():
         )
 
     except Exception:
-        conn.rollback()
+        # Best effort, like the finally below: when the run failed *because*
+        # the connection dropped, rollback() raises InterfaceError of its own
+        # and would replace the real cause — the operator would see
+        # "connection already closed" and never the error that killed the run,
+        # and the log.exception line below would never run either.
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — never mask the original failure
+            log.warning("rollback failed on a broken connection; closing it instead")
         log.exception(
             "Run failed; uncommitted work rolled back "
             "(committed document batches are unaffected)"
         )
         raise
     finally:
+        # Best effort: the connection close below releases session-level
+        # advisory locks anyway, so a failure here is a warning, not an error.
+        for key in list(held):
+            try:
+                if not conn.closed:
+                    conn.rollback()
+                    release_lock(conn, key)
+            except Exception:  # noqa: BLE001 — closing releases it anyway
+                log.warning(f"could not release lock {key!r}; the connection close will")
         conn.close()
 
 
