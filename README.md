@@ -39,7 +39,7 @@ Write contract (the ingestion service is the only writer):
 
 Every manifest column (corpus, source_code, doc_type, title, pdf_url, source_url, date, year, language, provenance, mime_type, sha256, local_path) is overwritten from the manifest on upsert; deleted_at is cleared to NULL (row resurrection); id and created_at are never updated. The `extra` column (unknown manifest fields) is replaced from the manifest on every upsert, like every other manifest column: a key the producer stops emitting disappears from the vault on the next run, and a line with no unknown fields sets `extra` to NULL. The manifest is regenerated whole on every producer run, so this is convergence to the producer's current truth, not data loss — but it is a one-way door, decided 2026-09-04 (vault #8, #2).
 
-Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs.
+Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs. `last_seen_at` is monotone — it only ever advances (see Concurrency below) — so a slower concurrent run can never make a live row look stale to a newer run's sweep.
 
 ### Table `rag_ingestions`
 
@@ -115,6 +115,10 @@ Consumer contract:
 6. `discovery_errors.last_seen_at` is ingestion time while `seen_at_is_ingestion_time` is TRUE.
 7. The 7-day / 90-day windows of `source_health` are choices, named in the columns; use `runs_sources` for any other window. No anomaly threshold lives in a view — the detector owns it as a documented config value.
 8. Indexes: `idx_documents_live_agg` serves the per-source drill-down cards (not the whole-corpus rollup, which correctly seq-scans); `idx_documents_corpus_doc_type` is used once a second corpus exists.
+
+### Concurrency
+
+Each ingestion run holds two session-level Postgres advisory locks on its own connection: `vault-ddl` around the DDL train only (the `CREATE TABLE`/`ALTER`/view block above, serialized across every service and corpus), then `vault-ingest-<corpus>` for the documents, cadence, runs, and discovery-error passes, held through the end of the run. A run that finds a lock already held logs a WARNING naming the key and blocks until it is free — it never skips its work. Both locks are released on explicit unlock or when the connection closes, so a killed run never leaves one behind. Two overlapping runs of the *same* corpus serialize; different corpora run in parallel and never block each other. `documents.last_seen_at` is written as `GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)` on upsert, so even a writer that bypassed the lock could not rewind a stamp a newer run already set. The orchestrator's own writes (`runs`, `rag_ingestions`, and the probe `UPDATE` of `has_text_layer`/`page_count` on `documents`) take neither lock — a separate writer outside the ingestion service's transaction. Calling `ingest_cadence.run()` / `ingest_runs.run()` / `ingest_discovery_errors.run()` directly, outside `ingest.py`'s `main()`, bypasses the DDL lock entirely (each issues its own `CREATE TABLE IF NOT EXISTS`).
 
 ### Migration (2026-09 substrate)
 
