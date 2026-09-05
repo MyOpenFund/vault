@@ -94,15 +94,16 @@ def test_role_attributes_converge_when_someone_widened_them_by_hand(
         if not cur.fetchone():
             cur.execute("CREATE ROLE vault_orchestrator LOGIN")
         cur.execute("ALTER ROLE vault_orchestrator WITH SUPERUSER CREATEDB "
-                    "CREATEROLE BYPASSRLS")
+                    "CREATEROLE REPLICATION BYPASSRLS")
     conn.close()
 
     train(monkeypatch, clean_db, tmp_path)
 
     assert scalar(clean_db, """
-        SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls, rolcanlogin
+        SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication,
+               rolbypassrls, rolcanlogin
         FROM pg_roles WHERE rolname = 'vault_orchestrator'
-    """) == (False, False, False, False, True)
+    """) == (False, False, False, False, False, True)
 
 
 def test_privilege_matrix(clean_db, tmp_path, monkeypatch):
@@ -222,8 +223,12 @@ def test_password_rotation_applies_on_every_train(clean_db, tmp_path, monkeypatc
     role_conn(clean_db, "vault_orchestrator", "rot-1").close()
     train(monkeypatch, clean_db, tmp_path, orch=ORCH_PW)  # back to the module default
     role_conn(clean_db, "vault_orchestrator", ORCH_PW).close()
-    with pytest.raises(psycopg2.OperationalError):
+    with pytest.raises(psycopg2.OperationalError) as exc:
         role_conn(clean_db, "vault_orchestrator", "rot-1")
+    # The old password is REJECTED, not merely unusable for some other reason
+    # (a role that vanished, a connection refused) — those would also raise
+    # OperationalError and would make this test pass for the wrong reason.
+    assert "password authentication failed" in str(exc.value)
 
 
 def test_pg_hba_trusts_only_the_containers_own_loopback(clean_db, tmp_path, monkeypatch):

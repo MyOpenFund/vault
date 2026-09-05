@@ -80,6 +80,10 @@ def test_a_failing_role_statement_raises_without_leaking_the_password():
     assert "vault_orchestrator" in str(exc.value)
     assert "s3cr3t" not in str(exc.value)
     assert exc.value.__cause__ is None  # `from None`: the driver error is dropped
+    # Raised outside the except block, so Python never chained the driver error
+    # as the implicit context either -- and that error carries cur.query, i.e.
+    # the rendered ALTER ROLE with the password in it.
+    assert exc.value.__context__ is None
 
 
 def test_the_password_survives_in_no_frame_local_of_the_raised_traceback():
@@ -117,7 +121,8 @@ def test_statements_are_issued_in_the_documented_order_and_no_others():
     assert "is_superuser" in got[1]
     assert "CREATE ROLE" in got[2]
     assert "ALTER ROLE" in got[3]
-    assert not any("log_statement" in statement for statement in got)
+    assert not any("log_statement" in statement or
+                   "log_min_error_statement" in statement for statement in got)
     for statement, template in zip(got[4:], grants):
         head = template.split("{")[0].strip()
         assert head in statement, f"expected {head!r} in {statement}"
@@ -131,20 +136,25 @@ def test_the_alter_role_spells_out_every_cluster_power_it_denies():
     roles.ensure_roles(cur, {roles.ROLE_READONLY: "s3cr3t"})
     alter = cur.statements()[3]
     for attribute in ("LOGIN", "NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE",
-                      "NOBYPASSRLS", "PASSWORD"):
+                      "NOREPLICATION", "NOBYPASSRLS", "PASSWORD"):
         assert attribute in alter, f"{attribute} missing from {alter}"
 
 
 def test_log_statement_is_muted_around_the_alter_role_and_restored_right_after():
     # Scoped to the one statement that carries the literal: a server running
     # log_statement = 'ddl' keeps its audit trail of the GRANTs.
+    # log_min_error_statement goes with it: its default logs a FAILING
+    # statement in full, which for the ALTER ROLE means the password literal.
     cur = FakeCursor(superuser=True)
     roles.ensure_roles(cur, {roles.ROLE_ORCHESTRATOR: "s3cr3t"})
     got = cur.statements()
     assert "SET LOCAL log_statement" in got[3]
-    assert "ALTER ROLE" in got[4]
-    assert "RESET log_statement" in got[5]
+    assert "SET LOCAL log_min_error_statement" in got[4]
+    assert "ALTER ROLE" in got[5]
+    assert "RESET log_statement" in got[6]
+    assert "RESET log_min_error_statement" in got[7]
     assert sum("log_statement" in statement for statement in got) == 2
+    assert sum("log_min_error_statement" in statement for statement in got) == 2
 
 
 def test_grant_templates_are_the_documented_surface_and_nothing_more():

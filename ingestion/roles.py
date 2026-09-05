@@ -41,6 +41,10 @@ PASSWORD_ENV = {
 # at execution time, so the views recreated a few statements earlier in the same
 # train are included; the ALTER DEFAULT PRIVILEGES covers anything a LATER train
 # creates, before its own explicit grant runs.
+# ALTER DEFAULT PRIVILEGES without FOR ROLE binds to the role EXECUTING it, so
+# it only covers tables created by that role: the deployed DATABASE_URL user
+# must be the one that owns the tables (`docuser`), or new tables land without
+# the default SELECT and stay unreadable until the next train's explicit GRANT.
 _READ_GRANTS = (
     "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}",  # converge, don't accumulate
     "GRANT CONNECT ON DATABASE {db} TO {role}",
@@ -79,7 +83,7 @@ END $do$
 # keeping whatever it was given.
 _ALTER_ROLE_SQL = (
     "ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
-    "NOBYPASSRLS PASSWORD {password}"
+    "NOREPLICATION NOBYPASSRLS PASSWORD {password}"
 )
 
 
@@ -154,10 +158,16 @@ def _provision(cur, role, password, dbname, quiet=False):
         # default is 'none', so on most servers this changes nothing.) On the
         # failure path the RESET is skipped, which is harmless: the train's
         # transaction is already doomed and SET LOCAL dies with it.
+        # log_min_error_statement goes with it: its default ('error') makes the
+        # server log the FAILING statement in full, so without this a failing
+        # ALTER ROLE would write the password literal into the server log --
+        # exactly the leak log_statement = 'none' was meant to prevent.
         alter_role = (
-            [sql.SQL("SET LOCAL log_statement = 'none'")]
+            [sql.SQL("SET LOCAL log_statement = 'none'"),
+             sql.SQL("SET LOCAL log_min_error_statement = 'panic'")]
             + alter_role
-            + [sql.SQL("RESET log_statement")]
+            + [sql.SQL("RESET log_statement"),
+               sql.SQL("RESET log_min_error_statement")]
         )
     statements = [
         sql.SQL(_CREATE_ROLE_SQL).format(name=sql.Literal(role), role=ident),
@@ -165,6 +175,7 @@ def _provision(cur, role, password, dbname, quiet=False):
         sql.SQL(tpl).format(role=ident, db=sql.Identifier(dbname))
         for tpl in grant_templates(role)
     ]
+    failed = False
     for statement in statements:
         try:
             cur.execute(statement)
@@ -173,6 +184,12 @@ def _provision(cur, role, password, dbname, quiet=False):
             # `statements` and `alter_role` hold a Literal whose repr is the
             # password, and a --showlocals-style reporter would print it.
             statement = statements = alter_role = password = None
-            # `from None` is load-bearing: a chained psycopg2 error carries
-            # cur.query, i.e. the rendered ALTER ROLE with the password in it.
-            raise RuntimeError(f"failed to provision role {role}") from None
+            failed = True
+            break
+    if failed:
+        # Raised OUTSIDE the handler on purpose: inside it, Python would set
+        # __context__ to the driver error being handled, and that error carries
+        # cur.query -- the rendered ALTER ROLE, password literal and all. Out
+        # here the exception state is already cleared, so __context__ is None.
+        # `from None` says the same thing about __cause__ explicitly.
+        raise RuntimeError(f"failed to provision role {role}") from None
