@@ -116,14 +116,16 @@ def test_statements_are_issued_in_the_documented_order_and_no_others():
     roles.ensure_roles(cur, {roles.ROLE_ORCHESTRATOR: "s3cr3t"})
     got = cur.statements()
     grants = roles.grant_templates(roles.ROLE_ORCHESTRATOR)
-    assert len(got) == 2 + 2 + len(grants)  # 2 probes, DO guard, ALTER ROLE, grants
+    # 2 probes, DO guard, ALTER ROLE, the grants, then the schema-level REVOKE
+    assert len(got) == 2 + 2 + len(grants) + 1
+    assert "REVOKE CREATE ON SCHEMA public FROM PUBLIC" in got[-1]
     assert "current_database" in got[0]
     assert "is_superuser" in got[1]
     assert "CREATE ROLE" in got[2]
     assert "ALTER ROLE" in got[3]
     assert not any("log_statement" in statement or
                    "log_min_error_statement" in statement for statement in got)
-    for statement, template in zip(got[4:], grants):
+    for statement, template in zip(got[4:-1], grants):
         head = template.split("{")[0].strip()
         assert head in statement, f"expected {head!r} in {statement}"
 
@@ -174,3 +176,27 @@ def test_grant_templates_are_the_documented_surface_and_nothing_more():
     assert set(writes) <= set(orch)
     assert not set(writes) & set(ro)
     assert not any(w in " ".join(ro) for w in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
+
+
+def test_the_train_revokes_the_public_schemas_inherited_create_right():
+    # PostgreSQL 15 stopped granting CREATE on schema `public` to PUBLIC, but a
+    # cluster initialised before 15 -- or one where someone re-granted it by
+    # hand -- still does, and PUBLIC includes both vault roles. "vault_readonly
+    # cannot CREATE TABLE" must not rest on the server's default, so the train
+    # revokes it itself, once per run rather than once per role.
+    cur = FakeCursor()
+    roles.ensure_roles(cur, {roles.ROLE_READONLY: "s3cr3t"})
+    got = cur.statements()
+    hardening = [s for s in got if "REVOKE CREATE ON SCHEMA public FROM PUBLIC" in s]
+    assert len(hardening) == 1, got
+    # ... and it is not aimed at a role: FROM PUBLIC, never FROM vault_readonly
+    assert "vault_readonly" not in hardening[0]
+
+
+def test_an_unconfigured_train_touches_nothing_at_all():
+    # The dev/CI path: no password variable set, so no role, no grant -- and no
+    # schema-level REVOKE either. A train that provisions nothing must leave
+    # the cluster exactly as it found it.
+    cur = FakeCursor()
+    assert roles.ensure_roles(cur, {}) == []
+    assert cur.statements() == []

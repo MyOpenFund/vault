@@ -1,19 +1,36 @@
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from db import get_conn, build_where_clause, SORTABLE_FIELDS
+from db import get_conn, build_where_clause, verify_connection, SORTABLE_FIELDS
 from models import Document, DocumentList, StatsSummary, CountItem
 
 RAW_DATA_DIR = Path(os.environ.get("RAW_DATA_DIR", "/data/raw")).resolve()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Refuse to serve a corpus this process cannot read.
+
+    The API connects as `vault_readonly`, a role the ingestion service's DDL
+    train creates -- so on a brand-new cluster it does not exist yet and every
+    connection fails. Crashing here is the point: uvicorn exits non-zero, the
+    container restarts, and its logs say what to run. Serving 500s behind a
+    green /health would hide exactly the same problem.
+    """
+    verify_connection()
+    yield
+
 
 app = FastAPI(
     title="MyOpenFund vault API",
     description="API for browsing the document corpus (metadata + download).",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 

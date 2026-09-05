@@ -198,3 +198,39 @@ def test_download_document_file_serves_a_file_under_the_raw_data_dir(
     assert response.status_code == 200
     assert response.content == b"%PDF-1.4 fixture\n"
     assert "good.pdf" in response.headers["content-disposition"]
+
+
+def test_the_app_refuses_to_start_when_its_role_does_not_exist(clean_db, monkeypatch):
+    """The first-boot window, against a real cluster and a real driver error.
+
+    The API connects as `vault_readonly`, which the DDL train creates — this
+    module never sets the password variables, so on this cluster the role does
+    not exist, exactly like a brand-new deployment before its first ingestion
+    run. The container must say so and die, not serve 500s behind a green
+    /health.
+    """
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    import db
+    import main as api_main
+
+    host_and_db = clean_db.split("@", 1)[1]
+    monkeypatch.setattr(db, "DATABASE_URL",
+                        f"postgresql://vault_readonly:s3cr3t@{host_and_db}")
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    db.log.addHandler(handler)
+    try:
+        with pytest.raises(RuntimeError):
+            with TestClient(api_main.app):
+                pass
+    finally:
+        db.log.removeHandler(handler)
+
+    logged = "\n".join(r.getMessage() for r in records)
+    assert "vault_readonly" in logged
+    assert "docker compose run --rm ingestion" in logged
+    assert "s3cr3t" not in logged

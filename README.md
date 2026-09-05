@@ -24,7 +24,7 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 | Service | Role | Port |
 |---|---|---|
-| `postgres` | the vault itself (PostgreSQL 16) | internal only |
+| `postgres` | the vault itself (PostgreSQL 16) | internal only (publishable on one interface — see [Access & roles](#access--roles)) |
 | `ingestion` | one-shot manifest → Postgres sync (run per corpus) | — |
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
@@ -130,6 +130,62 @@ Runbook: if the producer legitimately rotates (truncates) `discovery_errors.json
 
 `has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by `data-orchestrator`'s probe pass only — manifests never carry them and the manifest upsert never touches them.
 
+## Access & roles
+
+Every service used to connect as `docuser`, which in the `postgres:16` image is a full cluster
+superuser. Two least-privilege roles now do the work instead. They are owned by the DDL train:
+the ingestion service creates them and **re-issues their grants on every run** — the views are
+dropped and recreated nightly, and a grant dies with its view.
+
+| Object | `docuser` | `vault_orchestrator` | `vault_readonly` |
+|---|---|---|---|
+| `documents` | superuser (all) | `SELECT`; `UPDATE (has_text_layer, page_count)` only | `SELECT` |
+| `runs` | all | `SELECT`, `INSERT` | `SELECT` |
+| `rag_ingestions` | all | `SELECT`, `INSERT`, `UPDATE` | `SELECT` |
+| `cadence`, `discovery_errors` | all | `SELECT` | `SELECT` |
+| the five views | all | `SELECT` | `SELECT` |
+| tables/views created later | all | `SELECT` (default privileges) | `SELECT` (default privileges) |
+| schema `public` | owner | `USAGE`, no `CREATE` | `USAGE`, no `CREATE` |
+| database `documents` | owner | `CONNECT` | `CONNECT` |
+| DDL, `DELETE`, `TRUNCATE`, `DROP` | yes | denied | denied |
+
+`vault_orchestrator` is for the off-host `data-orchestrator`; `vault_readonly` is what the API
+connects as (read-only by code *and* by grant) and what Metabase's analytics connection should
+use. `docuser` stays a superuser — demoting it means re-owning the schema — but after this
+change it is used by the **ingestion service only**, plus Metabase's own application database
+(`MB_DB_USER`), which legitimately needs DDL on its own schema.
+
+Passwords come from `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` (see
+`.env.example`). Unset or empty → that role is skipped with a WARNING and no grant is issued,
+which is how the dev and CI clusters run with no roles at all. **Rotation**: change the value in
+`.env`, run `docker compose run --rm ingestion` once (the train re-applies the password every
+run), then update the consumer. Nothing is ever run by hand against the cluster.
+
+**First boot ordering.** The roles do not exist until the first ingestion run, so on a brand-new
+cluster the API cannot connect. It says so and stops: one `ERROR` naming the role and the command
+to run, then a non-zero exit, with `restart: unless-stopped` retrying — never a silent 500 behind
+a green `/health`. On a new deployment, run the ingestion once before (or right after) starting
+the API:
+
+```bash
+docker compose up -d postgres
+docker compose run --rm ingestion     # creates the roles + the schema
+docker compose up -d api metabase
+```
+
+**Publishing the database port.** `compose.yaml` publishes no Postgres port; the `ports:` block is
+committed commented out. Uncomment it in the deployment's own compose (Dockge on the NAS) and set
+`POSTGRES_BIND_ADDR=<tailnet-ip>` in that host's `.env` — the real address never enters this repo.
+It must always be one specific interface address (`127.0.0.1` is the default), never the
+all-zeroes wildcard and never a bind-address-less `5432:5432`: Docker publishes ports by DNAT
+*ahead of* the host firewall, so that value is the whole access control. A unit test fails the
+build if either form appears. Off-host clients land on the image's `scram-sha-256` rule (its
+`pg_hba` trusts only the container's own loopback) and must connect as one of the two roles.
+
+TLS is deliberately not configured: the only off-host transport is a tailnet, which is already
+authenticated and encrypted. If Postgres ever has to be reachable outside it, `sslmode=require`
+plus a certificate on the host is the next hardening step.
+
 ## API
 
 `GET /health` · `GET /documents` (filters: corpus, source, type, dates, pagination) ·
@@ -161,10 +217,15 @@ PDF download button, both still behind the API/`vaultctl`.
 ## Quickstart
 
 ```bash
-cp .env.example .env        # set POSTGRES_PASSWORD + host paths (never committed)
-docker compose up -d postgres metabase api
-docker compose run --rm ingestion            # sync the manifests, then exits
+cp .env.example .env        # POSTGRES_PASSWORD, the two role passwords, host paths
+docker compose up -d postgres
+docker compose run --rm ingestion            # schema + roles, syncs the manifests, exits
+docker compose up -d api metabase
 ```
+
+Order matters on a brand-new cluster only: the API connects as `vault_readonly`, a role the
+ingestion run creates (see [Access & roles](#access--roles)). Afterwards, `docker compose up -d`
+brings everything back in any order, and ingestion is re-run on demand or from cron.
 
 ## CLI
 

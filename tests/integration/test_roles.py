@@ -226,3 +226,38 @@ def test_pg_hba_trusts_only_the_containers_own_loopback(clean_db, tmp_path, monk
            AND address IS NOT NULL
            AND address NOT IN ('127.0.0.1', '::1')
     """) == (0,)
+
+
+def test_create_on_public_is_revoked_even_where_the_cluster_grants_it(
+    clean_db, tmp_path, monkeypatch
+):
+    # "vault_orchestrator cannot CREATE TABLE" is asserted elsewhere against
+    # postgres:16, where PUBLIC lost CREATE on schema `public` in v15 -- so
+    # that assertion would hold even if this chantier did nothing. The NAS
+    # cluster, or any cluster initialised before 15, or one where someone
+    # re-granted it by hand, is the case that matters. Re-create it: grant
+    # CREATE back to PUBLIC, then let the train take it away again.
+    train(monkeypatch, clean_db, tmp_path)
+    conn = psycopg2.connect(clean_db)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("GRANT CREATE ON SCHEMA public TO PUBLIC")
+    conn.close()
+    # The widened cluster really is widened -- without this the assertions
+    # below would pass for the wrong reason.
+    for role in ROLES:
+        assert scalar(clean_db, "SELECT has_schema_privilege(%s, 'public', 'CREATE')",
+                      (role,)) == (True,), f"{role} should have inherited CREATE"
+
+    train(monkeypatch, clean_db, tmp_path)
+
+    for role in ROLES:
+        assert scalar(clean_db, "SELECT has_schema_privilege(%s, 'public', 'CREATE')",
+                      (role,)) == (False,), f"{role} kept CREATE on schema public"
+    # and the database really refuses, not just the catalogue
+    conn = role_conn(clean_db, "vault_orchestrator", ORCH_PW)
+    conn.autocommit = True
+    with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+        with conn.cursor() as cur:
+            cur.execute("CREATE TABLE t_evil (x int)")
+    conn.close()

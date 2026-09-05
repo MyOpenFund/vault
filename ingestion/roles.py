@@ -12,6 +12,10 @@ recreates all five views on every run, which destroys any grant held on them.
 Re-issuing the grants after the CREATE VIEWs, inside the same transaction, is
 what makes them survive the night.
 
+The same pass also revokes PUBLIC's inherited CREATE right on schema `public`
+(see _HARDEN_PUBLIC_SCHEMA_SQL), so "these roles cannot create anything" holds
+on a pre-15 cluster too, not only where the server's default already says so.
+
 Passwords come from the environment (see PASSWORD_ENV). A role whose variable
 is unset or empty is skipped with a WARNING, together with its grants: that is
 the dev/CI path, where no role exists at all. Rotation is "change the variable,
@@ -67,6 +71,15 @@ WRITE_GRANTS = {
     ),
     ROLE_READONLY: (),
 }
+
+# Schema-level, role-independent, issued once per train. PostgreSQL 15 stopped
+# granting CREATE on schema `public` to PUBLIC, but a cluster initialised before
+# 15 (pg_upgrade keeps the old ACL) still grants it, and so does any cluster
+# where someone re-granted it by hand -- and PUBLIC includes every role there
+# will ever be, both vault roles included. Without this, "the orchestrator
+# cannot CREATE TABLE" would be a property of the server's version rather than
+# of this train. docuser is unaffected: it owns the schema.
+_HARDEN_PUBLIC_SCHEMA_SQL = "REVOKE CREATE ON SCHEMA public FROM PUBLIC"
 
 _CREATE_ROLE_SQL = """
 DO $do$ BEGIN
@@ -131,14 +144,22 @@ def ensure_roles(cur, passwords):
             continue
         _provision(cur, role, passwords[role], dbname, quiet)
         provisioned.append(role)
+    # Last, and deliberately outside the loop: it is a property of the schema,
+    # not of a role. Unwrapped on purpose -- it carries no password, and a
+    # failure here must abort the train's transaction loudly, with the driver's
+    # own message, the way any other DDL failure does.
+    cur.execute(sql.SQL(_HARDEN_PUBLIC_SCHEMA_SQL))
     log.info(f"roles provisioned: {', '.join(provisioned)}")
     return provisioned
 
 
 def _can_quiet_password_logging(cur):
-    """Whether this connection may mute log_statement around the ALTER ROLE.
+    """Whether this connection may mute the server log around the ALTER ROLE.
 
-    log_statement is SUSET, so the SET is only attempted on a superuser
+    Two settings are muted together: log_statement (which would echo the
+    ALTER ROLE on a server running 'ddl' or 'all') and log_min_error_statement
+    (whose default logs a FAILING statement in full, password literal
+    included). Both are SUSET, so the SET is only attempted on a superuser
     connection -- a failed SET would abort the whole train's transaction.
     """
     cur.execute("SELECT current_setting('is_superuser') = 'on'")
