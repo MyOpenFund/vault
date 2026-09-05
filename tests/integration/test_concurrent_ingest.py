@@ -2,10 +2,19 @@
 
 Nothing stops a second run from starting while the first is still going —
 a slow nightly cron overlapping the next one, or an operator kicking off a
-manual re-ingest. Both runs then upsert over the same rows with their own
-run timestamp, and `last_seen_at` is what the soft-delete sweep trusts to
-decide which documents have vanished from the share. This test pins what an
-overlapping pair must never do to the registry.
+manual re-ingest. Both runs then want to upsert over the same rows with
+their own run timestamp, and `last_seen_at` is what the soft-delete sweep
+trusts to decide which documents have vanished from the share. This test
+pins what an overlapping pair must never do to the registry.
+
+Two mechanisms keep that safe, and this module exercises both at once:
+
+* the per-corpus advisory lock (`vault-ingest-<corpus>`) serializes runs of
+  the same corpus — the second run *waits*, it is never skipped — so the
+  two data passes never interleave at all; and
+* `last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)`
+  in the upsert guards the stamp for any writer that bypasses the lock
+  (an older deployment, a hand-run script, a psql session).
 
 The two manifests overlap only partially — each run also carries one doc_id
 the other has never heard of — so "no row was lost" means something beyond
@@ -13,6 +22,7 @@ the other has never heard of — so "no row was lost" means something beyond
 """
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,7 +37,8 @@ EARLY = "ingest-early"  # the run holding the OLDER one
 SHARED = ("d_shared1", "d_shared2")
 ONLY = {LATE: "d_only_late", EARLY: "d_only_early"}
 ALL_DOC_IDS = sorted(SHARED + tuple(ONLY.values()))
-GATE_TIMEOUT = 30  # seconds; generous, only ever hit when a run wedges
+RUN_TIMEOUT = 60  # seconds; generous, only ever hit when a run wedges
+HEADSTART = 0.2  # seconds; enough for LATE to be inside the corpus lock
 
 
 class _PerThreadClock:
@@ -46,79 +57,90 @@ class _PerThreadClock:
 
 
 def _run_both_concurrently(monkeypatch, ingest, stamps, manifests):
-    """Run two ingest.main() in parallel, EARLY committing its batch last.
+    """Start both ingest.main() runs and let the corpus lock order them.
 
-    Three test-side hooks, none of them a change to production behaviour:
-    each thread reads its own manifest (DATA_DIR is process-global, so the
-    scan is what has to be per-thread), each gets a fixed run timestamp, and
-    the gate around ingest's own execute_values makes the interleaving the
-    damaging one rather than a coin flip. Both runs first meet at a barrier —
-    each has finished its DDL and is inside its own open transaction — then
-    LATE upserts and commits while EARLY, already in its transaction and
-    blocking on LATE's row locks, applies its older timestamp afterwards.
+    Two test-side hooks, neither a change to production behaviour: each
+    thread reads its own manifest (DATA_DIR is process-global, so the scan is
+    what has to be per-thread), and each gets a fixed run timestamp. Nothing
+    here choreographs the interleaving — that is the point. LATE is started
+    first and EARLY a moment later, and whether EARLY then waits behind
+    LATE's lock or wins the race to it is left to the database.
+
+    A third hook only *observes*: `execute_values` is wrapped in a counter of
+    in-flight upserts. Its peak over the whole pair is returned; under the
+    per-corpus lock it can only ever be 1.
     """
-    barrier = threading.Barrier(2)
-    late_upserted = threading.Event()
+    in_flight = 0
+    peak = 0
+    guard = threading.Lock()
 
     def per_thread_manifests(_root):
         return [str(manifests[threading.current_thread().name])]
 
     # psycopg2's own execute_values, never whatever a previous iteration left
-    # patched onto the module — gates must not nest across iterations.
-    def gated_execute_values(cur, sql, rows, **kwargs):
-        name = threading.current_thread().name
-        barrier.wait(timeout=GATE_TIMEOUT)
-        if name == EARLY:
-            assert late_upserted.wait(timeout=GATE_TIMEOUT), "LATE never upserted"
-        real_execute_values(cur, sql, rows, **kwargs)
-        if name == LATE:
-            late_upserted.set()
+    # patched onto the module — probes must not nest across iterations.
+    def probed_execute_values(cur, sql, rows, **kwargs):
+        nonlocal in_flight, peak
+        with guard:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        try:
+            real_execute_values(cur, sql, rows, **kwargs)
+        finally:
+            with guard:
+                in_flight -= 1
 
     monkeypatch.setattr(ingest, "datetime", _PerThreadClock(stamps))
     monkeypatch.setattr(ingest, "find_jsonl_files", per_thread_manifests)
-    monkeypatch.setattr(ingest, "execute_values", gated_execute_values)
+    monkeypatch.setattr(ingest, "execute_values", probed_execute_values)
 
     failures = {}
 
     def target():
         try:
             ingest.main()
-        except BaseException as exc:  # surfaced in the main thread below
+        except BaseException as exc:  # noqa: BLE001 — surfaced in the main thread
             failures[threading.current_thread().name] = exc
 
     threads = [
         threading.Thread(target=target, name=n, daemon=True) for n in (LATE, EARLY)
     ]
+    threads[0].start()
+    time.sleep(HEADSTART)
+    threads[1].start()
     for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=GATE_TIMEOUT * 2)
-        assert not t.is_alive(), f"{t.name} did not finish"
+        t.join(timeout=RUN_TIMEOUT)
+        assert not t.is_alive(), f"{t.name} did not finish within {RUN_TIMEOUT}s"
     assert not failures, f"a racing run raised: {failures}"
+    return peak
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MyOpenFund/vault#3: the upsert overwrites last_seen_at "
-    "unconditionally, so the run that commits last wins even when its run "
-    "timestamp is older than the one already stored",
-)
 def test_concurrent_ingest_runs_do_not_lose_or_duplicate_rows(
     clean_db, tmp_path, monkeypatch
 ):
-    """Overlapping runs must keep every document, once, freshly stamped.
+    """Overlapping runs must serialize, and keep every document, once, fresh.
 
-    Whatever order the two runs commit in, the registry afterwards must hold
-    each doc_id exactly once — including the one only the other run saw —
-    none of them tombstoned, and every shared document stamped with the
-    LATEST of the two run timestamps. A row rewound to an older stamp looks
-    stale to the next run's sweep and gets soft-deleted while still very much
-    present on the share.
+    The per-corpus lock is the first guarantee: no two runs of the same
+    corpus may be upserting at the same moment, so the in-flight probe's peak
+    must be 1. The registry afterwards must hold each doc_id exactly once —
+    including the one only the other run saw — none of them tombstoned, and
+    every shared document stamped with the LATEST of the two run timestamps.
+    A row rewound to an older stamp looks stale to the next run's sweep and
+    gets soft-deleted while still very much present on the share.
 
-    SWEEP_MAX_DELETE_FRACTION is left at its production default here: with
-    partially overlapping manifests each run sees a quarter of the corpus as
-    missing, so the torn-share guard blocks both sweeps and the only thing
-    left to fail is the timestamp itself.
+    The shared stamp lands on LATE's value whichever order the lock hands the
+    two runs, and for two different reasons: if EARLY goes second, its older
+    stamp is discarded by the upsert's GREATEST; if LATE goes second, it
+    simply overwrites EARLY's with its newer one. Only the second of those
+    would survive dropping GREATEST — which is why the guard stays in the
+    upsert even now that the lock exists.
+
+    SWEEP_MAX_DELETE_FRACTION is left at its production default here. With
+    partially overlapping manifests the run that goes second sees the other's
+    exclusive doc as missing — when LATE is second, `d_only_early` still
+    carries EARLY's older stamp and so is a sweep candidate, 1 of 4 live rows
+    = 25% — well above the 5% default, so the torn-share guard blocks the
+    sweep and the only thing left to fail is the timestamp itself.
     """
     import ingest
 
@@ -144,7 +166,7 @@ def test_concurrent_ingest_runs_do_not_lose_or_duplicate_rows(
             EARLY: t0 + timedelta(seconds=2 * iteration + 1),
             LATE: t0 + timedelta(seconds=2 * iteration + 2),
         }
-        _run_both_concurrently(monkeypatch, ingest, stamps, manifests)
+        peak = _run_both_concurrently(monkeypatch, ingest, stamps, manifests)
 
         rows = fetch_all(
             clean_db,
@@ -152,6 +174,10 @@ def test_concurrent_ingest_runs_do_not_lose_or_duplicate_rows(
             "ORDER BY doc_id",
         )
         where = f"iteration {iteration}"
+        assert peak == 1, (
+            f"{where}: two runs upserted concurrently — the per-corpus lock "
+            "is not held"
+        )
         assert [r[0] for r in rows] == ALL_DOC_IDS, (
             f"{where}: a doc_id was lost or duplicated"
         )
