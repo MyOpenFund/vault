@@ -118,7 +118,7 @@ Consumer contract:
 
 ### Concurrency
 
-Each ingestion run holds two session-level Postgres advisory locks on its own connection: `vault-ddl` around the DDL train only (the `CREATE TABLE`/`ALTER`/view block above, serialized across every service and corpus), then `vault-ingest-<corpus>` for the documents, cadence, runs, and discovery-error passes, held through the end of the run. A run that finds a lock already held logs a WARNING naming the key and blocks until it is free — it never skips its work. Both locks are released on explicit unlock or when the connection closes, so a killed run never leaves one behind. Two overlapping runs of the *same* corpus serialize; different corpora run in parallel and never block each other. `documents.last_seen_at` is written as `GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)` on upsert, so even a writer that bypassed the lock could not rewind a stamp a newer run already set. The orchestrator's own writes (`runs`, `rag_ingestions`, and the probe `UPDATE` of `has_text_layer`/`page_count` on `documents`) take neither lock — a separate writer outside the ingestion service's transaction. Calling `ingest_cadence.run()` / `ingest_runs.run()` / `ingest_discovery_errors.run()` directly, outside `ingest.py`'s `main()`, bypasses the DDL lock entirely (each issues its own `CREATE TABLE IF NOT EXISTS`).
+Each ingestion run holds two session-level Postgres advisory locks on its own connection: `vault-ddl` around the DDL train only (the `CREATE TABLE`/`ALTER`/view block above, serialized across every service and corpus), then `vault-ingest-<corpus>` for the documents, cadence, runs, and discovery-error passes, held through the end of the run. A run that finds a lock already held logs a WARNING naming the key and blocks until it is free — it never skips its work. Both locks are released on explicit unlock or when the connection closes, so a killed run never leaves one behind — that holds for a killed *process* (the OS closes the socket and Postgres releases the session's locks immediately); a vanished *host* keeps them until TCP keepalive notices the dead peer, which can take minutes. On an hourly cron, one `waiting for it` WARNING per overlap is the expected signal that the lock did its job, not an error to page on. Two overlapping runs of the *same* corpus serialize; different corpora run in parallel and never block each other. `documents.last_seen_at` is written as `GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)` on upsert, so even a writer that bypassed the lock could not rewind a stamp a newer run already set. The orchestrator's own writes (`runs`, `rag_ingestions`, and the probe `UPDATE` of `has_text_layer`/`page_count` on `documents`) take neither lock — a separate writer outside the ingestion service's transaction. Calling `ingest_cadence.run()` / `ingest_runs.run()` / `ingest_discovery_errors.run()` directly, outside `ingest.py`'s `main()`, bypasses the DDL lock entirely (each issues its own `CREATE TABLE IF NOT EXISTS`).
 
 ### Migration (2026-09 substrate)
 
@@ -158,9 +158,13 @@ vaultctl download <doc_id>                    # fetch the raw file via the API
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest tests/ -q          # 73 unit tests
-# integration tests (59) need a live Postgres — CI runs them against a service container
+.venv/bin/python -m pytest tests/ -q              # unit tests
+.venv/bin/python -m pytest tests/ -q -m integration  # needs docker: throwaway Postgres
 ```
+
+Counts change with every branch; CI is the truth. The integration suite starts a
+throwaway `postgres:16` container per module, so it is skipped where docker is not
+available.
 
 ## License
 
