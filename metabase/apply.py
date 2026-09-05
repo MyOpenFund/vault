@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.request import urlopen  # bound here so a test can swap the transport
 
 LOG = logging.getLogger("metabase.apply")
 
@@ -103,8 +104,11 @@ class MetabaseClient:
         for header, value in self.auth_headers().items():
             request.add_header(header, value)
         LOG.debug("%s %s", method, path)
+        # Order matters: HTTPError is a URLError is an OSError, and so are the
+        # socket failures (TimeoutError, ConnectionResetError,
+        # http.client.RemoteDisconnected) the last branch is here to catch.
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout) as response:
                 status = response.status
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
@@ -112,9 +116,18 @@ class MetabaseClient:
             raise MetabaseError(exc.code, path, detail) from None
         except urllib.error.URLError as exc:
             raise MetabaseError(0, path, f"unreachable: {exc.reason}") from None
+        except OSError as exc:
+            raise MetabaseError(0, path, f"transport failed: {exc!s} ({type(exc).__name__})") \
+                from None
         if not 200 <= status < 300:
             raise MetabaseError(status, path, raw)
-        return json.loads(raw) if raw.strip() else None
+        if not raw.strip():
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            # A 2xx that is not JSON is a proxy or a login page, not an answer.
+            raise MetabaseError(status, path, f"response is not JSON ({exc}): {raw}") from None
 
 
 # -------------------------------------------------------------- pure builders
@@ -261,8 +274,8 @@ def plan(cards, dashboards, existing_cards, existing_dashboards) -> Plan:
     restricted to the target collection.
     """
     result = Plan()
-    card_ids_by_name = _ids_by_name(existing_cards)
-    dashboard_ids_by_name = _ids_by_name(existing_dashboards)
+    card_ids_by_name = _ids_by_name(existing_cards, "card")
+    dashboard_ids_by_name = _ids_by_name(existing_dashboards, "dashboard")
 
     for card in cards:
         existing_id = card_ids_by_name.get(card["name"])
@@ -283,12 +296,22 @@ def plan(cards, dashboards, existing_cards, existing_dashboards) -> Plan:
     return result
 
 
-def _ids_by_name(items) -> dict[str, int]:
-    return {
-        item["name"]: item["id"]
-        for item in items or []
-        if not item.get("archived", False)
-    }
+def _ids_by_name(items, kind: str = "card") -> dict[str, int]:
+    """Live objects by name. Metabase allows two of them to share a name; the
+    applier can only adopt one, so say which — the other is left orphaned."""
+    ids: dict[str, int] = {}
+    for item in items or []:
+        if item.get("archived", False):
+            continue
+        name = item["name"]
+        if name in ids:
+            LOG.warning(
+                "duplicate %s name %r (ids %s and %s): adopting id %s, "
+                "the other is left untouched",
+                kind, name, ids[name], item["id"], item["id"],
+            )
+        ids[name] = item["id"]
+    return ids
 
 
 # -------------------------------------------------------------------- summary
@@ -298,10 +321,11 @@ def _ids_by_name(items) -> dict[str, int]:
 class Summary:
     """Counts of what the apply did (or would do, under ``--dry-run``).
 
-    ``*_skipped`` counts definitions the applier deliberately did not send — a
-    dashboard whose cards could not all be resolved. An unchanged card is not
-    "skipped": it is PUT again (the JSON is the truth, and the API's own
-    normalisation makes a content diff unreliable), which leaves the card
+    ``dashboards_skipped`` counts definitions the applier deliberately did not
+    send — a dashboard whose cards could not all be resolved. Cards have no such
+    count: every card in the file is either created or updated. An unchanged card
+    is not "skipped" either: it is PUT again (the JSON is the truth, and the API's
+    own normalisation makes a content diff unreliable), which leaves the card
     byte-identical.
     """
 
@@ -309,7 +333,6 @@ class Summary:
     collection_created: bool = False
     cards_created: int = 0
     cards_updated: int = 0
-    cards_skipped: int = 0
     dashboards_created: int = 0
     dashboards_updated: int = 0
     dashboards_skipped: int = 0
@@ -321,7 +344,7 @@ class Summary:
         return (
             f"{prefix}: collection={self.collection_id}"
             f" (created={self.collection_created});"
-            f" cards +{self.cards_created} ~{self.cards_updated} !{self.cards_skipped};"
+            f" cards +{self.cards_created} ~{self.cards_updated};"
             f" dashboards +{self.dashboards_created} ~{self.dashboards_updated}"
             f" !{self.dashboards_skipped};"
             f" examples_archived={self.examples_archived}"

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import http.client
 import itertools
 import json
 import logging
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -316,6 +318,26 @@ def test_plan_splits_creates_and_updates():
     assert result.dashboard_ids_by_name[DASHBOARDS[0]["name"]] == 21
 
 
+def test_plan_warns_and_adopts_the_last_id_on_a_duplicate_name(caplog):
+    """Two live cards can share a name in Metabase; the applier then keeps
+    overwriting one of them and orphaning the other, which is worth a word."""
+    existing_cards = [
+        {"id": 11, "name": CARDS[0]["name"]},
+        {"id": 12, "name": CARDS[0]["name"]},
+    ]
+    with caplog.at_level(logging.WARNING, logger="metabase.apply"):
+        result = mb.plan(CARDS, DASHBOARDS, existing_cards, [])
+    assert result.card_ids_by_code[CARDS[0]["code"]] == 12
+    assert "duplicate" in caplog.text and CARDS[0]["name"] in caplog.text
+    assert "12" in caplog.text
+
+
+def test_ids_by_name_is_quiet_when_names_are_unique(caplog):
+    with caplog.at_level(logging.WARNING, logger="metabase.apply"):
+        mb.plan(CARDS, DASHBOARDS, [{"id": 11, "name": CARDS[0]["name"]}], [])
+    assert caplog.text == ""
+
+
 # ------------------------------------------------------------------- apply
 
 
@@ -460,6 +482,8 @@ def test_dry_run_issues_no_writes():
     assert summary.dry_run is True
     assert summary.cards_created == 18
     assert summary.dashboards_created == 3
+    assert summary.examples_archived is True  # "would archive", and it says so
+    assert "would apply" in summary.as_line()
     assert fake.cards == {} and fake.dashboards == {}
 
 
@@ -508,10 +532,124 @@ def test_client_never_reveals_the_credential():
     assert "super-secret" not in str(client)
 
 
+def test_summary_line_reports_only_counts_it_actually_keeps():
+    """`cards_skipped` never moved off zero — a token that can only ever read
+    `!0` is noise, so the card half of the line has none."""
+    summary = mb.Summary(collection_id=3, cards_created=1, cards_updated=2,
+                         dashboards_created=4, dashboards_updated=5,
+                         dashboards_skipped=6)
+    line = summary.as_line()
+    assert "cards +1 ~2;" in line
+    assert "dashboards +4 ~5 !6" in line
+    assert not hasattr(summary, "cards_skipped")
+
+
 def test_metabase_error_message_carries_status_and_path():
     error = mb.MetabaseError(404, "/api/card/1", "not found")
     assert error.status == 404 and error.path == "/api/card/1"
     assert "404" in str(error) and "/api/card/1" in str(error)
+
+
+# --- the transport under the client -------------------------------------
+# `urlopen` is bound at module level precisely so a test can replace it. A
+# transport failure (read timeout, dropped connection) and a 2xx body that is
+# not JSON are both MetabaseError, so `main` reports one ERROR line instead of
+# a traceback.
+
+
+class FakeResponse:
+    """What `urlopen` yields: a context manager with `.status` and `.read()`."""
+
+    def __init__(self, status=200, body=b"{}", read_error=None):
+        self.status = status
+        self._body = body
+        self._read_error = read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        if self._read_error is not None:
+            raise self._read_error
+        return self._body
+
+
+def _client_with_urlopen(monkeypatch, opener):
+    monkeypatch.setattr(mb, "urlopen", opener)
+    return mb.MetabaseClient("https://metabase.example", api_key="k")
+
+
+def test_request_wraps_a_read_timeout(monkeypatch):
+    client = _client_with_urlopen(
+        monkeypatch,
+        lambda request, timeout=None: FakeResponse(read_error=TimeoutError("timed out")),
+    )
+    with pytest.raises(mb.MetabaseError) as excinfo:
+        client.get("/api/card")
+    assert excinfo.value.status == 0
+    assert excinfo.value.path == "/api/card"
+    assert "timed out" in str(excinfo.value)
+
+
+def test_request_wraps_a_dropped_connection(monkeypatch):
+    def boom(request, timeout=None):
+        raise http.client.RemoteDisconnected("Remote end closed connection")
+
+    client = _client_with_urlopen(monkeypatch, boom)
+    with pytest.raises(mb.MetabaseError) as excinfo:
+        client.get("/api/database")
+    assert excinfo.value.status == 0
+    assert "Remote end closed connection" in str(excinfo.value)
+
+
+def test_request_wraps_a_non_json_2xx_body(monkeypatch):
+    client = _client_with_urlopen(
+        monkeypatch,
+        lambda request, timeout=None: FakeResponse(status=200, body=b"not json"),
+    )
+    with pytest.raises(mb.MetabaseError) as excinfo:
+        client.get("/api/card")
+    assert excinfo.value.status == 200
+    assert "not json" in str(excinfo.value)
+
+
+def test_request_still_reports_an_unreachable_host(monkeypatch):
+    """URLError is an OSError; the transport branch must not swallow it."""
+
+    def boom(request, timeout=None):
+        raise urllib.error.URLError("name or service not known")
+
+    client = _client_with_urlopen(monkeypatch, boom)
+    with pytest.raises(mb.MetabaseError) as excinfo:
+        client.get("/api/card")
+    assert excinfo.value.status == 0
+    assert "unreachable" in str(excinfo.value)
+
+
+def test_request_returns_the_parsed_body_on_success(monkeypatch):
+    client = _client_with_urlopen(
+        monkeypatch,
+        lambda request, timeout=None: FakeResponse(body=b'{"id": 7}'),
+    )
+    assert client.get("/api/database") == {"id": 7}
+
+
+def test_main_exits_1_on_a_transport_error(monkeypatch, caplog):
+    """End to end: a dropped connection is one ERROR line and exit 1."""
+
+    def boom(request, timeout=None):
+        raise http.client.RemoteDisconnected("Remote end closed connection")
+
+    monkeypatch.setattr(mb, "urlopen", boom)
+    monkeypatch.setenv("METABASE_URL", "https://metabase.example")
+    monkeypatch.setenv("METABASE_API_KEY", "k")
+    with caplog.at_level(logging.ERROR):
+        assert mb.main(["--dry-run"]) == 1
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
 
 
 # -------------------------------------------------------------------- main
