@@ -25,7 +25,7 @@ def clean_cadence(pg_url):
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS cadence")
+        cur.execute("DROP TABLE IF EXISTS cadence CASCADE")
     conn.close()
     return pg_url
 

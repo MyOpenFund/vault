@@ -1,0 +1,5 @@
+{"bank": "ecb", "context": "listing", "url": "https://www.ecb.europa.eu/press/pr/html/index.en.html?page=3", "error": "ReadTimeout: HTTPSConnectionPool(host='www.ecb.europa.eu', port=443): Read timed out. (read timeout=30)"}
+{"bank": "ecb", "context": "listing", "url": "https://www.ecb.europa.eu/press/pr/html/index.en.html?page=3", "error": "ReadTimeout: HTTPSConnectionPool(host='www.ecb.europa.eu', port=443): Read timed out. (read timeout=30)"}
+{"bank": "ecb", "context": "listing", "url": "https://www.ecb.europa.eu/press/pr/html/index.en.html?page=3", "error": "ReadTimeout: HTTPSConnectionPool(host='www.ecb.europa.eu', port=443): Read timed out. (read timeout=60)"}
+{"bank": "fed", "context": "wp_index", "url": "https://www.federalreserve.gov/econres/feds/index.htm", "error": "HTTPError: 503 Server Error: Service Unavailable for url: https://www.federalreserve.gov/econres/feds/index.htm"}
+{"bank": "jp", "context": "listing", "url": "https://www.boj.or.jp/en/research/wps_rev/index.htm", "error": "weird message with no class prefix"}

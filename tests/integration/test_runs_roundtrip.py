@@ -31,7 +31,7 @@ def clean_runs(pg_url):
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
     return pg_url
 
@@ -43,7 +43,7 @@ def _run(pg_url, data_dir):
     try:
         # ingest_runs.run() issues its own CREATE TABLE IF NOT EXISTS, so no
         # hand-written DDL is needed here (avoids drifting from the module).
-        return ingest_runs.run(conn, str(data_dir))
+        return ingest_runs.run(conn, str(data_dir), "central-bank")
     finally:
         conn.close()
 
@@ -107,7 +107,7 @@ def test_service_run_chains_documents_cadence_runs(clean_db, tmp_path, monkeypat
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs; DROP TABLE IF EXISTS cadence;")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE; DROP TABLE IF EXISTS cadence CASCADE;")
     conn.close()
 
     write_manifest(tmp_path, "us.jsonl", [make_doc("d1")])
@@ -129,7 +129,7 @@ def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
 
     run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only
@@ -165,7 +165,7 @@ def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS runs")
+        cur.execute("DROP TABLE IF EXISTS runs CASCADE")
     conn.close()
 
     run_ingest(monkeypatch, clean_db, tmp_path)  # empty manifest set: DDL only
@@ -187,3 +187,45 @@ def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
 
     assert second == first
     assert first == [("legacy-1", "data-orchestrator")]
+
+
+def test_runs_corpus_column_and_backfill(clean_runs, tmp_path):
+    # A row ingested before the column existed carried corpus inside extra;
+    # the train promotes it. New rows get the service corpus directly.
+    conn = psycopg2.connect(clean_runs)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, tool TEXT NOT NULL, "
+            "command TEXT, started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, "
+            "outcome TEXT, exit_code INTEGER, totals JSONB, sources JSONB, "
+            "extra JSONB, ingested_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        for run_id, extra in (
+            ("old-1", {"corpus": "central-bank", "host": "nas"}),
+            ("old-2", {"corpus": None, "host": "nas"}),      # JSON null: nothing to promote
+            ("old-3", {"corpus": 42, "host": "nas"}),        # not a string: not a corpus
+        ):
+            cur.execute(
+                "INSERT INTO runs (run_id, tool, extra) VALUES (%s, %s, %s)",
+                (run_id, "central-bank-corpus", json.dumps(extra)),
+            )
+    conn.close()
+    write_runs(tmp_path, [make_report("new-1")])
+    _run(clean_runs, tmp_path)
+    rows = _rows(clean_runs, "SELECT run_id, corpus FROM runs ORDER BY run_id")
+    assert rows == [
+        ("new-1", "central-bank"),
+        ("old-1", "central-bank"),
+        ("old-2", None),
+        ("old-3", None),
+    ]
+    assert _rows(clean_runs, "SELECT extra FROM runs WHERE run_id = 'old-1'") == [
+        ({"corpus": "central-bank", "host": "nas"},)          # the backfill leaves extra alone
+    ]
+
+
+def test_contradicting_corpus_line_is_rejected(clean_runs, tmp_path):
+    write_runs(tmp_path, [make_report("a", corpus="company"), make_report("b")])
+    _run(clean_runs, tmp_path)
+    assert _rows(clean_runs, "SELECT run_id, corpus FROM runs") == [("b", "central-bank")]
