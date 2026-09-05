@@ -29,7 +29,12 @@ def test_postgres_is_published_on_one_interface_never_on_all_of_them():
 
 def test_only_the_ingestion_service_still_uses_the_superuser():
     assert COMPOSE.count("postgresql://docuser:") == 1
-    assert "postgresql://vault_readonly:${VAULT_READONLY_PASSWORD}@postgres:5432/documents" in COMPOSE
+    # `:?` and not `:-`: an unset VAULT_READONLY_PASSWORD must fail at
+    # `compose up`, not silently build a DSN with an empty password that only
+    # fails later, inside the container, as an authentication error.
+    assert ("postgresql://vault_readonly:"
+            "${VAULT_READONLY_PASSWORD:?set it in .env — see .env.example}"
+            "@postgres:5432/documents") in COMPOSE
 
 
 def test_ingestion_receives_both_role_passwords():

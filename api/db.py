@@ -16,9 +16,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 EXPECTED_ROLE = "vault_readonly"
 
 FIRST_BOOT_HINT = (
-    "The vault's least-privilege roles are created by the DDL train, so on a "
-    "brand-new cluster %s does not exist until the ingestion service has run "
-    "once: `docker compose run --rm ingestion`. Check VAULT_READONLY_PASSWORD "
+    "The vault's least-privilege roles are created by the DDL train, so on any "
+    "cluster that has not run it yet %s does not exist until the ingestion "
+    "service has run once: `docker compose run --rm ingestion`. Check VAULT_READONLY_PASSWORD "
     "is set to the same value for both services. This container now exits "
     "non-zero; `restart: unless-stopped` will retry it."
 )
@@ -42,12 +42,22 @@ def _redact(text):
 
     URL-shaped DSNs only, which is what compose.yaml builds; a key=value DSN
     has no password to find here and is passed through unchanged.
+
+    A password shorter than 4 characters is a substring of half the words in an
+    English error message, so replacing it everywhere would mangle the message
+    without hiding the `user:pw@host` that leaks it anyway. Below that length
+    the DSN's whole authority is redacted instead.
     """
     try:
-        password = urlsplit(DATABASE_URL or "").password
+        parts = urlsplit(DATABASE_URL or "")
+        password, netloc = parts.password, parts.netloc
     except ValueError:  # unparseable DSN: nothing to redact, and nothing known
-        password = None
-    return text.replace(password, "***") if password else text
+        return text
+    if not password:
+        return text
+    if len(password) >= 4:
+        return text.replace(password, "***")
+    return text.replace(netloc, "***")
 
 
 def verify_connection():

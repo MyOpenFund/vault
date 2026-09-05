@@ -23,11 +23,13 @@ services:
     #
     # POSTGRES_BIND_ADDR MUST be a specific interface address: the tailnet IP
     # (`POSTGRES_BIND_ADDR=<tailnet-ip>`) on the NAS, 127.0.0.1 (the default)
-    # everywhere else. NEVER the all-zeroes wildcard address, never an empty
-    # one, and never a bind-address-less "5432:5432" (a unit test forbids all
-    # three) — Docker publishes ports by DNAT *ahead of* the host
-    # firewall, so this line is the only thing between the corpus and whatever
-    # networks the host sits on. Off-host clients authenticate with
+    # everywhere else. NEVER the all-zeroes wildcard address and never a
+    # bind-address-less "5432:5432" — a unit test forbids both literals in this
+    # file. An *empty* POSTGRES_BIND_ADDR is not a third literal to forbid: the
+    # `:-127.0.0.1` default below turns it back into the loopback, which is why
+    # the default must stay in the line. Docker publishes ports by DNAT *ahead
+    # of* the host firewall, so this line is the only thing between the corpus
+    # and whatever networks the host sits on. Off-host clients authenticate with
     # scram-sha-256 (the image's pg_hba trusts only the container's own
     # loopback) and must connect as vault_orchestrator or vault_readonly —
     # never docuser, which is a cluster superuser.
@@ -38,6 +40,12 @@ services:
       # -h 127.0.0.1 forces the REAL server: the entrypoint's temporary init
       # server listens on the unix socket only, so a socket-based pg_isready can
       # go green before deploy/initdb/01-metabase.sql has created `metabase`.
+      #
+      # Consequence on a data dir older than deploy/initdb/ (initdb scripts run
+      # on an EMPTY data dir only): no `metabase` database, so this check never
+      # goes green and `ingestion`/`api` stay blocked on service_healthy. Fix it
+      # once, by hand: `docker compose exec postgres createdb -U docuser
+      # -O docuser metabase` (or the CREATE DATABASE in deploy/initdb/).
       test:
         - CMD-SHELL
         - pg_isready -h 127.0.0.1 -U docuser -d documents && psql -h 127.0.0.1 -U docuser -d metabase -Atc 'SELECT 1' > /dev/null
@@ -94,11 +102,15 @@ services:
     build: ./api
     container_name: vault_api
     environment:
-      # Read-only by code AND by grant (#5). On a brand-new cluster the role
-      # does not exist until the first ingestion run: until then this container
-      # logs why and exits non-zero on startup, and `restart: unless-stopped`
-      # keeps retrying it. Run `docker compose run --rm ingestion` once.
-      DATABASE_URL: postgresql://vault_readonly:${VAULT_READONLY_PASSWORD}@postgres:5432/documents
+      # Read-only by code AND by grant (#5). On a cluster that has not yet run
+      # the new train the role does not exist: until then this container logs
+      # why and exits non-zero on startup, and `restart: unless-stopped` keeps
+      # retrying it. Run `docker compose run --rm ingestion` once.
+      #
+      # `:?` and not `:-`: an unset password should stop `compose up` here,
+      # loudly, rather than build a DSN with an empty password whose only
+      # symptom is an authentication failure inside the container.
+      DATABASE_URL: postgresql://vault_readonly:${VAULT_READONLY_PASSWORD:?set it in .env — see .env.example}@postgres:5432/documents
       RAW_DATA_DIR: /data/raw
     volumes:
       - ${RAW_DIR:?set it in .env — see .env.example}:/data/raw:ro   # needed to serve actual file downloads

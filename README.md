@@ -126,6 +126,27 @@ Additive. Run `docker compose run --rm ingestion` once after deploying: the trai
 
 Runbook: if the producer legitimately rotates (truncates) `discovery_errors.jsonl`, the retain-fraction guard above will otherwise leave the table stuck on the pre-rotation snapshot — run `docker compose run --rm -e DISCOVERY_ERRORS_MIN_RETAIN_FRACTION=0.0 ingestion` once to accept the drop (or set the variable in `.env`), then revert to the default. The upsert never deletes: after such a run, fingerprints absent from the new file keep the `occurrences` they had before the rotation, and only the fingerprints present in it are reset to their post-rotation count.
 
+### Migration (2026-09 access & roles)
+
+Not additive: this one needs two variables in the deployment's `.env` **before** the new tree is
+pulled, because the API's DSN now refuses to interpolate without one of them (`compose up` stops
+with `required variable VAULT_READONLY_PASSWORD is missing a value`).
+
+1. Add `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` to the deployment's `.env`
+   (see `.env.example`) — first, before pulling.
+2. `docker compose run --rm ingestion` — the DDL train creates the two roles and issues their
+   grants. Nothing is run by hand against the cluster.
+3. `docker compose up -d api` — the API is recreated (its environment changed). Until step 2 has
+   run, it crash-loops loudly: one `ERROR` naming `vault_readonly` and the command that fixes it,
+   then a non-zero exit, retried by `restart: unless-stopped`.
+
+Then, as operator steps outside the repo: point Metabase's **analytics** connection at
+`vault_readonly` in the UI (Admin → Databases → the vault connection → user/password; Metabase's
+own *application* database keeps `docuser`, which needs DDL on its own schema), and — on the NAS
+compose only — uncomment the `ports:` block and set `POSTGRES_BIND_ADDR` to the tailnet address if
+the off-host orchestrator must reach Postgres. Rollback is `git checkout` of the previous tree:
+the roles are extra objects, nothing the old services used was dropped or revoked.
+
 ### Fact columns on `documents`
 
 `has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by `data-orchestrator`'s probe pass only — manifests never carry them and the manifest upsert never touches them.
@@ -161,8 +182,9 @@ which is how the dev and CI clusters run with no roles at all. **Rotation**: cha
 `.env`, run `docker compose run --rm ingestion` once (the train re-applies the password every
 run), then update the consumer. Nothing is ever run by hand against the cluster.
 
-**First boot ordering.** The roles do not exist until the first ingestion run, so on a brand-new
-cluster the API cannot connect. It says so and stops: one `ERROR` naming the role and the command
+**First boot ordering.** The roles do not exist until the first ingestion run of *this* tree, so
+on any cluster that has not yet run it — a brand-new one, or an existing deployment being upgraded
+— the API cannot connect. It says so and stops: one `ERROR` naming the role and the command
 to run, then a non-zero exit, with `restart: unless-stopped` retrying — never a silent 500 behind
 a green `/health`. On a new deployment, run the ingestion once before (or right after) starting
 the API:
@@ -223,9 +245,12 @@ docker compose run --rm ingestion            # schema + roles, syncs the manifes
 docker compose up -d api metabase
 ```
 
-Order matters on a brand-new cluster only: the API connects as `vault_readonly`, a role the
-ingestion run creates (see [Access & roles](#access--roles)). Afterwards, `docker compose up -d`
-brings everything back in any order, and ingestion is re-run on demand or from cron.
+Order matters on any cluster that has not yet run the new train: the API connects as
+`vault_readonly`, a role the ingestion run creates (see [Access & roles](#access--roles)) — that
+includes an existing deployment upgrading to this tree, not just a brand-new cluster (see
+[Migration (2026-09 access & roles)](#migration-2026-09-access--roles)). Once the roles exist,
+`docker compose up -d` brings everything back in any order, and ingestion is re-run on demand or
+from cron.
 
 ## CLI
 

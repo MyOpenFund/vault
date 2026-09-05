@@ -83,6 +83,18 @@ def test_the_drivers_echo_of_the_connection_string_is_redacted(monkeypatch, capl
     assert "invalid dsn" in logged
 
 
+def test_a_very_short_password_redacts_the_whole_dsn_authority(monkeypatch):
+    # A 1-3 character password is a substring of half the words in an error
+    # message: replacing it everywhere mangles the message without protecting
+    # anything, and a message that still shows `user:ab@host` leaks it anyway.
+    # Below the threshold the DSN's whole authority goes instead.
+    short = "postgresql://vault_readonly:ab@postgres:5432/documents"
+    monkeypatch.setattr(db, "DATABASE_URL", short)
+    redacted = db._redact(f"invalid dsn: {short} (a bad database)")
+    assert "vault_readonly:ab@postgres:5432" not in redacted
+    assert "a bad database" in redacted  # the rest of the message survives
+
+
 def test_the_app_refuses_to_start_when_the_database_is_unreachable(monkeypatch):
     # Uvicorn turns a lifespan-startup exception into a non-zero exit, which is
     # what `restart: unless-stopped` then retries -- visibly.
