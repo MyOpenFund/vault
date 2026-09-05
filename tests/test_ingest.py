@@ -155,3 +155,12 @@ def test_upsert_never_rewinds_last_seen_at():
     set_clause = UPSERT_SQL.split("DO UPDATE SET", 1)[1]
     assert "last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)" in set_clause
     assert "last_seen_at = EXCLUDED.last_seen_at" not in set_clause
+
+
+def test_lock_keys_are_distinct_per_corpus_and_from_the_ddl_lock():
+    # vault #3: two runs of the same corpus serialize on their own key; a
+    # different corpus (and the global DDL key) must never collide with it.
+    from ingest import DDL_LOCK_KEY, corpus_lock_key
+    assert corpus_lock_key("central-bank") == "vault-ingest-central-bank"
+    assert corpus_lock_key("central-bank") != corpus_lock_key("company")
+    assert DDL_LOCK_KEY not in {corpus_lock_key("central-bank"), corpus_lock_key("company")}
