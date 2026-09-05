@@ -124,7 +124,8 @@ def test_statements_are_issued_in_the_documented_order_and_no_others():
     assert "CREATE ROLE" in got[2]
     assert "ALTER ROLE" in got[3]
     assert not any("log_statement" in statement or
-                   "log_min_error_statement" in statement for statement in got)
+                   "log_min_error_statement" in statement or
+                   "log_min_duration_statement" in statement for statement in got)
     for statement, template in zip(got[4:-1], grants):
         head = template.split("{")[0].strip()
         assert head in statement, f"expected {head!r} in {statement}"
@@ -147,16 +148,22 @@ def test_log_statement_is_muted_around_the_alter_role_and_restored_right_after()
     # log_statement = 'ddl' keeps its audit trail of the GRANTs.
     # log_min_error_statement goes with it: its default logs a FAILING
     # statement in full, which for the ALTER ROLE means the password literal.
+    # log_min_duration_statement goes with them: a server with slow-query
+    # logging on (>= 0) logs the statement text of anything slow enough, and
+    # the ALTER ROLE is the one statement whose text is the password.
     cur = FakeCursor(superuser=True)
     roles.ensure_roles(cur, {roles.ROLE_ORCHESTRATOR: "s3cr3t"})
     got = cur.statements()
     assert "SET LOCAL log_statement" in got[3]
     assert "SET LOCAL log_min_error_statement" in got[4]
-    assert "ALTER ROLE" in got[5]
-    assert "RESET log_statement" in got[6]
-    assert "RESET log_min_error_statement" in got[7]
+    assert "SET LOCAL log_min_duration_statement = -1" in got[5]
+    assert "ALTER ROLE" in got[6]
+    assert "RESET log_statement" in got[7]
+    assert "RESET log_min_error_statement" in got[8]
+    assert "RESET log_min_duration_statement" in got[9]
     assert sum("log_statement" in statement for statement in got) == 2
     assert sum("log_min_error_statement" in statement for statement in got) == 2
+    assert sum("log_min_duration_statement" in statement for statement in got) == 2
 
 
 def test_grant_templates_are_the_documented_surface_and_nothing_more():

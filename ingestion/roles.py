@@ -156,11 +156,14 @@ def ensure_roles(cur, passwords):
 def _can_quiet_password_logging(cur):
     """Whether this connection may mute the server log around the ALTER ROLE.
 
-    Two settings are muted together: log_statement (which would echo the
-    ALTER ROLE on a server running 'ddl' or 'all') and log_min_error_statement
+    Three settings are muted together: log_statement (which would echo the
+    ALTER ROLE on a server running 'ddl' or 'all'), log_min_error_statement
     (whose default logs a FAILING statement in full, password literal
-    included). Both are SUSET, so the SET is only attempted on a superuser
-    connection -- a failed SET would abort the whole train's transaction.
+    included) and log_min_duration_statement (which, set to anything >= 0,
+    logs the statement text of anything slow enough -- and "slow enough" is
+    not something this train controls). All three are SUSET, so the SET is
+    only attempted on a superuser connection -- a failed SET would abort the
+    whole train's transaction.
     """
     cur.execute("SELECT current_setting('is_superuser') = 'on'")
     (is_superuser,) = cur.fetchone()
@@ -183,12 +186,18 @@ def _provision(cur, role, password, dbname, quiet=False):
         # server log the FAILING statement in full, so without this a failing
         # ALTER ROLE would write the password literal into the server log --
         # exactly the leak log_statement = 'none' was meant to prevent.
+        # log_min_duration_statement is the third door into the same log: at
+        # any value >= 0 the server logs the text of a statement that ran
+        # longer than it, and a cluster under load can make even an ALTER ROLE
+        # slow. -1 is the off value.
         alter_role = (
             [sql.SQL("SET LOCAL log_statement = 'none'"),
-             sql.SQL("SET LOCAL log_min_error_statement = 'panic'")]
+             sql.SQL("SET LOCAL log_min_error_statement = 'panic'"),
+             sql.SQL("SET LOCAL log_min_duration_statement = -1")]
             + alter_role
             + [sql.SQL("RESET log_statement"),
-               sql.SQL("RESET log_min_error_statement")]
+               sql.SQL("RESET log_min_error_statement"),
+               sql.SQL("RESET log_min_duration_statement")]
         )
     statements = [
         sql.SQL(_CREATE_ROLE_SQL).format(name=sql.Literal(role), role=ident),

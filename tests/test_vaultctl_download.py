@@ -19,6 +19,17 @@ from vaultctl import safe_filename
     ('attachment; filename=""', "doc123"),
     ('attachment', "doc123"),
     (None, "doc123"),
+    # A parameter AFTER filename= is legal in the grammar (RFC 6266 §4.1), so
+    # the value ends at the next `;`, not at the end of the header. Splitting
+    # from the right first would have produced `a.pdf"; size=3`.
+    ('attachment; filename="a.pdf"; size=3', "a.pdf"),
+    ('attachment; size=3; filename="a.pdf"', "a.pdf"),
+    ('attachment; filename=a.pdf; size=3', "a.pdf"),
+    # ... and the traversal defence still applies to the trimmed value.
+    ('attachment; filename="../../etc/passwd"; size=3', "passwd"),
+    ('attachment; filename=".."; size=3', "doc123"),
+    ('attachment; filename=""; size=3', "doc123"),
+    ('attachment; filename=; size=3', "doc123"),
 ])
 def test_safe_filename_is_always_a_bare_basename(header, expected):
     assert safe_filename(header, "doc123") == expected

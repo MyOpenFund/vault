@@ -123,14 +123,28 @@ def get_document(doc_id: str):
 def safe_filename(content_disposition, fallback):
     """The download filename, reduced to a bare basename.
 
+    The header is a disposition type followed by `;`-separated parameters
+    (RFC 6266 §4.1), so `filename` is not necessarily the last one: the value
+    ends at the next `;`. Splitting the whole header on `filename=` alone
+    would swallow any parameter that follows it, turning
+    `attachment; filename="a.pdf"; size=3` into `a.pdf"; size=3`.
+
     The server's Content-Disposition is untrusted input (the default transport
-    is plain HTTP): `Path(name).name` strips any directory part, so neither an
-    absolute path nor a "../" traversal can move the write out of the chosen
-    output directory (vault #5).
+    is plain HTTP), so whatever the split yields is reduced to a basename:
+    `Path(name).name` strips any directory part, and neither an absolute path
+    nor a "../" traversal can move the write out of the chosen output
+    directory (vault #5).
     """
-    if not content_disposition or "filename=" not in content_disposition:
+    if not content_disposition:
         return fallback
-    raw = content_disposition.split("filename=")[-1].strip().strip('"')
+    raw = None
+    for parameter in content_disposition.split(";"):
+        parameter = parameter.strip()
+        if parameter.startswith("filename="):
+            raw = parameter[len("filename="):].strip().strip('"')
+            break
+    if raw is None:
+        return fallback
     name = Path(raw).name
     return name if name not in ("", ".", "..") else fallback
 
