@@ -64,9 +64,12 @@ Publication-cadence report, one row per `(corpus, source_code, doc_type)` series
 
 ### Table `runs`
 
-Run telemetry for every stack tool: one row per run, append-only
-(`INSERT ... ON CONFLICT (run_id) DO NOTHING` — producer-side file rotation is
-always safe). Columns: `run_id` (PK), `tool`, `command`, `started_at`,
+Run telemetry for every stack tool: one row per run, append-only for content
+(`INSERT ... ON CONFLICT (run_id) DO UPDATE SET corpus = coalesce(runs.corpus,
+EXCLUDED.corpus)` — no stored column is ever rewritten, so producer-side file
+rotation is always safe; `corpus` alone is filled in when NULL, a one-time
+repair of the rows ingested before the column existed). A `run_id` repeated
+inside one file keeps its first occurrence. Columns: `run_id` (PK), `tool`, `command`, `started_at`,
 `finished_at`, `outcome` (`ok` | `degraded` | `failed`), `exit_code`,
 `totals` (JSONB), `sources` (JSONB array of per-source stats incl. the
 `truncated` flag), `corpus`, `extra`. `corpus` is the ingesting service's

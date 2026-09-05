@@ -27,7 +27,7 @@ of this service's corpus.
 
 After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
 the `cadence` table as a full replace (see ingest_cadence.py for the
-transactional semantics), DATA_DIR/runs.jsonl append-only into `runs`
+transactional semantics), DATA_DIR/runs.jsonl content-append-only into `runs`
 (ingest_runs.py), and DATA_DIR/discovery_errors.jsonl into `discovery_errors`
 as a fingerprint-keyed snapshot upsert (ingest_discovery_errors.py).
 """
@@ -220,9 +220,12 @@ CREATE TABLE IF NOT EXISTS cadence (
 );
 
 -- Run telemetry: one row per producer run (central-bank-corpus via
--- data/runs.jsonl handoff; data-orchestrator writes directly). Append-only:
--- ingestion is INSERT ... ON CONFLICT (run_id) DO NOTHING, so producer-side
--- file rotation is always safe. Owned and populated by ingest_runs.py.
+-- data/runs.jsonl handoff; data-orchestrator writes directly). Append-only
+-- for content: ingestion is INSERT ... ON CONFLICT (run_id) DO UPDATE SET
+-- corpus = coalesce(runs.corpus, EXCLUDED.corpus), which rewrites no stored
+-- column, so producer-side file rotation is always safe; `corpus` alone is
+-- filled in when NULL (one-time repair of rows ingested before the column
+-- existed, which the producer has never emitted and DO NOTHING never fixed). Owned and populated by ingest_runs.py.
 -- Included here too so the full target schema exists after any service run's
 -- DDL train, even on a deployment with no runs producer. ingest_runs.run()
 -- also issues this same CREATE TABLE IF NOT EXISTS (index included) so the
