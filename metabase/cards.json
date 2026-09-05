@@ -148,7 +148,7 @@
         }
       }
     },
-    "sql": "-- Documents with RAG state\nSELECT d.doc_id,\n       d.source_code   AS bank,\n       d.doc_type      AS type,\n       d.date,\n       d.title,\n       (r.doc_id IS NOT NULL) AS in_rag,\n       r.chunk_count   AS n_chunks,\n       r.embedding_model,\n       r.ingested_at   AS rag_ingested_at,\n       coalesce(d.pdf_url, d.source_url) AS official_link,\n       d.page_count,\n       d.has_text_layer\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  AND ({{rag_state}} = 'any'\n       OR ({{rag_state}} = 'in'  AND r.doc_id IS NOT NULL)\n       OR ({{rag_state}} = 'out' AND r.doc_id IS NULL))\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\nORDER BY d.date DESC NULLS LAST, d.doc_id\nLIMIT 2000;\n",
+    "sql": "-- Documents with RAG state\nSELECT d.doc_id,\n       d.source_code   AS bank,\n       d.doc_type      AS type,\n       d.date,\n       d.title,\n       (r.doc_id IS NOT NULL) AS in_rag,\n       r.chunk_count   AS n_chunks,\n       r.embedding_model,\n       r.ingested_at   AS rag_ingested_at,\n       coalesce(d.pdf_url, d.source_url) AS official_link,\n       d.page_count,\n       d.has_text_layer\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND ({{rag_state}} = 'any'\n       OR ({{rag_state}} = 'in'  AND r.doc_id IS NOT NULL)\n       OR ({{rag_state}} = 'out' AND r.doc_id IS NULL))]]\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\nORDER BY d.date DESC NULLS LAST, d.doc_id\nLIMIT 2000;\n",
     "tags": {
       "corpus": {
         "type": "text",
@@ -182,8 +182,8 @@
       },
       "rag_state": {
         "type": "text",
-        "required": true,
-        "default": "any",
+        "required": false,
+        "default": null,
         "display_name": "RAG state (any / in / out)"
       }
     }
@@ -258,7 +258,7 @@
     "visualization_settings": {
       "table.pivot": false
     },
-    "sql": "-- Publication anomalies (missing / low / exceptional yearly volume)\nWITH params AS (\n    SELECT {{ref_date}}::date       AS as_of,\n           {{window_years}}::int    AS window_years,\n           {{min_nonzero_years}}::int AS min_nonzero_years,\n           {{min_baseline}}::numeric  AS min_baseline,\n           {{low_ratio}}::numeric     AS low_ratio,\n           {{high_ratio}}::numeric    AS high_ratio\n), win AS (\n    SELECT (extract(year FROM as_of)::int - 1)             AS y_to,\n           (extract(year FROM as_of)::int - window_years)   AS y_from,\n           min_nonzero_years, min_baseline, low_ratio, high_ratio\n    FROM params\n), yearly AS (\n    SELECT d.source_code, d.doc_type, d.year, count(*)::int AS n\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.year IS NOT NULL\n      [[AND d.source_code = {{bank}}]]\n    GROUP BY 1, 2, 3\n), span AS (\n    SELECT source_code, doc_type, min(year) AS y_start, max(year) AS y_end\n    FROM yearly GROUP BY 1, 2\n), grid AS (\n    SELECT s.source_code, s.doc_type, gs.year::int AS year\n    FROM span s CROSS JOIN win w\n    CROSS JOIN LATERAL generate_series(greatest(s.y_start, w.y_from),\n                                       least(s.y_end,   w.y_to)) AS gs(year)\n), counts AS (\n    SELECT g.source_code, g.doc_type, g.year, coalesce(y.n, 0) AS n\n    FROM grid g\n    LEFT JOIN yearly y\n           ON y.source_code = g.source_code\n          AND y.doc_type    = g.doc_type\n          AND y.year        = g.year\n), baseline AS (\n    SELECT source_code, doc_type,\n           percentile_cont(0.5) WITHIN GROUP (ORDER BY n)\n               FILTER (WHERE n > 0)              AS baseline,\n           count(*) FILTER (WHERE n > 0)::int    AS nonzero_years,\n           count(*)::int                         AS years_considered\n    FROM counts GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.year,\n       c.n           AS documents,\n       round(b.baseline::numeric, 1) AS baseline_per_year,\n       b.nonzero_years,\n       round((100.0 * c.n / nullif(b.baseline, 0))::numeric, 0) AS pct_of_baseline,\n       CASE WHEN c.n = 0                          THEN 'missing'\n            WHEN c.n < w.low_ratio  * b.baseline  THEN 'low'\n            WHEN c.n > w.high_ratio * b.baseline  THEN 'exceptional'\n       END AS anomaly\nFROM counts c\nJOIN baseline b\n  ON b.source_code = c.source_code AND b.doc_type = c.doc_type\nCROSS JOIN win w\nWHERE b.nonzero_years >= w.min_nonzero_years\n  AND b.baseline      >= w.min_baseline\n  AND (c.n = 0\n       OR c.n < w.low_ratio  * b.baseline\n       OR c.n > w.high_ratio * b.baseline)\nORDER BY c.source_code, c.doc_type, c.year;\n",
+    "sql": "-- Publication anomalies (missing / low / exceptional yearly volume)\nWITH params AS (\n    SELECT coalesce(NULL::date [[, {{ref_date}}]], current_date) AS as_of,\n           {{window_years}}::int    AS window_years,\n           {{min_nonzero_years}}::int AS min_nonzero_years,\n           {{min_baseline}}::numeric  AS min_baseline,\n           {{low_ratio}}::numeric     AS low_ratio,\n           {{high_ratio}}::numeric    AS high_ratio\n), win AS (\n    SELECT (extract(year FROM as_of)::int - 1)             AS y_to,\n           (extract(year FROM as_of)::int - window_years)   AS y_from,\n           min_nonzero_years, min_baseline, low_ratio, high_ratio\n    FROM params\n), yearly AS (\n    SELECT d.source_code, d.doc_type, d.year, count(*)::int AS n\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.year IS NOT NULL\n      [[AND d.source_code = {{bank}}]]\n    GROUP BY 1, 2, 3\n), span AS (\n    SELECT source_code, doc_type, min(year) AS y_start, max(year) AS y_end\n    FROM yearly GROUP BY 1, 2\n), grid AS (\n    SELECT s.source_code, s.doc_type, gs.year::int AS year\n    FROM span s CROSS JOIN win w\n    CROSS JOIN LATERAL generate_series(greatest(s.y_start, w.y_from),\n                                       least(s.y_end,   w.y_to)) AS gs(year)\n), counts AS (\n    SELECT g.source_code, g.doc_type, g.year, coalesce(y.n, 0) AS n\n    FROM grid g\n    LEFT JOIN yearly y\n           ON y.source_code = g.source_code\n          AND y.doc_type    = g.doc_type\n          AND y.year        = g.year\n), baseline AS (\n    SELECT source_code, doc_type,\n           percentile_cont(0.5) WITHIN GROUP (ORDER BY n)\n               FILTER (WHERE n > 0)              AS baseline,\n           count(*) FILTER (WHERE n > 0)::int    AS nonzero_years,\n           count(*)::int                         AS years_considered\n    FROM counts GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.year,\n       c.n           AS documents,\n       round(b.baseline::numeric, 1) AS baseline_per_year,\n       b.nonzero_years,\n       round((100.0 * c.n / nullif(b.baseline, 0))::numeric, 0) AS pct_of_baseline,\n       CASE WHEN c.n = 0                          THEN 'missing'\n            WHEN c.n < w.low_ratio  * b.baseline  THEN 'low'\n            WHEN c.n > w.high_ratio * b.baseline  THEN 'exceptional'\n       END AS anomaly\nFROM counts c\nJOIN baseline b\n  ON b.source_code = c.source_code AND b.doc_type = c.doc_type\nCROSS JOIN win w\nWHERE b.nonzero_years >= w.min_nonzero_years\n  AND b.baseline      >= w.min_baseline\n  AND (c.n = 0\n       OR c.n < w.low_ratio  * b.baseline\n       OR c.n > w.high_ratio * b.baseline)\nORDER BY c.source_code, c.doc_type, c.year;\n",
     "tags": {
       "corpus": {
         "type": "text",
@@ -274,8 +274,8 @@
       },
       "ref_date": {
         "type": "date",
-        "required": true,
-        "default": "2026-09-05",
+        "required": false,
+        "default": null,
         "display_name": "Reference date"
       },
       "window_years": {
@@ -348,7 +348,7 @@
     "visualization_settings": {
       "table.pivot": false
     },
-    "sql": "-- Expected vs observed publication rate\nWITH observed AS (\n    SELECT d.source_code, d.doc_type,\n           count(*) FILTER (WHERE d.date >= ({{ref_date}}::date - INTERVAL '3 years'))::numeric / 3.0\n               AS observed_per_year_3y\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.date IS NOT NULL\n      AND d.date <= {{ref_date}}::date\n    GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.expected_per_year,\n       round(coalesce(o.observed_per_year_3y, 0), 2) AS observed_per_year_3y,\n       round(coalesce(o.observed_per_year_3y, 0) - c.expected_per_year, 2) AS gap,\n       c.status\nFROM cadence c\nLEFT JOIN observed o\n       ON o.source_code = c.source_code AND o.doc_type = c.doc_type\nWHERE c.corpus = {{corpus}}\n  [[AND c.source_code = {{bank}}]]\nORDER BY gap ASC NULLS LAST;\n",
+    "sql": "-- Expected vs observed publication rate\nWITH params AS (\n    SELECT coalesce(NULL::date [[, {{ref_date}}]], current_date) AS as_of\n), observed AS (\n    SELECT d.source_code, d.doc_type,\n           count(*) FILTER (WHERE d.date >= (p.as_of - INTERVAL '3 years'))::numeric / 3.0\n               AS observed_per_year_3y\n    FROM documents d\n    CROSS JOIN params p\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.date IS NOT NULL\n      AND d.date <= p.as_of\n    GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.expected_per_year,\n       round(coalesce(o.observed_per_year_3y, 0), 2) AS observed_per_year_3y,\n       round(coalesce(o.observed_per_year_3y, 0) - c.expected_per_year, 2) AS gap,\n       c.status\nFROM cadence c\nLEFT JOIN observed o\n       ON o.source_code = c.source_code AND o.doc_type = c.doc_type\nWHERE c.corpus = {{corpus}}\n  [[AND c.source_code = {{bank}}]]\nORDER BY gap ASC NULLS LAST;\n",
     "tags": {
       "corpus": {
         "type": "text",
@@ -364,8 +364,8 @@
       },
       "ref_date": {
         "type": "date",
-        "required": true,
-        "default": "2026-09-05",
+        "required": false,
+        "default": null,
         "display_name": "Reference date"
       }
     }

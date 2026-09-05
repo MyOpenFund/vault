@@ -38,6 +38,9 @@ PROBES = {
     "doc_type": "'A1'",
     "status": "'overdue'",
     "as_of": "'2026-12-31'::date",
+    # C4's rag_state is optional (unset = no restriction); the filled branch has
+    # to bind one of the three words the predicate knows, not a stray string.
+    "rag_state": "'any'",
 }
 
 
