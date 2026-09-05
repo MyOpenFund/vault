@@ -748,7 +748,15 @@ def main(*, corpus=None, data_dir=None):
         )
 
     except Exception:
-        conn.rollback()
+        # Best effort, like the finally below: when the run failed *because*
+        # the connection dropped, rollback() raises InterfaceError of its own
+        # and would replace the real cause — the operator would see
+        # "connection already closed" and never the error that killed the run,
+        # and the log.exception line below would never run either.
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — never mask the original failure
+            log.warning("rollback failed on a broken connection; closing it instead")
         log.exception(
             "Run failed; uncommitted work rolled back "
             "(committed document batches are unaffected)"
