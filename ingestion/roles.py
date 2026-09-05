@@ -72,6 +72,16 @@ DO $do$ BEGIN
 END $do$
 """
 
+# Every attribute is spelled out, including the ones that are already the
+# CREATE ROLE default: this statement runs on every train, so it is what makes
+# the role's cluster powers CONVERGE. A role widened out of band (a rushed psql
+# session, an older deploy script) is narrowed back the next night instead of
+# keeping whatever it was given.
+_ALTER_ROLE_SQL = (
+    "ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+    "NOBYPASSRLS PASSWORD {password}"
+)
+
 
 def grant_templates(role):
     """Every grant statement template issued for `role`, in order.
@@ -109,38 +119,49 @@ def ensure_roles(cur, passwords):
         return []
     cur.execute("SELECT current_database()")
     (dbname,) = cur.fetchone()
-    _quiet_password_logging(cur)
+    quiet = _can_quiet_password_logging(cur)
 
     provisioned = []
     for role in ROLES:
         if role not in passwords:
             continue
-        _provision(cur, role, passwords[role], dbname)
+        _provision(cur, role, passwords[role], dbname, quiet)
         provisioned.append(role)
     log.info(f"roles provisioned: {', '.join(provisioned)}")
     return provisioned
 
 
-def _quiet_password_logging(cur):
-    """Best effort: keep ALTER ROLE ... PASSWORD out of a server log configured
-    with log_statement = 'ddl' (the default is 'none', so this usually changes
-    nothing). log_statement is SUSET, so it is only attempted on a superuser
+def _can_quiet_password_logging(cur):
+    """Whether this connection may mute log_statement around the ALTER ROLE.
+
+    log_statement is SUSET, so the SET is only attempted on a superuser
     connection -- a failed SET would abort the whole train's transaction.
-    SET LOCAL is reverted when the train commits."""
+    """
     cur.execute("SELECT current_setting('is_superuser') = 'on'")
     (is_superuser,) = cur.fetchone()
-    if is_superuser:
-        cur.execute("SET LOCAL log_statement = 'none'")
+    return is_superuser
 
 
-def _provision(cur, role, password, dbname):
+def _provision(cur, role, password, dbname, quiet=False):
     ident = sql.Identifier(role)
+    alter_role = [
+        sql.SQL(_ALTER_ROLE_SQL).format(role=ident, password=sql.Literal(password)),
+    ]
+    if quiet:
+        # Muted for exactly one statement -- the only one carrying the literal
+        # -- and restored immediately: a server running log_statement = 'ddl'
+        # keeps its audit trail of every GRANT this function issues. (The
+        # default is 'none', so on most servers this changes nothing.) On the
+        # failure path the RESET is skipped, which is harmless: the train's
+        # transaction is already doomed and SET LOCAL dies with it.
+        alter_role = (
+            [sql.SQL("SET LOCAL log_statement = 'none'")]
+            + alter_role
+            + [sql.SQL("RESET log_statement")]
+        )
     statements = [
         sql.SQL(_CREATE_ROLE_SQL).format(name=sql.Literal(role), role=ident),
-        sql.SQL("ALTER ROLE {role} WITH LOGIN PASSWORD {password}").format(
-            role=ident, password=sql.Literal(password)
-        ),
-    ] + [
+    ] + alter_role + [
         sql.SQL(tpl).format(role=ident, db=sql.Identifier(dbname))
         for tpl in grant_templates(role)
     ]
@@ -148,10 +169,10 @@ def _provision(cur, role, password, dbname):
         try:
             cur.execute(statement)
         except Exception:
-            # Clear this frame before the traceback captures it: `statement`
-            # and `statements` hold a Literal whose repr is the password, and
-            # a --showlocals-style reporter would print it.
-            statement = statements = password = None
+            # Clear this frame before the traceback captures it: `statement`,
+            # `statements` and `alter_role` hold a Literal whose repr is the
+            # password, and a --showlocals-style reporter would print it.
+            statement = statements = alter_role = password = None
             # `from None` is load-bearing: a chained psycopg2 error carries
             # cur.query, i.e. the rendered ALTER ROLE with the password in it.
             raise RuntimeError(f"failed to provision role {role}") from None
