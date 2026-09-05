@@ -164,3 +164,16 @@ def test_feature_coverage_map_is_complete():
     for feature, cards in coverage.items():
         missing = cards - codes
         assert not missing, f"inventory #{feature}: missing {missing}"
+
+
+@pytest.mark.parametrize("card", CARDS, ids=[c["code"] for c in CARDS])
+def test_no_card_sql_contains_a_question_mark(card):
+    """Metabase talks to Postgres through pgjdbc, which treats a bare `?`
+    anywhere in a native query as a positional placeholder — the JSONB
+    operators `?`, `?|` and `?&` therefore blow up at execution time (Metabase
+    issues #1964, #14680, #41151). psycopg2 does not, so the integration guard
+    cannot see it; this one can."""
+    assert "?" not in card["sql"], (
+        f"{card['code']}: use jsonb_exists / jsonb_exists_any instead of ?/?|/?& "
+        "— pgjdbc treats ? as a placeholder"
+    )

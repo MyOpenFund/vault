@@ -40,10 +40,16 @@ card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
 - Cards **read only**: no card creates or alters a schema object. The only view
   they use (`rag_backlog`, read by Q4) belongs to `ingestion/ingest.py`'s DDL train.
 - Dashboards are a 24-column grid; dashcards must not overlap.
+- **No `?` anywhere in a card's SQL.** Metabase reaches Postgres through pgjdbc,
+  which reads a bare `?` in a native query as a positional placeholder, so the
+  JSONB operators `?`, `?|` and `?&` break the card at execution time (Metabase
+  issues #1964, #14680, #41151). Write `jsonb_exists(col, 'key')`,
+  `jsonb_exists_any(col, array[…])` and `jsonb_exists_all(col, array[…])`
+  instead (pinned by `test_no_card_sql_contains_a_question_mark`).
 
 ## Deviations from the source catalogue
 
-Three, all deliberate; everything else is the catalogue's SQL verbatim.
+Four, all deliberate; everything else is the catalogue's SQL verbatim.
 
 1. **Q5 · `error_type` → `error_class`.** The shipped `discovery_errors` table
    has `error_class`; the catalogue's *proposed* DDL called it `error_type`. The
@@ -61,6 +67,11 @@ Three, all deliberate; everything else is the catalogue's SQL verbatim.
    that date. The same reasoning makes C4's `{{rag_state}}` optional: its whole
    predicate sits in one `[[AND ( … )]]` block, so an unset widget means "no
    restriction" rather than a card that refuses to run.
+4. **R5 · `totals ? 'docs_path_metadata'` → `jsonb_exists(totals, …)`.** The
+   catalogue uses the JSONB existence operator; Metabase sends native SQL through
+   pgjdbc, which binds every bare `?` as a positional placeholder and so refuses
+   the statement (Metabase issues #1964, #14680, #41151). `jsonb_exists` is the
+   same function under a name that contains no `?` — identical semantics.
 
 ## Applying
 

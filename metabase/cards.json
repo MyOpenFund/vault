@@ -516,7 +516,7 @@
   {
     "code": "R5",
     "name": "R5 · Path-metadata trend",
-    "description": "Share of ingested documents whose metadata came from the file path rather than the manifest, per day and tool — a rising share is a silent quality regression. `totals ? 'docs_path_metadata'` excludes runs from before the key existed.",
+    "description": "Share of ingested documents whose metadata came from the file path rather than the manifest, per day and tool — a rising share is a silent quality regression. `jsonb_exists(totals, 'docs_path_metadata')` excludes runs from before the key existed.",
     "display": "combo",
     "visualization_settings": {
       "graph.dimensions": [
@@ -536,7 +536,7 @@
         }
       }
     },
-    "sql": "-- Documents whose metadata came from the path, per day\nSELECT date_trunc('day', r.finished_at)::date AS day,\n       r.tool,\n       count(*)                                      AS runs,\n       sum((r.totals ->> 'docs_path_metadata')::int) AS docs_path_metadata,\n       sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                    (r.totals ->> 'docs_new')::int)) AS docs_ingested,\n       round(100.0 * sum((r.totals ->> 'docs_path_metadata')::int)\n             / nullif(sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                                   (r.totals ->> 'docs_new')::int)), 0), 1)\n                                                     AS pct_path_metadata\nFROM runs r\nWHERE r.totals ? 'docs_path_metadata'\n  AND r.finished_at >= now() - ({{lookback_days}} || ' days')::interval\nGROUP BY 1, 2\nORDER BY 1 DESC, 2;\n",
+    "sql": "-- Documents whose metadata came from the path, per day\nSELECT date_trunc('day', r.finished_at)::date AS day,\n       r.tool,\n       count(*)                                      AS runs,\n       sum((r.totals ->> 'docs_path_metadata')::int) AS docs_path_metadata,\n       sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                    (r.totals ->> 'docs_new')::int)) AS docs_ingested,\n       round(100.0 * sum((r.totals ->> 'docs_path_metadata')::int)\n             / nullif(sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                                   (r.totals ->> 'docs_new')::int)), 0), 1)\n                                                     AS pct_path_metadata\nFROM runs r\nWHERE jsonb_exists(r.totals, 'docs_path_metadata')\n  AND r.finished_at >= now() - ({{lookback_days}} || ' days')::interval\nGROUP BY 1, 2\nORDER BY 1 DESC, 2;\n",
     "tags": {
       "lookback_days": {
         "type": "number",
