@@ -30,15 +30,13 @@ from psycopg2.extras import execute_values as real_execute_values
 
 import ingest
 
-from .conftest import fetch_all, make_doc, run_ingest, write_manifest
+from .conftest import fetch_all, lock_is_free, make_doc, run_ingest, write_manifest
 
 pytestmark = pytest.mark.integration
 
-# psycopg2's own execute_values and ingest's own acquire_lock, captured at
-# import time — never whatever a previous iteration left patched onto the
-# module. The hooks below must delegate to these, or they nest on each other
-# across the three iterations.
-REAL_ACQUIRE_LOCK = ingest.acquire_lock
+# `real_execute_values` above is psycopg2's own, imported here at module import
+# time — never whatever a previous iteration left patched onto ingest. The hook
+# below must delegate to that one, or the three iterations nest on each other.
 
 LATE = "ingest-late"  # the run holding the NEWER run timestamp
 EARLY = "ingest-early"  # the run holding the OLDER one
@@ -53,6 +51,37 @@ RUN_TIMEOUT = 60  # seconds; generous, only ever hit when a run wedges
 # finish and be judged by the assertions, rather than tripping the join
 # timeout and reporting "a run wedged" for what is really a lock regression.
 ORDER_TIMEOUT = 15
+
+
+class _WaitingForTheCorpusLock(logging.Filter):
+    """Rendezvous that fires only once EARLY's try for the lock has FAILED.
+
+    Attached to the `ingest` logger, it watches for the one WARNING
+    `acquire_lock` emits between `pg_try_advisory_lock` returning False and
+    the blocking `pg_advisory_lock` that follows — and only for the corpus
+    key, and only from the EARLY thread. Every filter on a logger runs for
+    every record, so this returns True and changes nothing about what is
+    logged (caplog still sees the warning; the assertion on it stands).
+
+    Watching the log rather than the *entry* into `acquire_lock` is what makes
+    the interleaving a fact: an entry proves only that EARLY asked, and EARLY
+    could still have won the lock outright had LATE not held it. This record
+    exists only on the path where the database refused it.
+    """
+
+    def __init__(self, event, key):
+        super().__init__()
+        self._event = event
+        self._needle = f"lock {key!r} — waiting for it"
+
+    def filter(self, record):
+        if (
+            record.levelno >= logging.WARNING
+            and record.threadName == EARLY
+            and self._needle in record.getMessage()
+        ):
+            self._event.set()
+        return True
 
 
 class _PerThreadClock:
@@ -82,37 +111,33 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
 
     * `execute_values` is wrapped in a counter of runs sitting in the upsert
       (its peak over the pair is what this returns; under the per-corpus lock
-      it can only ever be 1). LATE's first trip through that wrapper parks —
-      inside its transaction, holding the corpus lock — until EARLY reaches
-      the lock.
-    * `acquire_lock` is wrapped so that EARLY, on its way into the corpus lock,
-      announces itself before delegating to the real function. It is not gated
-      by anything: it walks straight into `pg_try_advisory_lock`.
+      it can only ever be 1). LATE parks there, holding the corpus lock, until
+      EARLY is blocked on that same lock.
+    * a `logging.Filter` on the `ingest` logger releases that park when — and
+      only when — EARLY logs that `pg_try_advisory_lock` came back False.
+      Nothing gates EARLY itself: it walks straight at the lock.
 
-    So the interleaving is deterministic without any test-side choreography of
-    the *outcome*: EARLY starts only once LATE is parked mid-upsert with the
-    lock held, EARLY's try then fails and it blocks in `pg_advisory_lock`,
-    which releases LATE, which finishes and unlocks; EARLY runs second. The
-    contention is real — the database, not the test, is what makes EARLY wait.
+    So the interleaving is deterministic in the literal sense, with no
+    test-side choreography of the *outcome*: EARLY starts only once LATE holds
+    the lock, and LATE resumes only once the database has demonstrably refused
+    EARLY the lock and parked it in `pg_advisory_lock`. LATE then finishes and
+    unlocks; EARLY runs second. The contention is real — the database, not the
+    test, is what makes EARLY wait, and the log line proving it is the same one
+    the caller asserts on.
 
     Delete the corpus lock from main() and the whole thing degrades exactly
-    the way it should: EARLY's wrapper is never reached, LATE's park expires on
+    the way it should: EARLY never logs the wait, LATE's park expires on
     ORDER_TIMEOUT, and by then EARLY has been upserting alongside it — peak 2.
     """
     in_flight = 0
     peak = 0
     guard = threading.Lock()
     corpus_lock = ingest.corpus_lock_key(CORPUS)
-    late_at_upsert = threading.Event()  # LATE holds the lock and is mid-upsert
-    early_at_corpus_lock = threading.Event()  # EARLY is about to reach for it
+    late_holds_the_lock = threading.Event()  # LATE has it and is at the upsert
+    early_blocked_on_lock = threading.Event()  # the database refused EARLY
 
     def per_thread_manifests(_root):
         return [str(manifests[threading.current_thread().name])]
-
-    def announcing_acquire_lock(conn, key):
-        if threading.current_thread().name == EARLY and key == corpus_lock:
-            early_at_corpus_lock.set()
-        return REAL_ACQUIRE_LOCK(conn, key)
 
     def probed_execute_values(cur, sql, rows, **kwargs):
         nonlocal in_flight, peak
@@ -125,10 +150,25 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
             peak = max(peak, in_flight)
         try:
             if threading.current_thread().name == LATE:
-                late_at_upsert.set()
+                # Park BEFORE delegating, for two reasons. It is the only
+                # point where LATE demonstrably holds the corpus lock and has
+                # not yet written anything — so the peak below counts a real
+                # overlap rather than one manufactured after the fact. And
+                # LATE's connection must carry no open transaction while it
+                # sits here: acquire_lock committed, and psycopg2 opens the
+                # next transaction lazily on the first statement, which is
+                # the delegation below. Park *after* it and LATE would be
+                # holding row locks on `documents` while EARLY's DDL train
+                # asks for ACCESS EXCLUSIVE on the same table (`ALTER TABLE
+                # documents ... ADD COLUMN IF NOT EXISTS` takes it even when
+                # it adds nothing) — EARLY would then be stuck behind LATE
+                # while LATE waits for EARLY, for a 15 s ORDER_TIMEOUT stall
+                # on every iteration, and the deadlock would look like a
+                # slow test rather than the wiring mistake it is.
+                late_holds_the_lock.set()
                 # No assert on the result: an expired wait is a legitimate
                 # outcome that the peak assertion is there to report.
-                early_at_corpus_lock.wait(timeout=ORDER_TIMEOUT)
+                early_blocked_on_lock.wait(timeout=ORDER_TIMEOUT)
             real_execute_values(cur, sql, rows, **kwargs)
         finally:
             with guard:
@@ -137,7 +177,6 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
     monkeypatch.setattr(ingest, "datetime", _PerThreadClock(stamps))
     monkeypatch.setattr(ingest, "find_jsonl_files", per_thread_manifests)
     monkeypatch.setattr(ingest, "execute_values", probed_execute_values)
-    monkeypatch.setattr(ingest, "acquire_lock", announcing_acquire_lock)
 
     failures = {}
 
@@ -151,17 +190,29 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
         name: threading.Thread(target=target, name=name, daemon=True)
         for name in (LATE, EARLY)
     }
-    threads[LATE].start()
-    # Hold EARLY back only until LATE is demonstrably inside the lock. Waiting
-    # on the event rather than sleeping a guessed interval is what makes "LATE
-    # goes first" a fact instead of a hope; if LATE never gets there the wait
-    # expires and EARLY starts anyway, so a broken LATE surfaces as its own
-    # failure below rather than as a hang.
-    late_at_upsert.wait(timeout=ORDER_TIMEOUT)
-    threads[EARLY].start()
-    for t in threads.values():
-        t.join(timeout=RUN_TIMEOUT)
-        assert not t.is_alive(), f"{t.name} did not finish within {RUN_TIMEOUT}s"
+    rendezvous = _WaitingForTheCorpusLock(early_blocked_on_lock, corpus_lock)
+    ingest.log.addFilter(rendezvous)
+    try:
+        threads[LATE].start()
+        # Hold EARLY back only until LATE is demonstrably inside the lock.
+        # Waiting on the event rather than sleeping a guessed interval is what
+        # makes "LATE goes first" a fact instead of a hope; if LATE never gets
+        # there the wait expires and EARLY starts anyway, so a broken LATE
+        # surfaces as its own failure below rather than as a hang.
+        late_holds_the_lock.wait(timeout=ORDER_TIMEOUT)
+        threads[EARLY].start()
+        # Join every thread before judging any of them: a first thread that
+        # wedged must not leave the second one running (holding a connection
+        # and the lock) into the next iteration's assertions.
+        for t in threads.values():
+            t.join(timeout=RUN_TIMEOUT)
+    finally:
+        ingest.log.removeFilter(rendezvous)
+    alive = [t.name for t in threads.values() if t.is_alive()]
+    assert not alive, (
+        f"{alive} did not finish within {RUN_TIMEOUT}s "
+        f"(failures so far: {failures})"
+    )
     assert not failures, f"a racing run raised: {failures}"
     return peak
 
@@ -255,3 +306,13 @@ def test_concurrent_ingest_runs_do_not_lose_or_duplicate_rows(
         assert {seen[d] for d in SHARED} == {stamps[LATE]}, (
             f"{where}: a shared doc's last_seen_at is not the later run's stamp"
         )
+
+    # Both runs returned, so neither may still be holding the key on the
+    # success path — a lock leaked here would only surface much later, as the
+    # next hourly run blocking forever on a session nobody is using.
+    assert lock_is_free(clean_db, ingest.corpus_lock_key(CORPUS)), (
+        "the corpus lock is still held after both runs finished"
+    )
+    assert lock_is_free(clean_db, ingest.DDL_LOCK_KEY), (
+        "the DDL lock is still held after both runs finished"
+    )

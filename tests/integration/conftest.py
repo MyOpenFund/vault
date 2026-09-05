@@ -138,6 +138,27 @@ def run_ingest(monkeypatch, pg_url, data_dir, corpus="central-bank", sweep="1.0"
     ingest.main()
 
 
+def lock_is_free(pg_url, key):
+    """True if no session holds the advisory lock for `key` right now.
+
+    There is no non-racy way to ask Postgres about one specific key, so this
+    asks the only question that has a definite answer — try to take it — and
+    hands it straight back when it succeeds. Used to pin that a run released
+    what it held, on the failure path as well as the success one.
+    """
+    conn = psycopg2.connect(pg_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (key,))
+            (got,) = cur.fetchone()
+            if got:
+                cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (key,))
+        conn.commit()
+        return got
+    finally:
+        conn.close()
+
+
 def fetch_all(pg_url, query):
     conn = psycopg2.connect(pg_url)
     with conn.cursor() as cur:
