@@ -185,9 +185,10 @@ def test_card_sql_executes(seeded_db, card, fill_optional):
     assert isinstance(rows, list)
 
 
-# The cards below read a table the fixture populates on purpose; an empty
-# result from them is a broken predicate, not a thin fixture. (The rest can
-# legitimately be empty here — no anomaly, no backlog gap for every series.)
+# Every card but Q1 reads a table the fixture populates on purpose; an empty
+# result from one of them is a broken predicate, not a thin fixture. Q1 is the
+# only exclusion: it reports *publication anomalies*, and a fixture with none is
+# a healthy corpus rather than a broken card.
 NON_EMPTY = ["C0", "C1", "C2", "C3", "C4", "C5", "C6",
              "Q2", "Q3", "Q4", "Q5", "R1", "R2", "R3", "R4", "R5", "R6"]
 

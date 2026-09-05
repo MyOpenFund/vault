@@ -16,6 +16,10 @@ change made in the Metabase UI is overwritten on the next apply.
 - **Vault — Coverage & QC** (Q1–Q5) — what is missing, late or wrong.
 - **Vault — RAG & Runs** (R1–R6) — is the machine healthy.
 
+Dashboard 1's `doc_type` filter drives **C1, C3 and C4 only**: C2, C5 and C6
+group *by* `doc_type` rather than filtering on it, so the catalogue gives them no
+`doc_type` tag and the widget leaves them alone.
+
 Dashboard 2's `as_of` filter maps onto Q1's and Q3's **`ref_date`** tag on
 purpose — the two names mean the same thing ("evaluate as of this date"), and no
 card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
