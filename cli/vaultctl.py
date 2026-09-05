@@ -120,6 +120,21 @@ def get_document(doc_id: str):
         console.print(f"[cyan]{key}[/cyan]: {value}")
 
 
+def safe_filename(content_disposition, fallback):
+    """The download filename, reduced to a bare basename.
+
+    The server's Content-Disposition is untrusted input (the default transport
+    is plain HTTP): `Path(name).name` strips any directory part, so neither an
+    absolute path nor a "../" traversal can move the write out of the chosen
+    output directory (vault #5).
+    """
+    if not content_disposition or "filename=" not in content_disposition:
+        return fallback
+    raw = content_disposition.split("filename=")[-1].strip().strip('"')
+    name = Path(raw).name
+    return name if name not in ("", ".", "..") else fallback
+
+
 @app.command("download")
 def download_document(
     doc_id: str,
@@ -139,11 +154,10 @@ def download_document(
         except httpx.HTTPError as e:
             _die(str(e))
 
-    filename = doc_id
-    if "content-disposition" in resp.headers:
-        filename = resp.headers["content-disposition"].split("filename=")[-1].strip('"')
-
+    filename = safe_filename(resp.headers.get("content-disposition"), doc_id)
     dest = output_dir / filename
+    # NOTE: the whole response body is buffered in memory before the write.
+    # Known, and out of scope for #5 — streaming the download is its own issue.
     dest.write_bytes(resp.content)
     console.print(f"[green]Downloaded:[/green] {dest}")
 
