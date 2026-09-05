@@ -1,0 +1,567 @@
+[
+  {
+    "code": "C0",
+    "name": "C0 · Corpus KPIs",
+    "description": "KPI strip: live documents, banks, doc types, undated, soft-deleted and the date span of the corpus — the header context every other card is read against.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Corpus KPIs\nSELECT count(*) FILTER (WHERE d.deleted_at IS NULL)                       AS live_documents,\n       count(DISTINCT d.source_code) FILTER (WHERE d.deleted_at IS NULL)  AS banks,\n       count(DISTINCT d.doc_type)    FILTER (WHERE d.deleted_at IS NULL)  AS doc_types,\n       count(*) FILTER (WHERE d.deleted_at IS NULL AND d.date IS NULL)    AS undated,\n       count(*) FILTER (WHERE d.deleted_at IS NOT NULL)                   AS soft_deleted,\n       min(d.date) FILTER (WHERE d.deleted_at IS NULL)                    AS oldest,\n       max(d.date) FILTER (WHERE d.deleted_at IS NULL)                    AS newest\nFROM documents d\nWHERE d.corpus = {{corpus}};\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      }
+    }
+  },
+  {
+    "code": "C1",
+    "name": "C1 · Documents by year",
+    "description": "Documents published per year (inventory #4, #2); undated rows are dropped here by construction and counted separately by C0.",
+    "display": "bar",
+    "visualization_settings": {
+      "graph.dimensions": [
+        "year"
+      ],
+      "graph.metrics": [
+        "documents"
+      ]
+    },
+    "sql": "-- Documents by year\nSELECT d.year AS year,\n       count(*) AS documents\nFROM documents d\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  AND d.year IS NOT NULL\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\nGROUP BY 1\nORDER BY 1;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "doc_type": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Doc type"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      }
+    }
+  },
+  {
+    "code": "C2",
+    "name": "C2 · Documents by group (A–G)",
+    "description": "Documents per taxonomy group (inventory #4); the group letters are inlined as a VALUES list so an empty group renders as a zero bar instead of vanishing.",
+    "display": "row",
+    "visualization_settings": {
+      "graph.dimensions": [
+        "group_label"
+      ],
+      "graph.metrics": [
+        "documents"
+      ]
+    },
+    "sql": "-- Documents by taxonomy group\nWITH groups (group_letter, group_label) AS (\n    VALUES ('A', 'Monetary policy — decisions & deliberation'),\n           ('B', 'Press conferences & transcripts'),\n           ('C', 'Speeches & interviews'),\n           ('D', 'Research'),\n           ('E', 'Reports'),\n           ('F', 'Projections'),\n           ('G', 'Supervisory / statistical')\n)\nSELECT g.group_letter,\n       g.group_label,\n       count(d.doc_id) AS documents\nFROM groups g\nLEFT JOIN documents d\n       ON left(d.doc_type, 1) = g.group_letter\n      AND d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      [[AND d.source_code = {{bank}}]]\n      [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\nGROUP BY 1, 2\nORDER BY 1;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      }
+    }
+  },
+  {
+    "code": "C3",
+    "name": "C3 · Cumulative corpus over time",
+    "description": "Monthly and cumulative document counts (inventory #4); the one card that drops undated documents on purpose — a cumulative curve cannot place them.",
+    "display": "line",
+    "visualization_settings": {
+      "graph.dimensions": [
+        "month"
+      ],
+      "graph.metrics": [
+        "documents",
+        "cumulative_documents"
+      ]
+    },
+    "sql": "-- Cumulative corpus over time\nWITH monthly AS (\n    SELECT date_trunc('month', d.date)::date AS month,\n           count(*) AS documents\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.date IS NOT NULL\n      [[AND d.date <= {{as_of}}]]\n      [[AND d.source_code = {{bank}}]]\n      [[AND d.doc_type = {{doc_type}}]]\n    GROUP BY 1\n)\nSELECT month,\n       documents,\n       sum(documents) OVER (ORDER BY month\n                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n           AS cumulative_documents\nFROM monthly\nORDER BY month;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "doc_type": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Doc type"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      }
+    }
+  },
+  {
+    "code": "C4",
+    "name": "C4 · Document explorer (with RAG state)",
+    "description": "Browsable document table with the official link and RAG state (inventory #3, #5, #2); rag_state any/in/out replaces the Streamlit \"only in the RAG\" toggle. Keep the LIMIT — the file download stays `vaultctl download <doc_id>`.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false,
+      "column_settings": {
+        "[\"name\",\"official_link\"]": {
+          "view_as": "link"
+        }
+      }
+    },
+    "sql": "-- Documents with RAG state\nSELECT d.doc_id,\n       d.source_code   AS bank,\n       d.doc_type      AS type,\n       d.date,\n       d.title,\n       (r.doc_id IS NOT NULL) AS in_rag,\n       r.chunk_count   AS n_chunks,\n       r.embedding_model,\n       r.ingested_at   AS rag_ingested_at,\n       coalesce(d.pdf_url, d.source_url) AS official_link,\n       d.page_count,\n       d.has_text_layer\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  AND ({{rag_state}} = 'any'\n       OR ({{rag_state}} = 'in'  AND r.doc_id IS NOT NULL)\n       OR ({{rag_state}} = 'out' AND r.doc_id IS NULL))\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\nORDER BY d.date DESC NULLS LAST, d.doc_id\nLIMIT 2000;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "doc_type": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Doc type"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      },
+      "collection": {
+        "type": "text",
+        "required": true,
+        "default": "cb_corpus_v2",
+        "display_name": "Collection"
+      },
+      "rag_state": {
+        "type": "text",
+        "required": true,
+        "default": "any",
+        "display_name": "RAG state (any / in / out)"
+      }
+    }
+  },
+  {
+    "code": "C5",
+    "name": "C5 · Inventory per bank × doc_type",
+    "description": "One row per (bank, type) series with total, active span, average and median per year (inventory #6); the median is zero-filled over the active span and `empty_years` makes that zero-filling visible.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Inventory per bank x doc_type\nWITH scoped AS (\n    SELECT d.source_code, d.doc_type, d.year\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.year IS NOT NULL\n      [[AND d.source_code = {{bank}}]]\n      [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n), yearly AS (\n    SELECT source_code, doc_type, year, count(*)::int AS n\n    FROM scoped GROUP BY 1, 2, 3\n), span AS (\n    SELECT source_code, doc_type,\n           min(year) AS first_year, max(year) AS last_year, sum(n)::int AS total\n    FROM yearly GROUP BY 1, 2\n), filled AS (\n    SELECT s.source_code, s.doc_type, gs.year::int AS year, coalesce(y.n, 0) AS n\n    FROM span s\n    CROSS JOIN LATERAL generate_series(s.first_year, s.last_year) AS gs(year)\n    LEFT JOIN yearly y\n           ON y.source_code = s.source_code\n          AND y.doc_type   = s.doc_type\n          AND y.year       = gs.year\n)\nSELECT s.source_code AS bank,\n       s.doc_type    AS type,\n       s.total       AS documents,\n       s.first_year,\n       s.last_year,\n       (s.last_year - s.first_year + 1) AS active_years,\n       round(s.total::numeric / (s.last_year - s.first_year + 1), 2) AS avg_per_year,\n       percentile_cont(0.5) WITHIN GROUP (ORDER BY f.n) AS median_per_year,\n       count(*) FILTER (WHERE f.n = 0) AS empty_years\nFROM span s\nJOIN filled f\n  ON f.source_code = s.source_code AND f.doc_type = s.doc_type\nGROUP BY s.source_code, s.doc_type, s.total, s.first_year, s.last_year\nORDER BY s.source_code, s.doc_type;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      }
+    }
+  },
+  {
+    "code": "C6",
+    "name": "C6 · Coverage matrix year × doc_type",
+    "description": "Pivot-ready year × type × documents (inventory #7); kept as three long columns so a new doc_type appears on its own. Run it with a bank filter.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": true,
+      "table.pivot_column": "type",
+      "table.cell_column": "documents"
+    },
+    "sql": "-- Coverage matrix year x doc_type (pivot-ready)\nSELECT d.year AS year,\n       d.doc_type AS type,\n       count(*) AS documents\nFROM documents d\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  AND d.year IS NOT NULL\n  [[AND d.source_code = {{bank}}]]\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\nGROUP BY 1, 2\nORDER BY 1, 2;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "as_of": {
+        "type": "date",
+        "required": false,
+        "default": null,
+        "display_name": "As of"
+      }
+    }
+  },
+  {
+    "code": "Q1",
+    "name": "Q1 · Publication anomalies",
+    "description": "Missing / low / exceptional yearly volume per (bank, type) against a zero-filled non-zero median baseline (inventory #9); all six knobs are parameters, not constants.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Publication anomalies (missing / low / exceptional yearly volume)\nWITH params AS (\n    SELECT {{ref_date}}::date       AS as_of,\n           {{window_years}}::int    AS window_years,\n           {{min_nonzero_years}}::int AS min_nonzero_years,\n           {{min_baseline}}::numeric  AS min_baseline,\n           {{low_ratio}}::numeric     AS low_ratio,\n           {{high_ratio}}::numeric    AS high_ratio\n), win AS (\n    SELECT (extract(year FROM as_of)::int - 1)             AS y_to,\n           (extract(year FROM as_of)::int - window_years)   AS y_from,\n           min_nonzero_years, min_baseline, low_ratio, high_ratio\n    FROM params\n), yearly AS (\n    SELECT d.source_code, d.doc_type, d.year, count(*)::int AS n\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.year IS NOT NULL\n      [[AND d.source_code = {{bank}}]]\n    GROUP BY 1, 2, 3\n), span AS (\n    SELECT source_code, doc_type, min(year) AS y_start, max(year) AS y_end\n    FROM yearly GROUP BY 1, 2\n), grid AS (\n    SELECT s.source_code, s.doc_type, gs.year::int AS year\n    FROM span s CROSS JOIN win w\n    CROSS JOIN LATERAL generate_series(greatest(s.y_start, w.y_from),\n                                       least(s.y_end,   w.y_to)) AS gs(year)\n), counts AS (\n    SELECT g.source_code, g.doc_type, g.year, coalesce(y.n, 0) AS n\n    FROM grid g\n    LEFT JOIN yearly y\n           ON y.source_code = g.source_code\n          AND y.doc_type    = g.doc_type\n          AND y.year        = g.year\n), baseline AS (\n    SELECT source_code, doc_type,\n           percentile_cont(0.5) WITHIN GROUP (ORDER BY n)\n               FILTER (WHERE n > 0)              AS baseline,\n           count(*) FILTER (WHERE n > 0)::int    AS nonzero_years,\n           count(*)::int                         AS years_considered\n    FROM counts GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.year,\n       c.n           AS documents,\n       round(b.baseline::numeric, 1) AS baseline_per_year,\n       b.nonzero_years,\n       round((100.0 * c.n / nullif(b.baseline, 0))::numeric, 0) AS pct_of_baseline,\n       CASE WHEN c.n = 0                          THEN 'missing'\n            WHEN c.n < w.low_ratio  * b.baseline  THEN 'low'\n            WHEN c.n > w.high_ratio * b.baseline  THEN 'exceptional'\n       END AS anomaly\nFROM counts c\nJOIN baseline b\n  ON b.source_code = c.source_code AND b.doc_type = c.doc_type\nCROSS JOIN win w\nWHERE b.nonzero_years >= w.min_nonzero_years\n  AND b.baseline      >= w.min_baseline\n  AND (c.n = 0\n       OR c.n < w.low_ratio  * b.baseline\n       OR c.n > w.high_ratio * b.baseline)\nORDER BY c.source_code, c.doc_type, c.year;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "ref_date": {
+        "type": "date",
+        "required": true,
+        "default": "2026-09-05",
+        "display_name": "Reference date"
+      },
+      "window_years": {
+        "type": "number",
+        "required": true,
+        "default": 12,
+        "display_name": "Window (completed years)"
+      },
+      "min_nonzero_years": {
+        "type": "number",
+        "required": true,
+        "default": 3,
+        "display_name": "Min non-zero years"
+      },
+      "min_baseline": {
+        "type": "number",
+        "required": true,
+        "default": 4,
+        "display_name": "Min baseline per year"
+      },
+      "low_ratio": {
+        "type": "number",
+        "required": true,
+        "default": 0.5,
+        "display_name": "Low ratio"
+      },
+      "high_ratio": {
+        "type": "number",
+        "required": true,
+        "default": 1.5,
+        "display_name": "High ratio"
+      }
+    }
+  },
+  {
+    "code": "Q2",
+    "name": "Q2 · Upcoming & overdue",
+    "description": "The watchdog's cadence snapshot for every (bank, type) series it knows (inventory #10). `snapshot_at` is surfaced as a column: cadence is a full-replace snapshot and stale data does not look stale.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Upcoming & overdue publications\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.status,\n       c.last        AS last_seen,\n       c.interval_days,\n       c.next_expected,\n       c.days_until,\n       c.expected_per_year,\n       c.n_3y        AS docs_last_3y,\n       c.updated_at  AS snapshot_at\nFROM cadence c\nWHERE c.corpus = {{corpus}}\n  [[AND c.source_code = {{bank}}]]\n  [[AND c.status = {{status}}]]\nORDER BY CASE c.status WHEN 'overdue' THEN 0 WHEN 'soon' THEN 1 ELSE 2 END,\n         c.days_until NULLS LAST,\n         c.source_code, c.doc_type;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "status": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Cadence status"
+      }
+    }
+  },
+  {
+    "code": "Q3",
+    "name": "Q3 · Expected vs observed per year",
+    "description": "Data-driven replacement for the hard-coded EXPECTED_PER_YEAR calendar (inventory #8): cadence's expectation against the last 3 years actually recorded. A triage list, not a verdict.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Expected vs observed publication rate\nWITH observed AS (\n    SELECT d.source_code, d.doc_type,\n           count(*) FILTER (WHERE d.date >= ({{ref_date}}::date - INTERVAL '3 years'))::numeric / 3.0\n               AS observed_per_year_3y\n    FROM documents d\n    WHERE d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      AND d.date IS NOT NULL\n      AND d.date <= {{ref_date}}::date\n    GROUP BY 1, 2\n)\nSELECT c.source_code AS bank,\n       c.doc_type    AS type,\n       c.expected_per_year,\n       round(coalesce(o.observed_per_year_3y, 0), 2) AS observed_per_year_3y,\n       round(coalesce(o.observed_per_year_3y, 0) - c.expected_per_year, 2) AS gap,\n       c.status\nFROM cadence c\nLEFT JOIN observed o\n       ON o.source_code = c.source_code AND o.doc_type = c.doc_type\nWHERE c.corpus = {{corpus}}\n  [[AND c.source_code = {{bank}}]]\nORDER BY gap ASC NULLS LAST;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      },
+      "ref_date": {
+        "type": "date",
+        "required": true,
+        "default": "2026-09-05",
+        "display_name": "Reference date"
+      }
+    }
+  },
+  {
+    "code": "Q4",
+    "name": "Q4 · RAG backlog by bank × type",
+    "description": "Documents in the vault but not in the target collection, read from the `rag_backlog` view (inventory #3, inverse side); `needs_ocr` / `not_probed` make it double as the OCR work queue. Backlog 0 with C0's live_documents 0 means \"no data\", not \"done\".",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- RAG backlog: documents in the vault but not in the target collection\nSELECT b.source_code AS bank,\n       b.doc_type    AS type,\n       count(*)                                          AS backlog_documents,\n       count(*) FILTER (WHERE b.has_text_layer IS FALSE) AS needs_ocr,\n       count(*) FILTER (WHERE b.has_text_layer IS NULL)  AS not_probed,\n       min(b.date)   AS oldest,\n       max(b.date)   AS newest\nFROM rag_backlog b\nWHERE b.corpus = {{corpus}}\n  AND b.collection = {{collection}}\n  [[AND b.source_code = {{bank}}]]\nGROUP BY 1, 2\nORDER BY backlog_documents DESC;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "collection": {
+        "type": "text",
+        "required": true,
+        "default": "cb_corpus_v2",
+        "display_name": "Collection"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      }
+    }
+  },
+  {
+    "code": "Q5",
+    "name": "Q5 · Fetching problems",
+    "description": "Open discovery failures grouped by bank × context × error class (inventory #11), de-duplicated by fingerprint with `attempts` = summed occurrences.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Open fetching problems (discovery failures)\nSELECT e.source_code AS bank,\n       e.context,\n       e.error_class,\n       count(*)              AS distinct_urls,\n       sum(e.occurrences)    AS attempts,\n       max(e.last_seen_at)   AS last_seen,\n       min(e.first_seen_at)  AS first_seen,\n       (array_agg(e.url   ORDER BY e.last_seen_at DESC))[1] AS sample_url,\n       (array_agg(e.error ORDER BY e.last_seen_at DESC))[1] AS sample_error\nFROM discovery_errors e\nWHERE e.corpus = {{corpus}}\n  AND e.resolved_at IS NULL\n  AND e.last_seen_at >= now() - ({{lookback_days}} || ' days')::interval\n  [[AND e.source_code = {{bank}}]]\nGROUP BY 1, 2, 3\nORDER BY attempts DESC, last_seen DESC;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "lookback_days": {
+        "type": "number",
+        "required": true,
+        "default": 90,
+        "display_name": "Lookback (days)"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      }
+    }
+  },
+  {
+    "code": "R1",
+    "name": "R1 · Chunks by collection",
+    "description": "Documents and chunks recorded as ingested per collection and embedding model (inventory #1). Accepted loss: this is the vault's belief, not live Qdrant state.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Chunks by collection\nSELECT r.collection,\n       r.embedding_model,\n       r.embedding_version,\n       count(*)                     AS documents_ingested,\n       sum(r.chunk_count)           AS chunks,\n       round(avg(r.chunk_count), 1) AS avg_chunks_per_doc,\n       max(r.ingested_at)           AS last_ingested_at\nFROM rag_ingestions r\nWHERE r.corpus = {{corpus}}\nGROUP BY 1, 2, 3\nORDER BY chunks DESC;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      }
+    }
+  },
+  {
+    "code": "R2",
+    "name": "R2 · RAG coverage by bank × type",
+    "description": "How far along the RAG ingestion is per (bank, type) (inventory #3). Q4 answers \"what is left\"; this answers \"how far along\".",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- RAG coverage per bank x type\nSELECT d.source_code AS bank,\n       d.doc_type    AS type,\n       count(*)                                     AS documents,\n       count(r.doc_id)                              AS in_rag,\n       count(*) - count(r.doc_id)                   AS missing_from_rag,\n       round(100.0 * count(r.doc_id) / count(*), 1) AS pct_in_rag,\n       coalesce(sum(r.chunk_count), 0)              AS chunks\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND d.source_code = {{bank}}]]\nGROUP BY 1, 2\nORDER BY pct_in_rag ASC, documents DESC;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "collection": {
+        "type": "text",
+        "required": true,
+        "default": "cb_corpus_v2",
+        "display_name": "Collection"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      }
+    }
+  },
+  {
+    "code": "R3",
+    "name": "R3 · Last run per tool",
+    "description": "The most recent run of every producer with its totals and `age` — the silent-failure detector: a nightly tool whose last run is 3 days old is broken even when `outcome` says ok.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Last run per tool\nSELECT DISTINCT ON (r.tool)\n       r.tool,\n       r.command,\n       r.outcome,\n       r.exit_code,\n       r.started_at,\n       r.finished_at,\n       round(extract(epoch FROM (r.finished_at - r.started_at))::numeric / 60.0, 1) AS minutes,\n       (r.totals ->> 'docs_seen')::int          AS docs_seen,\n       coalesce((r.totals ->> 'docs_ingested')::int,\n                (r.totals ->> 'docs_new')::int) AS docs_ingested,\n       (r.totals ->> 'docs_failed')::int        AS docs_failed,\n       (r.totals ->> 'docs_path_metadata')::int AS docs_path_metadata,\n       jsonb_array_length(coalesce(r.sources, '[]'::jsonb)) AS n_sources,\n       EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(r.sources, '[]'::jsonb)) s\n               WHERE (s ->> 'truncated')::boolean) AS any_truncated,\n       now() - r.finished_at                     AS age\nFROM runs r\nORDER BY r.tool, r.finished_at DESC NULLS LAST;\n",
+    "tags": {}
+  },
+  {
+    "code": "R4",
+    "name": "R4 · Degraded / failed streaks",
+    "description": "Gaps-and-islands over consecutive non-ok runs per tool: one bad night is noise, four in a row is an incident, and this card tells them apart.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Consecutive non-ok run streaks per tool\nWITH ordered AS (\n    SELECT r.tool, r.run_id, r.command, r.outcome, r.exit_code, r.finished_at,\n           (r.outcome IS DISTINCT FROM 'ok') AS bad,\n           row_number() OVER (PARTITION BY r.tool ORDER BY r.finished_at) AS rn,\n           row_number() OVER (PARTITION BY r.tool, (r.outcome IS DISTINCT FROM 'ok')\n                              ORDER BY r.finished_at) AS rn_bad\n    FROM runs r\n    WHERE r.finished_at IS NOT NULL\n      AND r.finished_at >= now() - ({{lookback_days}} || ' days')::interval\n), islands AS (\n    SELECT *, rn - rn_bad AS grp FROM ordered\n)\nSELECT tool,\n       count(*)                                            AS run_count,\n       min(finished_at)                                    AS streak_start,\n       max(finished_at)                                    AS streak_end,\n       string_agg(DISTINCT outcome, ', ' ORDER BY outcome) AS outcomes,\n       max(exit_code)                                      AS worst_exit_code\nFROM islands\nWHERE bad\nGROUP BY tool, grp\nHAVING count(*) >= {{min_streak}}\nORDER BY streak_end DESC, run_count DESC;\n",
+    "tags": {
+      "lookback_days": {
+        "type": "number",
+        "required": true,
+        "default": 90,
+        "display_name": "Lookback (days)"
+      },
+      "min_streak": {
+        "type": "number",
+        "required": true,
+        "default": 1,
+        "display_name": "Min streak length"
+      }
+    }
+  },
+  {
+    "code": "R5",
+    "name": "R5 · Path-metadata trend",
+    "description": "Share of ingested documents whose metadata came from the file path rather than the manifest, per day and tool — a rising share is a silent quality regression. `totals ? 'docs_path_metadata'` excludes runs from before the key existed.",
+    "display": "combo",
+    "visualization_settings": {
+      "graph.dimensions": [
+        "day"
+      ],
+      "graph.metrics": [
+        "docs_path_metadata",
+        "pct_path_metadata"
+      ],
+      "series_settings": {
+        "docs_path_metadata": {
+          "display": "bar"
+        },
+        "pct_path_metadata": {
+          "display": "line",
+          "axis": "right"
+        }
+      }
+    },
+    "sql": "-- Documents whose metadata came from the path, per day\nSELECT date_trunc('day', r.finished_at)::date AS day,\n       r.tool,\n       count(*)                                      AS runs,\n       sum((r.totals ->> 'docs_path_metadata')::int) AS docs_path_metadata,\n       sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                    (r.totals ->> 'docs_new')::int)) AS docs_ingested,\n       round(100.0 * sum((r.totals ->> 'docs_path_metadata')::int)\n             / nullif(sum(coalesce((r.totals ->> 'docs_ingested')::int,\n                                   (r.totals ->> 'docs_new')::int)), 0), 1)\n                                                     AS pct_path_metadata\nFROM runs r\nWHERE r.totals ? 'docs_path_metadata'\n  AND r.finished_at >= now() - ({{lookback_days}} || ' days')::interval\nGROUP BY 1, 2\nORDER BY 1 DESC, 2;\n",
+    "tags": {
+      "lookback_days": {
+        "type": "number",
+        "required": true,
+        "default": 90,
+        "display_name": "Lookback (days)"
+      }
+    }
+  },
+  {
+    "code": "R6",
+    "name": "R6 · Truncated sources",
+    "description": "Runs whose per-source listing stopped early (`truncated: true`) with the fetch-error counters and error samples — without this card the honest-discovery flag is invisible.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Runs whose per-source listing was truncated\nSELECT r.tool,\n       r.command,\n       r.finished_at,\n       r.outcome,\n       s ->> 'source_code'          AS source_code,\n       (s ->> 'docs_seen')::int     AS docs_seen,\n       (s ->> 'docs_new')::int      AS docs_new,\n       (s ->> 'docs_failed')::int   AS docs_failed,\n       (s ->> 'fetch_errors')::int  AS fetch_errors,\n       (s -> 'error_samples')       AS error_samples\nFROM runs r\nCROSS JOIN LATERAL jsonb_array_elements(coalesce(r.sources, '[]'::jsonb)) AS s\nWHERE (s ->> 'truncated')::boolean IS TRUE\n  AND r.finished_at >= now() - ({{lookback_days}} || ' days')::interval\nORDER BY r.finished_at DESC, source_code;\n",
+    "tags": {
+      "lookback_days": {
+        "type": "number",
+        "required": true,
+        "default": 90,
+        "display_name": "Lookback (days)"
+      }
+    }
+  }
+]

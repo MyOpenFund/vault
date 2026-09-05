@@ -1,0 +1,287 @@
+[
+  {
+    "name": "Vault — Corpus",
+    "description": "What is in the corpus: volume, shape, coverage and the document explorer.",
+    "filters": [
+      {
+        "slug": "corpus",
+        "name": "Corpus",
+        "type": "string/=",
+        "default": "central-bank"
+      },
+      {
+        "slug": "bank",
+        "name": "Bank",
+        "type": "string/=",
+        "default": null
+      },
+      {
+        "slug": "doc_type",
+        "name": "Doc type",
+        "type": "string/=",
+        "default": null
+      },
+      {
+        "slug": "as_of",
+        "name": "As of",
+        "type": "date/single",
+        "default": null
+      }
+    ],
+    "cards": [
+      {
+        "code": "C0",
+        "row": 0,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 3,
+        "mappings": {
+          "corpus": "corpus"
+        }
+      },
+      {
+        "code": "C1",
+        "row": 3,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "doc_type": "doc_type",
+          "as_of": "as_of"
+        }
+      },
+      {
+        "code": "C2",
+        "row": 3,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "as_of": "as_of"
+        }
+      },
+      {
+        "code": "C3",
+        "row": 9,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 6,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "doc_type": "doc_type",
+          "as_of": "as_of"
+        }
+      },
+      {
+        "code": "C5",
+        "row": 15,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "as_of": "as_of"
+        }
+      },
+      {
+        "code": "C6",
+        "row": 15,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "as_of": "as_of"
+        }
+      },
+      {
+        "code": "C4",
+        "row": 23,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "doc_type": "doc_type",
+          "as_of": "as_of"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Vault — Coverage & QC",
+    "description": "What is missing, late or wrong: overdue series, publication anomalies, RAG backlog and open fetching problems.",
+    "filters": [
+      {
+        "slug": "corpus",
+        "name": "Corpus",
+        "type": "string/=",
+        "default": "central-bank"
+      },
+      {
+        "slug": "bank",
+        "name": "Bank",
+        "type": "string/=",
+        "default": null
+      },
+      {
+        "slug": "as_of",
+        "name": "As of",
+        "type": "date/single",
+        "default": null
+      }
+    ],
+    "cards": [
+      {
+        "code": "Q2",
+        "row": 0,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank"
+        }
+      },
+      {
+        "code": "Q1",
+        "row": 8,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "as_of": "ref_date"
+        }
+      },
+      {
+        "code": "Q3",
+        "row": 8,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank",
+          "as_of": "ref_date"
+        }
+      },
+      {
+        "code": "Q4",
+        "row": 16,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank"
+        }
+      },
+      {
+        "code": "Q5",
+        "row": 16,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank"
+        }
+      }
+    ]
+  },
+  {
+    "name": "Vault — RAG & Runs",
+    "description": "Is the machine healthy: last run per tool, failure streaks, truncated discoveries, chunks ingested and RAG coverage.",
+    "filters": [
+      {
+        "slug": "corpus",
+        "name": "Corpus",
+        "type": "string/=",
+        "default": "central-bank"
+      },
+      {
+        "slug": "collection",
+        "name": "Collection",
+        "type": "string/=",
+        "default": "cb_corpus_v2"
+      },
+      {
+        "slug": "lookback_days",
+        "name": "Lookback (days)",
+        "type": "number/=",
+        "default": 90
+      }
+    ],
+    "cards": [
+      {
+        "code": "R3",
+        "row": 0,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 8,
+        "mappings": {}
+      },
+      {
+        "code": "R4",
+        "row": 8,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "lookback_days": "lookback_days"
+        }
+      },
+      {
+        "code": "R6",
+        "row": 8,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "lookback_days": "lookback_days"
+        }
+      },
+      {
+        "code": "R1",
+        "row": 14,
+        "col": 0,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "corpus": "corpus"
+        }
+      },
+      {
+        "code": "R5",
+        "row": 14,
+        "col": 12,
+        "size_x": 12,
+        "size_y": 6,
+        "mappings": {
+          "lookback_days": "lookback_days"
+        }
+      },
+      {
+        "code": "R2",
+        "row": 20,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "collection": "collection"
+        }
+      }
+    ]
+  }
+]
