@@ -136,6 +136,28 @@ Runbook: if the producer legitimately rotates (truncates) `discovery_errors.json
 `GET /documents/{doc_id}` · `GET /documents/{doc_id}/file` (serves the raw file from the
 read-only mount) · `GET /stats/summary` (totals, by_corpus, by_source_code)
 
+## Metabase
+
+Three dashboards over the vault, defined as code in [`metabase/`](metabase/README.md)
+(`cards.json` + `dashboards.json`, the source of truth, edited by hand):
+
+- **Vault — Corpus** — what's in the corpus: volume, shape, coverage, document explorer.
+- **Vault — Coverage & QC** — what's missing, late or anomalous.
+- **Vault — RAG & Runs** — is the machine healthy.
+
+```bash
+METABASE_URL=… METABASE_API_KEY=… python metabase/apply.py [--dry-run] [--archive-examples]
+```
+
+(`METABASE_SESSION` works instead of the API key.) Idempotent by name inside the
+"Vault" collection: a change made in the Metabase UI is overwritten on the next
+apply. To actually remove a card or dashboard, delete it from the JSON — one
+merely archived in Metabase but still listed in the JSON is recreated on the
+next apply. CI (`tests/`) runs the definitions test (schema/tags/grid, no
+network) plus every card's SQL executed against a throwaway Postgres built by
+the real ingester. Not covered by any dashboard: live Qdrant health and the
+PDF download button, both still behind the API/`vaultctl`.
+
 ## Quickstart
 
 ```bash
