@@ -133,7 +133,9 @@ pulled, because the API's DSN now refuses to interpolate without one of them (`c
 with `required variable VAULT_READONLY_PASSWORD is missing a value`).
 
 1. Add `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` to the deployment's `.env`
-   (see `.env.example`) — first, before pulling.
+   (see `.env.example`) — first, before pulling. Generate each with `openssl rand -hex 24`: the
+   value must be URL-safe (no `$ / @ : # % ?`), because compose interpolates it and it is
+   embedded in a `postgresql://` URL.
 2. `docker compose run --rm ingestion` — the DDL train creates the two roles and issues their
    grants. Nothing is run by hand against the cluster.
 3. `docker compose up -d api` — the API is recreated (its environment changed). Until step 2 has
@@ -146,6 +148,11 @@ own *application* database keeps `docuser`, which needs DDL on its own schema), 
 compose only — uncomment the `ports:` block and set `POSTGRES_BIND_ADDR` to the tailnet address if
 the off-host orchestrator must reach Postgres. Rollback is `git checkout` of the previous tree:
 the roles are extra objects, nothing the old services used was dropped or revoked.
+
+Follow-up, one-off and outside the train (those databases do not exist on a dev or CI cluster, so
+the train cannot converge them): on the NAS, run `REVOKE CONNECT ON DATABASE metabase, postgres
+FROM PUBLIC` once, so the two new roles cannot open a session on the databases they have no
+business in.
 
 ### Fact columns on `documents`
 
@@ -178,9 +185,17 @@ change it is used by the **ingestion service only**, plus Metabase's own applica
 
 Passwords come from `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` (see
 `.env.example`). Unset or empty → that role is skipped with a WARNING and no grant is issued,
-which is how the dev and CI clusters run with no roles at all. **Rotation**: change the value in
-`.env`, run `docker compose run --rm ingestion` once (the train re-applies the password every
-run), then update the consumer. Nothing is ever run by hand against the cluster.
+which is how the dev and CI clusters run with no roles at all.
+
+**Password charset**: generate with `openssl rand -hex 24`. The value **must be URL-safe — no
+`$ / @ : # % ?`** — because compose interpolates it and it is embedded in a `postgresql://` URL.
+`openssl rand -base64` is not safe here: the `ALTER ROLE` accepts it (the train passes it as a
+SQL literal), but the resulting DSN for the API and the orchestrator is malformed, and they
+crash-loop on a libpq error that does not say "bad password".
+
+**Rotation**: change the value in `.env` — same charset rule — run
+`docker compose run --rm ingestion` once (the train re-applies the password every run), then
+update the consumer. Nothing is ever run by hand against the cluster.
 
 **First boot ordering.** The roles do not exist until the first ingestion run of *this* tree, so
 on any cluster that has not yet run it — a brand-new one, or an existing deployment being upgraded

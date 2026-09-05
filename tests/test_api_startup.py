@@ -42,6 +42,28 @@ def test_a_reachable_database_is_verified_and_the_probe_connection_closed(monkey
     assert conn.closed, "the startup probe leaked its connection"
 
 
+def test_every_connection_carries_a_connect_timeout(monkeypatch):
+    # Without it libpq waits out the OS TCP retry budget -- ~2 minutes against
+    # a black-holed host (a firewall that DROPs rather than REJECTs, a stale
+    # tailnet address). The startup gate would hang instead of crash-looping
+    # visibly, and a request would hang the worker.
+    calls = []
+
+    def record(dsn, **kwargs):
+        calls.append(kwargs)
+        return FakeConn()
+
+    monkeypatch.setattr(db, "DATABASE_URL", URL)
+    monkeypatch.setattr(db.psycopg2, "connect", record)
+    db.verify_connection()
+    with db.get_conn():
+        pass
+    assert len(calls) == 2
+    assert all(kw.get("connect_timeout") == db.CONNECT_TIMEOUT_SECONDS
+               for kw in calls), calls
+    assert db.CONNECT_TIMEOUT_SECONDS == 10
+
+
 def test_a_missing_role_is_reported_loudly_with_the_command_that_fixes_it(
     monkeypatch, caplog
 ):
@@ -81,6 +103,36 @@ def test_the_drivers_echo_of_the_connection_string_is_redacted(monkeypatch, capl
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert "s3cr3t" not in logged
     assert "invalid dsn" in logged
+
+
+def test_the_failure_names_the_password_charset_rule(monkeypatch, caplog):
+    # The one failure mode that reads as a bug in the code rather than in the
+    # .env: a password holding a URL delimiter. Compose interpolates it into
+    # `postgresql://vault_readonly:<pw>@postgres:5432/documents`, so a `/` (or
+    # `@ : # % ?`) re-cuts the URL and libpq rejects a DSN that *looks* fine in
+    # the .env. `$` is worse still: compose eats it before libpq ever sees it.
+    # And it defeats the targeted redaction on the way past: the `@` is no
+    # longer in the authority, so urlsplit reports no password and there is
+    # nothing to substitute. The whole DSN is blanked instead -- otherwise the
+    # error that reports the bad password would print it in full.
+    mangled = "postgresql://vault_readonly:abcd/efgh@postgres:5432/documents"
+    monkeypatch.setattr(db, "DATABASE_URL", mangled)
+
+    def boom(*a, **k):
+        raise psycopg2.OperationalError(f'invalid dsn: {mangled}')
+
+    monkeypatch.setattr(db.psycopg2, "connect", boom)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            db.verify_connection()
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "URL-safe" in logged
+    assert "openssl rand -hex 24" in logged
+    for delimiter in ("$", "/", "@", ":", "#", "%", "?"):
+        assert delimiter in logged, f"{delimiter} missing from the charset hint"
+    assert "abcd" not in logged and "efgh" not in logged
+    assert "invalid dsn" in logged  # the rest of the driver's message survives
 
 
 def test_a_very_short_password_redacts_the_whole_dsn_authority(monkeypatch):

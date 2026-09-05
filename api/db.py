@@ -15,6 +15,14 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # not even be well formed.
 EXPECTED_ROLE = "vault_readonly"
 
+# libpq's default is no timeout at all: a host that DROPs rather than REJECTs
+# (a firewall rule, a stale tailnet address) leaves connect() waiting out the
+# OS TCP retry budget -- around two minutes. Ten seconds is far past a healthy
+# same-compose-network connect and short enough that the startup gate
+# crash-loops visibly instead of hanging, and a request fails instead of
+# holding a worker.
+CONNECT_TIMEOUT_SECONDS = 10
+
 FIRST_BOOT_HINT = (
     "The vault's least-privilege roles are created by the DDL train, so on any "
     "cluster that has not run it yet %s does not exist until the ingestion "
@@ -23,10 +31,27 @@ FIRST_BOOT_HINT = (
     "non-zero; `restart: unless-stopped` will retry it."
 )
 
+# The other way this fails right after an .env edit, and the one that reads as
+# a bug in the code rather than in the .env: compose interpolates the value
+# into `postgresql://vault_readonly:<pw>@postgres:5432/documents`, so a
+# password holding a URL delimiter re-cuts the DSN and libpq rejects (or
+# misroutes) something that looks perfectly fine in the .env. `$` never even
+# reaches libpq -- compose expands it first.
+PASSWORD_CHARSET_HINT = (
+    "If VAULT_READONLY_PASSWORD was just set or rotated: the value is "
+    "interpolated by compose and embedded in a postgresql:// URL, so it must "
+    "be URL-safe -- no $ / @ : # % ? characters. Generate one with "
+    "`openssl rand -hex 24` (NOT `openssl rand -base64`)."
+)
+
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=CONNECT_TIMEOUT_SECONDS,
+    )
     try:
         yield conn
     finally:
@@ -40,21 +65,25 @@ def _redact(text):
     API's DSN carries VAULT_READONLY_PASSWORD. Cheap insurance: the password
     is never worth putting in a log line, whoever wrote the message.
 
-    URL-shaped DSNs only, which is what compose.yaml builds; a key=value DSN
-    has no password to find here and is passed through unchanged.
-
     A password shorter than 4 characters is a substring of half the words in an
     English error message, so replacing it everywhere would mangle the message
     without hiding the `user:pw@host` that leaks it anyway. Below that length
     the DSN's whole authority is redacted instead.
+
+    When urlsplit finds no password at all the whole DSN is blanked wherever
+    the driver echoed it. That is not just the key=value case: a password
+    holding a URL delimiter (see PASSWORD_CHARSET_HINT) re-cuts the URL so the
+    `@` no longer sits in the authority, urlsplit reports no password, and
+    targeted redaction would hand the entire literal to the log -- in exactly
+    the failure the charset rule exists to prevent.
     """
     try:
         parts = urlsplit(DATABASE_URL or "")
         password, netloc = parts.password, parts.netloc
-    except ValueError:  # unparseable DSN: nothing to redact, and nothing known
-        return text
+    except ValueError:  # unparseable DSN: nothing to parse, so blank it whole
+        return text.replace(DATABASE_URL, "***") if DATABASE_URL else text
     if not password:
-        return text
+        return text.replace(DATABASE_URL, "***") if DATABASE_URL else text
     if len(password) >= 4:
         return text.replace(password, "***")
     return text.replace(netloc, "***")
@@ -70,13 +99,14 @@ def verify_connection():
     """
     reason = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=CONNECT_TIMEOUT_SECONDS)
     except Exception as exc:
         reason = f"{type(exc).__name__}: {_redact(str(exc)).strip()}"
     if reason is not None:
         log.error("vault API cannot connect to Postgres as %s: %s",
                   EXPECTED_ROLE, reason)
         log.error(FIRST_BOOT_HINT, EXPECTED_ROLE)
+        log.error(PASSWORD_CHARSET_HINT)
         # Raised OUTSIDE the handler, like ingestion/roles.py does: inside it,
         # Python would chain the driver error onto __context__, and that error
         # drags its own traceback -- whose psycopg2.connect frame holds the DSN,
