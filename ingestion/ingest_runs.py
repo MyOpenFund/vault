@@ -4,13 +4,16 @@ Ingest run-reports (data/runs.jsonl) into the `runs` table.
 
 Producers append one JSON line per run (central-bank-corpus writes the file;
 data-orchestrator writes the table directly). This ingester is APPEND-ONLY FOR
-CONTENT: `INSERT ... ON CONFLICT (run_id) DO UPDATE SET corpus = coalesce(...)`
-never rewrites a stored column, so re-ingesting the same file leaves content
-untouched and file rotation on the producer side is always safe. The one
-exception is `corpus`, which is filled in when NULL — a one-time repair of the
-rows ingested before the column existed (the producer has never emitted
-`corpus`, so under DO NOTHING those rows would stay NULL forever and stay
-invisible to `source_health`, which joins on `(corpus, source_code)`).
+CONTENT: `INSERT ... ON CONFLICT (run_id) DO UPDATE SET corpus = EXCLUDED.corpus
+WHERE runs.corpus IS NULL` never rewrites a stored column, so re-ingesting the
+same file leaves content untouched and file rotation on the producer side is
+always safe. The one exception is `corpus`, which is rewritten only when the
+stored row's `corpus` is NULL — a one-time repair of the rows ingested before
+the column existed (the producer has never emitted `corpus`, so under DO
+NOTHING those rows would stay NULL forever and stay invisible to
+`source_health`, which joins on `(corpus, source_code)`). The WHERE clause
+means every other re-offered row is a no-op update (no dead tuple written),
+not just a no-op on content.
 
 A missing file is a no-op (deployments without a producer). Corrupt lines are
 skipped with a warning. Unknown fields land in `extra` (JSONB).
@@ -135,7 +138,8 @@ INSERT INTO runs (
     run_id, tool, command, started_at, finished_at,
     outcome, exit_code, totals, sources, corpus, extra
 ) VALUES %s
-ON CONFLICT (run_id) DO UPDATE SET corpus = coalesce(runs.corpus, EXCLUDED.corpus)
+ON CONFLICT (run_id) DO UPDATE SET corpus = EXCLUDED.corpus
+    WHERE runs.corpus IS NULL
 """
 
 
@@ -190,9 +194,12 @@ def load_run_rows(path, default_corpus, counters=None):
     The in-batch dedupe is required by the DO UPDATE conflict clause:
     execute_values raises "ON CONFLICT DO UPDATE command cannot affect row a
     second time" when the same run_id appears twice in one VALUES list (the
-    old DO NOTHING clause tolerated it). Keeping the first occurrence matches
-    the append-only semantics of the table: the earliest report of a run wins,
-    exactly as it would across two separate ingestion cycles.
+    old DO NOTHING clause tolerated it). That check fires before the DO
+    UPDATE's WHERE clause is ever evaluated, so guarding the update with
+    `WHERE runs.corpus IS NULL` does not relax the dedupe requirement.
+    Keeping the first occurrence matches the append-only semantics of the
+    table: the earliest report of a run wins, exactly as it would across two
+    separate ingestion cycles.
     """
     rows = []
     seen = set()
@@ -223,8 +230,8 @@ def run(conn, data_dir, default_corpus):
     """Ingest the runs file. Returns rows offered.
 
     Append-only for content (a re-offered run_id never rewrites a stored
-    column); `corpus` is filled in when NULL, repairing rows ingested before
-    the column existed.
+    column); a stored row's `corpus` is rewritten only when it is NULL,
+    repairing rows ingested before the column existed.
     """
     path = os.environ.get("RUNS_PATH") or os.path.join(data_dir, "runs.jsonl")
     if not os.path.exists(path):

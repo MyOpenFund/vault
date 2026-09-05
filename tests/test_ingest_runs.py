@@ -176,38 +176,36 @@ def test_non_string_corpus_is_rejected_on_shape():
 def test_insert_sql_fills_corpus_on_conflict_and_nothing_else():
     # Rows ingested before `runs.corpus` existed keep corpus NULL forever
     # under DO NOTHING (the file is re-offered nightly but never touched),
-    # which leaves source_health's observed half empty. DO UPDATE with a
-    # coalesce repairs them once and keeps every other column append-only.
+    # which leaves source_health's observed half empty. DO UPDATE ... WHERE
+    # runs.corpus IS NULL repairs them once, keeps every other column
+    # append-only, and — unlike an unconditional coalesce() — never fires
+    # (so never writes a dead tuple) for a row whose corpus is already set.
     from ingest_runs import INSERT_RUNS_SQL
 
     normalized = " ".join(INSERT_RUNS_SQL.split())
     assert (
-        "ON CONFLICT (run_id) DO UPDATE SET "
-        "corpus = coalesce(runs.corpus, EXCLUDED.corpus)" in normalized
+        "ON CONFLICT (run_id) DO UPDATE SET corpus = EXCLUDED.corpus "
+        "WHERE runs.corpus IS NULL" in normalized
     )
     set_list = normalized.split("DO UPDATE SET ", 1)[1]
-    # Exactly one assignment: no other column may be overwritten. (The only
-    # comma allowed is coalesce's own argument separator.)
+    # Exactly one assignment, guarded by the WHERE: no other column may be
+    # overwritten, and the update is a no-op unless corpus needs repairing.
     assert set_list.count("=") == 1
-    assert set_list == "corpus = coalesce(runs.corpus, EXCLUDED.corpus)"
+    assert set_list == "corpus = EXCLUDED.corpus WHERE runs.corpus IS NULL"
 
 
-def test_duplicate_run_id_in_one_file_keeps_first_and_counts():
+def test_duplicate_run_id_in_one_file_keeps_first_and_counts(tmp_path):
     # execute_values + DO UPDATE raises "ON CONFLICT DO UPDATE command cannot
     # affect row a second time" when a run_id repeats inside one batch (DO
     # NOTHING tolerated it), so the dedupe has to happen while loading.
-    import tempfile, os as _os
-
-    fd, path = tempfile.mkstemp(suffix=".jsonl")
-    with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(make_line(outcome="ok") + "\n")
-        fh.write(make_line(outcome="failed") + "\n")
-        fh.write(make_line(run_id="2" * 36) + "\n")
-    try:
-        counters = {"corpus_conflict": 0, "duplicate_run_id": 0}
-        rows = load_run_rows(path, "central-bank", counters)
-    finally:
-        _os.unlink(path)
+    p = tmp_path / "runs.jsonl"
+    p.write_text(
+        make_line(outcome="ok") + "\n"
+        + make_line(outcome="failed") + "\n"
+        + make_line(run_id="2" * 36) + "\n"
+    )
+    counters = {"corpus_conflict": 0, "duplicate_run_id": 0}
+    rows = load_run_rows(str(p), "central-bank", counters)
     assert [r[0] for r in rows] == ["1" * 8 + "-1111-1111-1111-" + "1" * 12, "2" * 36]
     assert rows[0][5] == "ok"  # the FIRST occurrence wins
     assert counters["duplicate_run_id"] == 1

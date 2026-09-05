@@ -236,8 +236,9 @@ def test_contradicting_corpus_line_is_rejected(clean_runs, tmp_path):
 # The producer never emitted `corpus`, so every row ingested before the column
 # existed (260 of them on the NAS) stays NULL forever under DO NOTHING: the
 # file is re-offered nightly and never touched, and source_health's observed
-# half — which joins on (corpus, source_code) — stays empty. DO UPDATE with a
-# coalesce repairs those rows once, without ever rewriting content.
+# half — which joins on (corpus, source_code) — stays empty. DO UPDATE ...
+# WHERE runs.corpus IS NULL repairs those rows once, without ever rewriting
+# content, and is a no-op (no dead tuple) for every already-repaired row.
 
 
 def _run_as(pg_url, data_dir, corpus):
@@ -302,7 +303,8 @@ def test_row_with_a_corpus_is_never_relabelled(clean_runs, tmp_path):
         ],
     )
     # cb-1's line carries no corpus: it reaches the insert with the service's
-    # 'company' and the coalesce keeps the stored 'central-bank'.
+    # 'company', but the WHERE runs.corpus IS NULL guard skips the update
+    # since cb-1 already has 'central-bank' stored.
     # cb-2's line contradicts 'company' outright and is rejected before insert.
     write_runs(tmp_path, [
         make_report("cb-1", outcome="failed"),
