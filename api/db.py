@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
@@ -58,35 +59,58 @@ def get_conn():
         conn.close()
 
 
+# The characters that cut a postgresql:// DSN into tokens -- the same set
+# PASSWORD_CHARSET_HINT forbids in a password, which is not a coincidence: a
+# password containing one of these is exactly a password that moves where the
+# cuts fall.
+_DSN_DELIMITERS = re.compile(r"[/@:#?%]+")
+
+
 def _redact(text):
-    """The driver's message with the DSN password blanked out.
+    """The driver's message with anything password-shaped blanked out.
 
-    psycopg2 quotes the connection string back for a malformed DSN, and the
-    API's DSN carries VAULT_READONLY_PASSWORD. Cheap insurance: the password
-    is never worth putting in a log line, whoever wrote the message.
+    The API's DSN carries VAULT_READONLY_PASSWORD, and the password is never
+    worth putting in a log line, whoever wrote the message.
 
-    A password shorter than 4 characters is a substring of half the words in an
-    English error message, so replacing it everywhere would mangle the message
-    without hiding the `user:pw@host` that leaks it anyway. Below that length
-    the DSN's whole authority is redacted instead.
+    Two shapes, because the driver leaks them differently.
 
-    When urlsplit finds no password at all the whole DSN is blanked wherever
-    the driver echoed it. That is not just the key=value case: a password
-    holding a URL delimiter (see PASSWORD_CHARSET_HINT) re-cuts the URL so the
-    `@` no longer sits in the authority, urlsplit reports no password, and
-    targeted redaction would hand the entire literal to the log -- in exactly
-    the failure the charset rule exists to prevent.
+    A well-formed DSN -- the password is a single token, as the charset hint
+    demands -- gets a targeted replacement, so the host and database names that
+    make a message diagnosable survive. A password shorter than 4 characters is
+    a substring of half the words in an English error message, so replacing it
+    everywhere would mangle the message without hiding the `user:pw@host` that
+    leaks it anyway; below that length the DSN's whole authority goes instead.
+
+    A password holding a URL delimiter (see PASSWORD_CHARSET_HINT) re-cuts the
+    URL, and then targeted replacement protects nothing, because libpq does NOT
+    echo the connection string back: it names the single token it choked on,
+    which is a *fragment* of the password. Verbatim, psycopg2 2.9.10:
+
+        …:abcd/efgh@…  -> invalid integer value "abcd" for connection option "port"
+        …:abcd@efgh@…  -> could not translate host name "efgh@postgres" to address: …
+
+    So for that shape every fragment the DSN could have been cut into is
+    blanked, longest first (`postgres` must not eat the `postgresql` scheme
+    before it is matched). That over-redacts the host and database names, which
+    is the right trade: the charset hint that follows in the log says what to
+    do next, and the leak this prevents is the whole password.
     """
+    if not DATABASE_URL:
+        return text
     try:
-        parts = urlsplit(DATABASE_URL or "")
+        parts = urlsplit(DATABASE_URL)
         password, netloc = parts.password, parts.netloc
-    except ValueError:  # unparseable DSN: nothing to parse, so blank it whole
-        return text.replace(DATABASE_URL, "***") if DATABASE_URL else text
-    if not password:
-        return text.replace(DATABASE_URL, "***") if DATABASE_URL else text
-    if len(password) >= 4:
-        return text.replace(password, "***")
-    return text.replace(netloc, "***")
+    except ValueError:  # unparseable DSN: no token to trust, so blank them all
+        password, netloc = None, None
+    if password and not _DSN_DELIMITERS.search(password):
+        if len(password) >= 4:
+            return text.replace(password, "***")
+        return text.replace(netloc, "***")
+    text = text.replace(DATABASE_URL, "***")
+    fragments = {f for f in _DSN_DELIMITERS.split(DATABASE_URL) if len(f) >= 4}
+    for fragment in sorted(fragments, key=len, reverse=True):
+        text = text.replace(fragment, "***")
+    return text
 
 
 def verify_connection():

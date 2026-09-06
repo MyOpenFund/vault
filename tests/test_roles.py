@@ -125,7 +125,8 @@ def test_statements_are_issued_in_the_documented_order_and_no_others():
     assert "ALTER ROLE" in got[3]
     assert not any("log_statement" in statement or
                    "log_min_error_statement" in statement or
-                   "log_min_duration_statement" in statement for statement in got)
+                   "log_min_duration_statement" in statement or
+                   "log_min_duration_sample" in statement for statement in got)
     for statement, template in zip(got[4:-1], grants):
         head = template.split("{")[0].strip()
         assert head in statement, f"expected {head!r} in {statement}"
@@ -151,19 +152,26 @@ def test_log_statement_is_muted_around_the_alter_role_and_restored_right_after()
     # log_min_duration_statement goes with them: a server with slow-query
     # logging on (>= 0) logs the statement text of anything slow enough, and
     # the ALTER ROLE is the one statement whose text is the password.
+    # log_min_duration_sample is the fourth door into the same log: with
+    # log_statement_sample_rate < 1 the server samples statements slower than
+    # it, so leaving it at 0 while muting the other three logs the ALTER ROLE
+    # some of the time -- an intermittent leak, the worst kind to notice.
     cur = FakeCursor(superuser=True)
     roles.ensure_roles(cur, {roles.ROLE_ORCHESTRATOR: "s3cr3t"})
     got = cur.statements()
     assert "SET LOCAL log_statement" in got[3]
     assert "SET LOCAL log_min_error_statement" in got[4]
     assert "SET LOCAL log_min_duration_statement = -1" in got[5]
-    assert "ALTER ROLE" in got[6]
-    assert "RESET log_statement" in got[7]
-    assert "RESET log_min_error_statement" in got[8]
-    assert "RESET log_min_duration_statement" in got[9]
+    assert "SET LOCAL log_min_duration_sample = -1" in got[6]
+    assert "ALTER ROLE" in got[7]
+    assert "RESET log_statement" in got[8]
+    assert "RESET log_min_error_statement" in got[9]
+    assert "RESET log_min_duration_statement" in got[10]
+    assert "RESET log_min_duration_sample" in got[11]
     assert sum("log_statement" in statement for statement in got) == 2
     assert sum("log_min_error_statement" in statement for statement in got) == 2
     assert sum("log_min_duration_statement" in statement for statement in got) == 2
+    assert sum("log_min_duration_sample" in statement for statement in got) == 2
 
 
 def test_grant_templates_are_the_documented_surface_and_nothing_more():

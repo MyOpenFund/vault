@@ -25,6 +25,18 @@ URL = "postgresql://vault_readonly:s3cr3t@postgres:5432/documents"
 MISSING_ROLE = ('connection to server at "postgres", port 5432 failed: '
                 'FATAL:  role "vault_readonly" does not exist')
 
+# What a delimiter-bearing password ACTUALLY produces. Both messages were
+# captured from psycopg2 2.9.10 by calling psycopg2.connect(dsn,
+# connect_timeout=10) on the DSN above them: libpq echoes the single token it
+# choked on, never the whole connection string, so "blank the DSN if you see
+# it" protects nothing here. A `/` re-cuts the URL so `abcd` lands where the
+# port belongs; an `@` moves the authority's cut so `efgh` lands in the host.
+SLASH_DSN = "postgresql://vault_readonly:abcd/efgh@postgres:5432/documents"
+SLASH_ERROR = 'invalid integer value "abcd" for connection option "port"\n'
+AT_DSN = "postgresql://vault_readonly:abcd@efgh@postgres:5432/documents"
+AT_ERROR = ('could not translate host name "efgh@postgres" to address: '
+            'nodename nor servname provided, or not known\n')
+
 
 class FakeConn:
     def __init__(self):
@@ -89,8 +101,8 @@ def test_a_missing_role_is_reported_loudly_with_the_command_that_fixes_it(
 
 
 def test_the_drivers_echo_of_the_connection_string_is_redacted(monkeypatch, caplog):
-    # psycopg2 quotes the DSN back at you for a malformed connection string --
-    # the one error whose text really does carry the password.
+    # Defence in depth: whatever produced it, a message that carries the DSN
+    # carries the password, so it is blanked wherever it appears.
     monkeypatch.setattr(db, "DATABASE_URL", URL)
 
     def boom(*a, **k):
@@ -111,15 +123,12 @@ def test_the_failure_names_the_password_charset_rule(monkeypatch, caplog):
     # `postgresql://vault_readonly:<pw>@postgres:5432/documents`, so a `/` (or
     # `@ : # % ?`) re-cuts the URL and libpq rejects a DSN that *looks* fine in
     # the .env. `$` is worse still: compose eats it before libpq ever sees it.
-    # And it defeats the targeted redaction on the way past: the `@` is no
-    # longer in the authority, so urlsplit reports no password and there is
-    # nothing to substitute. The whole DSN is blanked instead -- otherwise the
-    # error that reports the bad password would print it in full.
-    mangled = "postgresql://vault_readonly:abcd/efgh@postgres:5432/documents"
-    monkeypatch.setattr(db, "DATABASE_URL", mangled)
+    # Every failure gets the hint -- there is no way to tell from the driver's
+    # side which ones the charset caused.
+    monkeypatch.setattr(db, "DATABASE_URL", SLASH_DSN)
 
     def boom(*a, **k):
-        raise psycopg2.OperationalError(f'invalid dsn: {mangled}')
+        raise psycopg2.OperationalError(SLASH_ERROR)
 
     monkeypatch.setattr(db.psycopg2, "connect", boom)
     with caplog.at_level(logging.ERROR):
@@ -131,8 +140,48 @@ def test_the_failure_names_the_password_charset_rule(monkeypatch, caplog):
     assert "openssl rand -hex 24" in logged
     for delimiter in ("$", "/", "@", ":", "#", "%", "?"):
         assert delimiter in logged, f"{delimiter} missing from the charset hint"
-    assert "abcd" not in logged and "efgh" not in logged
-    assert "invalid dsn" in logged  # the rest of the driver's message survives
+
+
+@pytest.mark.parametrize("dsn,message,leaked", [
+    (SLASH_DSN, SLASH_ERROR, "abcd"),
+    (AT_DSN, AT_ERROR, "efgh"),
+])
+def test_a_delimiter_password_does_not_leak_through_the_drivers_real_message(
+    monkeypatch, caplog, dsn, message, leaked
+):
+    # The redaction's hard case, and the reason it cannot be "blank the DSN
+    # wherever the driver echoed it": libpq never echoes the DSN for these. It
+    # names the ONE token it could not use -- a fragment of the password -- so
+    # the only defence is to blank every fragment the DSN could have been cut
+    # into. Both messages are verbatim from psycopg2 2.9.10 (see the constants).
+    monkeypatch.setattr(db, "DATABASE_URL", dsn)
+
+    def boom(*a, **k):
+        raise psycopg2.OperationalError(message)
+
+    monkeypatch.setattr(db.psycopg2, "connect", boom)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            db.verify_connection()
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "abcd" not in logged and "efgh" not in logged, logged
+    assert leaked not in logged
+    # the shape of the driver's complaint survives, so the log still says what
+    # libpq objected to
+    assert ("connection option" in logged or "translate host name" in logged)
+
+
+def test_a_well_formed_dsn_is_not_over_redacted(monkeypatch):
+    # The common case must stay readable: when the password is a single token
+    # (a URL-safe one, as the hint demands) only the password goes. Blanking
+    # every fragment here would erase the host and database names that make
+    # `role "vault_readonly" does not exist` diagnosable.
+    monkeypatch.setattr(db, "DATABASE_URL", URL)
+    redacted = db._redact(f"{MISSING_ROLE} (database documents)")
+    assert "s3cr3t" not in redacted
+    assert "postgres" in redacted and "documents" in redacted
+    assert "vault_readonly" in redacted
 
 
 def test_a_very_short_password_redacts_the_whole_dsn_authority(monkeypatch):

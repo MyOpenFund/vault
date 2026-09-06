@@ -190,14 +190,22 @@ def _provision(cur, role, password, dbname, quiet=False):
         # any value >= 0 the server logs the text of a statement that ran
         # longer than it, and a cluster under load can make even an ALTER ROLE
         # slow. -1 is the off value.
+        # log_min_duration_sample is the fourth, and the sneakiest: it is the
+        # sampled twin of the previous one (PG13+), so a server that logs a
+        # fraction of its slow statements via log_statement_sample_rate would
+        # write the ALTER ROLE out *some* of the time -- an intermittent leak,
+        # which is the kind nobody notices. -1 turns it off too. Both are
+        # SUSET, so this whole block only runs where we are superuser anyway.
         alter_role = (
             [sql.SQL("SET LOCAL log_statement = 'none'"),
              sql.SQL("SET LOCAL log_min_error_statement = 'panic'"),
-             sql.SQL("SET LOCAL log_min_duration_statement = -1")]
+             sql.SQL("SET LOCAL log_min_duration_statement = -1"),
+             sql.SQL("SET LOCAL log_min_duration_sample = -1")]
             + alter_role
             + [sql.SQL("RESET log_statement"),
                sql.SQL("RESET log_min_error_statement"),
-               sql.SQL("RESET log_min_duration_statement")]
+               sql.SQL("RESET log_min_duration_statement"),
+               sql.SQL("RESET log_min_duration_sample")]
         )
     statements = [
         sql.SQL(_CREATE_ROLE_SQL).format(name=sql.Literal(role), role=ident),

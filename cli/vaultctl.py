@@ -139,9 +139,13 @@ def safe_filename(content_disposition, fallback):
         return fallback
     raw = None
     for parameter in content_disposition.split(";"):
-        parameter = parameter.strip()
-        if parameter.startswith("filename="):
-            raw = parameter[len("filename="):].strip().strip('"')
+        key, _, value = parameter.partition("=")
+        # Parameter names are case-insensitive and whitespace may surround the
+        # `=` (RFC 9110 §5.6.6), so `FILENAME = "x"` names the same parameter.
+        # Matching the key exactly also keeps `filename*=` (RFC 5987) out: it
+        # is a different parameter with a different value grammar.
+        if key.strip().lower() == "filename":
+            raw = value.strip().strip('"')
             break
     if raw is None:
         return fallback

@@ -30,6 +30,15 @@ from vaultctl import safe_filename
     ('attachment; filename=".."; size=3', "doc123"),
     ('attachment; filename=""; size=3', "doc123"),
     ('attachment; filename=; size=3', "doc123"),
+    # Parameter names are case-insensitive and whitespace around `=` is legal
+    # (RFC 9110 §5.6.6), so a server that spells it differently must still get
+    # a basename rather than silently falling back to the document id.
+    ('attachment; FILENAME="report.pdf"', "report.pdf"),
+    ('attachment; Filename="report.pdf"', "report.pdf"),
+    ('attachment; filename = "report.pdf"', "report.pdf"),
+    ('attachment; FILENAME = "../../etc/passwd"', "passwd"),
+    # ... but `filename*=` (RFC 5987) is a DIFFERENT parameter, not this one.
+    ('attachment; filename*=UTF-8\'\'r.pdf', "doc123"),
 ])
 def test_safe_filename_is_always_a_bare_basename(header, expected):
     assert safe_filename(header, "doc123") == expected
