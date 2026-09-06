@@ -4,3 +4,4 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "ingestion"))
 sys.path.insert(0, str(ROOT / "api"))
+sys.path.insert(0, str(ROOT / "cli"))

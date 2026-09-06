@@ -120,6 +120,39 @@ def get_document(doc_id: str):
         console.print(f"[cyan]{key}[/cyan]: {value}")
 
 
+def safe_filename(content_disposition, fallback):
+    """The download filename, reduced to a bare basename.
+
+    The header is a disposition type followed by `;`-separated parameters
+    (RFC 6266 §4.1), so `filename` is not necessarily the last one: the value
+    ends at the next `;`. Splitting the whole header on `filename=` alone
+    would swallow any parameter that follows it, turning
+    `attachment; filename="a.pdf"; size=3` into `a.pdf"; size=3`.
+
+    The server's Content-Disposition is untrusted input (the default transport
+    is plain HTTP), so whatever the split yields is reduced to a basename:
+    `Path(name).name` strips any directory part, and neither an absolute path
+    nor a "../" traversal can move the write out of the chosen output
+    directory (vault #5).
+    """
+    if not content_disposition:
+        return fallback
+    raw = None
+    for parameter in content_disposition.split(";"):
+        key, _, value = parameter.partition("=")
+        # Parameter names are case-insensitive and whitespace may surround the
+        # `=` (RFC 9110 §5.6.6), so `FILENAME = "x"` names the same parameter.
+        # Matching the key exactly also keeps `filename*=` (RFC 5987) out: it
+        # is a different parameter with a different value grammar.
+        if key.strip().lower() == "filename":
+            raw = value.strip().strip('"')
+            break
+    if raw is None:
+        return fallback
+    name = Path(raw).name
+    return name if name not in ("", ".", "..") else fallback
+
+
 @app.command("download")
 def download_document(
     doc_id: str,
@@ -139,11 +172,10 @@ def download_document(
         except httpx.HTTPError as e:
             _die(str(e))
 
-    filename = doc_id
-    if "content-disposition" in resp.headers:
-        filename = resp.headers["content-disposition"].split("filename=")[-1].strip('"')
-
+    filename = safe_filename(resp.headers.get("content-disposition"), doc_id)
     dest = output_dir / filename
+    # NOTE: the whole response body is buffered in memory before the write.
+    # Known, and out of scope for #5 — streaming the download is its own issue.
     dest.write_bytes(resp.content)
     console.print(f"[green]Downloaded:[/green] {dest}")
 

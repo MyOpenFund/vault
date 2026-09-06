@@ -1,19 +1,142 @@
+import logging
 import os
+import re
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 import psycopg2
 import psycopg2.extras
 
+log = logging.getLogger("uvicorn.error")
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# The role the API is meant to connect as (compose.yaml). Named here so the
+# startup error can say which role is missing without parsing a DSN that may
+# not even be well formed.
+EXPECTED_ROLE = "vault_readonly"
+
+# libpq's default is no timeout at all: a host that DROPs rather than REJECTs
+# (a firewall rule, a stale tailnet address) leaves connect() waiting out the
+# OS TCP retry budget -- around two minutes. Ten seconds is far past a healthy
+# same-compose-network connect and short enough that the startup gate
+# crash-loops visibly instead of hanging, and a request fails instead of
+# holding a worker.
+CONNECT_TIMEOUT_SECONDS = 10
+
+FIRST_BOOT_HINT = (
+    "The vault's least-privilege roles are created by the DDL train, so on any "
+    "cluster that has not run it yet %s does not exist until the ingestion "
+    "service has run once: `docker compose run --rm ingestion`. Check VAULT_READONLY_PASSWORD "
+    "is set to the same value for both services. This container now exits "
+    "non-zero; `restart: unless-stopped` will retry it."
+)
+
+# The other way this fails right after an .env edit, and the one that reads as
+# a bug in the code rather than in the .env: compose interpolates the value
+# into `postgresql://vault_readonly:<pw>@postgres:5432/documents`, so a
+# password holding a URL delimiter re-cuts the DSN and libpq rejects (or
+# misroutes) something that looks perfectly fine in the .env. `$` never even
+# reaches libpq -- compose expands it first.
+PASSWORD_CHARSET_HINT = (
+    "If VAULT_READONLY_PASSWORD was just set or rotated: the value is "
+    "interpolated by compose and embedded in a postgresql:// URL, so it must "
+    "be URL-safe -- no $ / @ : # % ? characters. Generate one with "
+    "`openssl rand -hex 24` (NOT `openssl rand -base64`)."
+)
 
 
 @contextmanager
 def get_conn():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=CONNECT_TIMEOUT_SECONDS,
+    )
     try:
         yield conn
     finally:
         conn.close()
+
+
+# The characters that cut a postgresql:// DSN into tokens -- the same set
+# PASSWORD_CHARSET_HINT forbids in a password, which is not a coincidence: a
+# password containing one of these is exactly a password that moves where the
+# cuts fall.
+_DSN_DELIMITERS = re.compile(r"[/@:#?%]+")
+
+
+def _redact(text):
+    """The driver's message with anything password-shaped blanked out.
+
+    The API's DSN carries VAULT_READONLY_PASSWORD, and the password is never
+    worth putting in a log line, whoever wrote the message.
+
+    Two shapes, because the driver leaks them differently.
+
+    A well-formed DSN -- the password is a single token, as the charset hint
+    demands -- gets a targeted replacement, so the host and database names that
+    make a message diagnosable survive. A password shorter than 4 characters is
+    a substring of half the words in an English error message, so replacing it
+    everywhere would mangle the message without hiding the `user:pw@host` that
+    leaks it anyway; below that length the DSN's whole authority goes instead.
+
+    A password holding a URL delimiter (see PASSWORD_CHARSET_HINT) re-cuts the
+    URL, and then targeted replacement protects nothing, because libpq does NOT
+    echo the connection string back: it names the single token it choked on,
+    which is a *fragment* of the password. Verbatim, psycopg2 2.9.10:
+
+        …:abcd/efgh@…  -> invalid integer value "abcd" for connection option "port"
+        …:abcd@efgh@…  -> could not translate host name "efgh@postgres" to address: …
+
+    So for that shape every fragment the DSN could have been cut into is
+    blanked, longest first (`postgres` must not eat the `postgresql` scheme
+    before it is matched). That over-redacts the host and database names, which
+    is the right trade: the charset hint that follows in the log says what to
+    do next, and the leak this prevents is the whole password.
+    """
+    if not DATABASE_URL:
+        return text
+    try:
+        parts = urlsplit(DATABASE_URL)
+        password, netloc = parts.password, parts.netloc
+    except ValueError:  # unparseable DSN: no token to trust, so blank them all
+        password, netloc = None, None
+    if password and not _DSN_DELIMITERS.search(password):
+        if len(password) >= 4:
+            return text.replace(password, "***")
+        return text.replace(netloc, "***")
+    text = text.replace(DATABASE_URL, "***")
+    fragments = {f for f in _DSN_DELIMITERS.split(DATABASE_URL) if len(f) >= 4}
+    for fragment in sorted(fragments, key=len, reverse=True):
+        text = text.replace(fragment, "***")
+    return text
+
+
+def verify_connection():
+    """Open and close one connection, or fail the process loudly.
+
+    Called once at startup (see main.lifespan). Without it the API comes up
+    happily against a database it cannot reach, answers /health with "ok", and
+    returns 500 on every route that touches the corpus -- the silent version of
+    a failure that `docker compose ps` should be shouting about.
+    """
+    reason = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=CONNECT_TIMEOUT_SECONDS)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {_redact(str(exc)).strip()}"
+    if reason is not None:
+        log.error("vault API cannot connect to Postgres as %s: %s",
+                  EXPECTED_ROLE, reason)
+        log.error(FIRST_BOOT_HINT, EXPECTED_ROLE)
+        log.error(PASSWORD_CHARSET_HINT)
+        # Raised OUTSIDE the handler, like ingestion/roles.py does: inside it,
+        # Python would chain the driver error onto __context__, and that error
+        # drags its own traceback -- whose psycopg2.connect frame holds the DSN,
+        # password and all. Out here the exception state is already cleared.
+        raise RuntimeError("cannot reach the vault database") from None
+    conn.close()
 
 
 # Fields allowing an exact-match filter (?source_code=us for example)

@@ -78,6 +78,36 @@ def clean_db(pg_url):
     return pg_url
 
 
+VAULT_ROLES = ("vault_orchestrator", "vault_readonly")
+
+
+def role_conn(pg_url, role, password):
+    """A connection authenticated as one of the provisioned vault roles."""
+    return psycopg2.connect(f"postgresql://{role}:{password}@{pg_url.split('@', 1)[1]}")
+
+
+def drop_vault_roles(pg_url):
+    """Hand the cluster back without the roles a DDL train provisioned.
+
+    Roles are cluster-level, not schema-level: `clean_db` cannot undo them, so
+    a module that provisions them cleans up after itself. DROP OWNED BY first:
+    it is what removes the grants and the ALTER DEFAULT PRIVILEGES entries that
+    would otherwise make DROP ROLE fail.
+    """
+    from psycopg2 import sql
+
+    conn = psycopg2.connect(pg_url)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        for role in VAULT_ROLES:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            if cur.fetchone():
+                ident = sql.Identifier(role)
+                cur.execute(sql.SQL("DROP OWNED BY {}").format(ident))
+                cur.execute(sql.SQL("DROP ROLE {}").format(ident))
+    conn.close()
+
+
 def write_manifest(directory, name, docs):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -160,9 +190,13 @@ def lock_is_free(pg_url, key):
 
 
 def fetch_all(pg_url, query):
+    # try/finally, not a bare close(): a query that raises would otherwise leak
+    # an open read transaction, and the next test's `clean_db` DROP TABLE ...
+    # CASCADE would block on its ACCESS SHARE lock until the suite timed out.
     conn = psycopg2.connect(pg_url)
-    with conn.cursor() as cur:
-        cur.execute(query)
-        rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            return cur.fetchall()
+    finally:
+        conn.close()

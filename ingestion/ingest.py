@@ -31,6 +31,10 @@ then a per-corpus one for the rest of the pass. An overlapping run of the
 same corpus waits (it never skips); a run of a different corpus is never
 blocked. See DDL_LOCK_KEY / corpus_lock_key below.
 
+The train also owns the two least-privilege login roles and their grants
+(roles.py): they are re-issued on every run because the views the grants sit on
+are dropped and recreated by this very train.
+
 After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
 the `cadence` table as a full replace (see ingest_cadence.py for the
 transactional semantics), DATA_DIR/runs.jsonl content-append-only into `runs`
@@ -50,6 +54,7 @@ from psycopg2.extras import execute_values
 import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
+import roles
 from common import resolve_corpus
 
 logging.basicConfig(
@@ -672,6 +677,9 @@ def main(*, corpus=None, data_dir=None):
         held.append(DDL_LOCK_KEY)
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
+            # Same cursor, same transaction, still under `vault-ddl`: the grants
+            # must land after the views this train just recreated (#5).
+            roles.ensure_roles(cur, roles.roles_from_env(os.environ))
         conn.commit()
         release_lock(conn, DDL_LOCK_KEY)
         held.remove(DDL_LOCK_KEY)

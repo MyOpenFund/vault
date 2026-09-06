@@ -12,14 +12,43 @@ services:
       # without it a fresh `compose up` leaves Metabase crash-looping on
       # "database metabase does not exist".
       - ./deploy/initdb:/docker-entrypoint-initdb.d:ro
-    # No published port: Metabase and the API reach Postgres over the
-    # internal compose network. For ad-hoc psql access, use
-    # `docker compose exec postgres psql -U docuser documents`.
+    # No published port here, on purpose: Metabase, the API and the ingestion
+    # service reach Postgres over the internal compose network, and ad-hoc
+    # access is `docker compose exec postgres psql -U docuser documents`.
+    #
+    # To reach the vault from another machine — the off-host data-orchestrator,
+    # over the tailnet — uncomment the two lines below in the DEPLOYMENT's
+    # compose (Dockge on the NAS) and set POSTGRES_BIND_ADDR in that host's
+    # .env; the interface address itself never enters this repo.
+    #
+    # POSTGRES_BIND_ADDR MUST be a specific interface address: the tailnet IP
+    # (`POSTGRES_BIND_ADDR=<tailnet-ip>`) on the NAS, 127.0.0.1 (the default)
+    # everywhere else. NEVER the all-zeroes wildcard address and never a
+    # bind-address-less "5432:5432" — a unit test forbids both literals in this
+    # file. An *empty* POSTGRES_BIND_ADDR is not a third literal to forbid: the
+    # `:-127.0.0.1` default below turns it back into the loopback, which is why
+    # the default must stay in the line. Docker publishes ports by DNAT *ahead
+    # of* the host firewall, so this line is the only thing between the corpus
+    # and whatever networks the host sits on. Off-host clients authenticate with
+    # scram-sha-256 (the image's pg_hba trusts only the container's own
+    # loopback) and must connect as vault_orchestrator or vault_readonly —
+    # never docuser, which is a cluster superuser.
+    #ports:
+    #  - "${POSTGRES_BIND_ADDR:-127.0.0.1}:${POSTGRES_BIND_PORT:-5432}:5432"
     restart: unless-stopped
     healthcheck:
+      # -h 127.0.0.1 forces the REAL server: the entrypoint's temporary init
+      # server listens on the unix socket only, so a socket-based pg_isready can
+      # go green before deploy/initdb/01-metabase.sql has created `metabase`.
+      #
+      # Consequence on a data dir older than deploy/initdb/ (initdb scripts run
+      # on an EMPTY data dir only): no `metabase` database, so this check never
+      # goes green and `ingestion`/`api` stay blocked on service_healthy. Fix it
+      # once, by hand: `docker compose exec postgres createdb -U docuser
+      # -O docuser metabase` (or the CREATE DATABASE in deploy/initdb/).
       test:
         - CMD-SHELL
-        - pg_isready -U docuser -d documents
+        - pg_isready -h 127.0.0.1 -U docuser -d documents && psql -h 127.0.0.1 -U docuser -d metabase -Atc 'SELECT 1' > /dev/null
       interval: 10s
       timeout: 5s
       retries: 5
@@ -51,6 +80,12 @@ services:
       DISCOVERY_ERROR_MAX_CHARS: ${DISCOVERY_ERROR_MAX_CHARS:-2000}
       DISCOVERY_ERRORS_MIN_RETAIN_FRACTION: ${DISCOVERY_ERRORS_MIN_RETAIN_FRACTION:-0.5}
       CORPUS: ${CORPUS:-central-bank}
+      # Least-privilege roles (#5). Set → the DDL train creates/refreshes that
+      # role and re-issues its grants on every run; unset → it is skipped with
+      # a WARNING and no grant is issued (the dev/CI path). Rotation: change
+      # the value in .env and run this service once.
+      VAULT_ORCHESTRATOR_PASSWORD: ${VAULT_ORCHESTRATOR_PASSWORD:-}
+      VAULT_READONLY_PASSWORD: ${VAULT_READONLY_PASSWORD:-}
       # Optional overrides for the three root-level producer files (default:
       # <DATA_DIR>/<name>.jsonl). Empty values fall back to the default.
       CADENCE_PATH: ${CADENCE_PATH:-}
@@ -67,7 +102,15 @@ services:
     build: ./api
     container_name: vault_api
     environment:
-      DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
+      # Read-only by code AND by grant (#5). On a cluster that has not yet run
+      # the new train the role does not exist: until then this container logs
+      # why and exits non-zero on startup, and `restart: unless-stopped` keeps
+      # retrying it. Run `docker compose run --rm ingestion` once.
+      #
+      # `:?` and not `:-`: an unset password should stop `compose up` here,
+      # loudly, rather than build a DSN with an empty password whose only
+      # symptom is an authentication failure inside the container.
+      DATABASE_URL: postgresql://vault_readonly:${VAULT_READONLY_PASSWORD:?set it in .env — see .env.example}@postgres:5432/documents
       RAW_DATA_DIR: /data/raw
     volumes:
       - ${RAW_DIR:?set it in .env — see .env.example}:/data/raw:ro   # needed to serve actual file downloads

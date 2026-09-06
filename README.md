@@ -24,7 +24,7 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 | Service | Role | Port |
 |---|---|---|
-| `postgres` | the vault itself (PostgreSQL 16) | internal only |
+| `postgres` | the vault itself (PostgreSQL 16) | internal only (publishable on one interface — see [Access & roles](#access--roles)) |
 | `ingestion` | one-shot manifest → Postgres sync (run per corpus) | — |
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
@@ -126,9 +126,102 @@ Additive. Run `docker compose run --rm ingestion` once after deploying: the trai
 
 Runbook: if the producer legitimately rotates (truncates) `discovery_errors.jsonl`, the retain-fraction guard above will otherwise leave the table stuck on the pre-rotation snapshot — run `docker compose run --rm -e DISCOVERY_ERRORS_MIN_RETAIN_FRACTION=0.0 ingestion` once to accept the drop (or set the variable in `.env`), then revert to the default. The upsert never deletes: after such a run, fingerprints absent from the new file keep the `occurrences` they had before the rotation, and only the fingerprints present in it are reset to their post-rotation count.
 
+### Migration (2026-09 access & roles)
+
+Not additive: this one needs two variables in the deployment's `.env` **before** the new tree is
+pulled, because the API's DSN now refuses to interpolate without one of them (`compose up` stops
+with `required variable VAULT_READONLY_PASSWORD is missing a value`).
+
+1. Add `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` to the deployment's `.env`
+   (see `.env.example`) — first, before pulling. Generate each with `openssl rand -hex 24`: the
+   value must be URL-safe (no `$ / @ : # % ?`), because compose interpolates it and it is
+   embedded in a `postgresql://` URL.
+2. `docker compose run --rm ingestion` — the DDL train creates the two roles and issues their
+   grants. Nothing is run by hand against the cluster.
+3. `docker compose up -d api` — the API is recreated (its environment changed). Until step 2 has
+   run, it crash-loops loudly: one `ERROR` naming `vault_readonly` and the command that fixes it,
+   then a non-zero exit, retried by `restart: unless-stopped`.
+
+Then, as operator steps outside the repo: point Metabase's **analytics** connection at
+`vault_readonly` in the UI (Admin → Databases → the vault connection → user/password; Metabase's
+own *application* database keeps `docuser`, which needs DDL on its own schema), and — on the NAS
+compose only — uncomment the `ports:` block and set `POSTGRES_BIND_ADDR` to the tailnet address if
+the off-host orchestrator must reach Postgres. Rollback is `git checkout` of the previous tree:
+the roles are extra objects, nothing the old services used was dropped or revoked.
+
+Follow-up, one-off and outside the train (those databases do not exist on a dev or CI cluster, so
+the train cannot converge them): on the NAS, run `REVOKE CONNECT ON DATABASE metabase, postgres
+FROM PUBLIC` once, so the two new roles cannot open a session on the databases they have no
+business in.
+
 ### Fact columns on `documents`
 
 `has_text_layer` and `page_count` are nullable facts feeding the RAG's OCR policy. They are written by `data-orchestrator`'s probe pass only — manifests never carry them and the manifest upsert never touches them.
+
+## Access & roles
+
+Every service used to connect as `docuser`, which in the `postgres:16` image is a full cluster
+superuser. Two least-privilege roles now do the work instead. They are owned by the DDL train:
+the ingestion service creates them and **re-issues their grants on every run** — the views are
+dropped and recreated nightly, and a grant dies with its view.
+
+| Object | `docuser` | `vault_orchestrator` | `vault_readonly` |
+|---|---|---|---|
+| `documents` | superuser (all) | `SELECT`; `UPDATE (has_text_layer, page_count)` only | `SELECT` |
+| `runs` | all | `SELECT`, `INSERT` | `SELECT` |
+| `rag_ingestions` | all | `SELECT`, `INSERT`, `UPDATE` | `SELECT` |
+| `cadence`, `discovery_errors` | all | `SELECT` | `SELECT` |
+| the five views | all | `SELECT` | `SELECT` |
+| tables/views created later | all | `SELECT` (default privileges) | `SELECT` (default privileges) |
+| schema `public` | owner | `USAGE`, no `CREATE` | `USAGE`, no `CREATE` |
+| database `documents` | owner | `CONNECT` | `CONNECT` |
+| DDL, `DELETE`, `TRUNCATE`, `DROP` | yes | denied | denied |
+
+`vault_orchestrator` is for the off-host `data-orchestrator`; `vault_readonly` is what the API
+connects as (read-only by code *and* by grant) and what Metabase's analytics connection should
+use. `docuser` stays a superuser — demoting it means re-owning the schema — but after this
+change it is used by the **ingestion service only**, plus Metabase's own application database
+(`MB_DB_USER`), which legitimately needs DDL on its own schema.
+
+Passwords come from `VAULT_ORCHESTRATOR_PASSWORD` and `VAULT_READONLY_PASSWORD` (see
+`.env.example`). Unset or empty → that role is skipped with a WARNING and no grant is issued,
+which is how the dev and CI clusters run with no roles at all.
+
+**Password charset**: generate with `openssl rand -hex 24`. The value **must be URL-safe — no
+`$ / @ : # % ?`** — because compose interpolates it and it is embedded in a `postgresql://` URL.
+`openssl rand -base64` is not safe here: the `ALTER ROLE` accepts it (the train passes it as a
+SQL literal), but the resulting DSN for the API and the orchestrator is malformed, and they
+crash-loop on a libpq error that does not say "bad password".
+
+**Rotation**: change the value in `.env` — same charset rule — run
+`docker compose run --rm ingestion` once (the train re-applies the password every run), then
+update the consumer. Nothing is ever run by hand against the cluster.
+
+**First boot ordering.** The roles do not exist until the first ingestion run of *this* tree, so
+on any cluster that has not yet run it — a brand-new one, or an existing deployment being upgraded
+— the API cannot connect. It says so and stops: one `ERROR` naming the role and the command
+to run, then a non-zero exit, with `restart: unless-stopped` retrying — never a silent 500 behind
+a green `/health`. On a new deployment, run the ingestion once before (or right after) starting
+the API:
+
+```bash
+docker compose up -d postgres
+docker compose run --rm ingestion     # creates the roles + the schema
+docker compose up -d api metabase
+```
+
+**Publishing the database port.** `compose.yaml` publishes no Postgres port; the `ports:` block is
+committed commented out. Uncomment it in the deployment's own compose (Dockge on the NAS) and set
+`POSTGRES_BIND_ADDR=<tailnet-ip>` in that host's `.env` — the real address never enters this repo.
+It must always be one specific interface address (`127.0.0.1` is the default), never the
+all-zeroes wildcard and never a bind-address-less `5432:5432`: Docker publishes ports by DNAT
+*ahead of* the host firewall, so that value is the whole access control. A unit test fails the
+build if either form appears. Off-host clients land on the image's `scram-sha-256` rule (its
+`pg_hba` trusts only the container's own loopback) and must connect as one of the two roles.
+
+TLS is deliberately not configured: the only off-host transport is a tailnet, which is already
+authenticated and encrypted. If Postgres ever has to be reachable outside it, `sslmode=require`
+plus a certificate on the host is the next hardening step.
 
 ## API
 
@@ -161,10 +254,18 @@ PDF download button, both still behind the API/`vaultctl`.
 ## Quickstart
 
 ```bash
-cp .env.example .env        # set POSTGRES_PASSWORD + host paths (never committed)
-docker compose up -d postgres metabase api
-docker compose run --rm ingestion            # sync the manifests, then exits
+cp .env.example .env        # POSTGRES_PASSWORD, the two role passwords, host paths
+docker compose up -d postgres
+docker compose run --rm ingestion            # schema + roles, syncs the manifests, exits
+docker compose up -d api metabase
 ```
+
+Order matters on any cluster that has not yet run the new train: the API connects as
+`vault_readonly`, a role the ingestion run creates (see [Access & roles](#access--roles)) — that
+includes an existing deployment upgrading to this tree, not just a brand-new cluster (see
+[Migration (2026-09 access & roles)](#migration-2026-09-access--roles)). Once the roles exist,
+`docker compose up -d` brings everything back in any order, and ingestion is re-run on demand or
+from cron.
 
 ## CLI
 
