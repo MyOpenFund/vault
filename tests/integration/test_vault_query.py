@@ -7,6 +7,8 @@ train included) and is deliberately uneven: two documents share a date, one has
 no date at all, one is html, and one is tombstoned by a second run's sweep.
 """
 
+import json
+
 import psycopg2
 import pytest
 
@@ -41,7 +43,10 @@ def conn(clean_db, tmp_path, monkeypatch):
     c = psycopg2.connect(clean_db)
     c.autocommit = True
     with c.cursor() as cur:
+        # runs and cadence survive clean_db and the container is module-scoped:
+        # clear them so fixed run_ids and cadence keys never collide.
         cur.execute("DELETE FROM runs")
+        cur.execute("DELETE FROM cadence")
     yield c
     c.close()
 
@@ -131,3 +136,91 @@ def test_corpus_stats_keeps_null_keys_and_filters_by_corpus(conn):
     assert sum(g["count"] for g in stats["groups"]) == stats["total"] == 4
     empty = vq.corpus_stats(conn, "year", corpus="company")
     assert empty["total"] == 0 and empty["groups"] == []
+
+
+def _insert_run(conn, run_id, finished_at, sources, outcome="ok", corpus="central-bank"):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO runs (run_id, tool, command, corpus, started_at, finished_at, outcome, "
+            "exit_code, sources) VALUES (%s, 'central-bank-corpus', 'sync', %s, %s, %s, %s, 0, %s)",
+            (run_id, corpus, finished_at, finished_at, outcome, json.dumps(sources)),
+        )
+
+
+def _insert_error(conn, fingerprint, resolved_at=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO discovery_errors (fingerprint, corpus, source_code, url, error_class, error, "
+            "first_seen_at, last_seen_at, resolved_at) VALUES (%s, 'central-bank', 'us', 'https://x', "
+            "'HTTP404', 'not found', now(), now(), %s)",
+            (fingerprint, resolved_at),
+        )
+
+
+def test_runs_status_is_per_source_newest_first_and_filters(conn):
+    """One row per (run, source), newest run first, then source_code.
+
+    The second run carries a non-integer counter: the view casts it to NULL,
+    so a producer bug never turns into an exception for the reader.
+    """
+    _insert_run(conn, "r1", "2026-10-01T02:00:00Z", [{"source_code": "us", "docs_new": 3}])
+    _insert_run(conn, "r2", "2026-10-02T02:00:00Z",
+                [{"source_code": "us", "docs_new": "garbage"}, {"source_code": "fr", "fetch_errors": 2}],
+                outcome="degraded")
+    rows = vq.runs_status(conn, limit=10)
+    assert [(r["run_id"], r["source_code"]) for r in rows] == [("r2", "fr"), ("r2", "us"), ("r1", "us")]
+    assert set(rows[0]) == set(vq.health.RUN_COLUMNS)
+    us = vq.runs_status(conn, source_code="us")
+    assert [r["run_id"] for r in us] == ["r2", "r1"]
+    assert us[0]["docs_new"] is None  # non-integer counter: NULL, never an exception
+    assert us[1]["docs_new"] == 3
+    assert vq.runs_status(conn, since="2026-10-02T00:00:00Z", source_code="us")[0]["run_id"] == "r2"
+    assert len(vq.runs_status(conn, since="2026-10-02T00:00:00Z", source_code="us")) == 1
+    assert len(vq.runs_status(conn, limit=1)) == 1
+    assert vq.runs_status(conn, corpus="company") == []
+
+
+def test_open_discovery_errors_and_freshness(conn):
+    """Open errors are listed; freshness reports live docs and no runs as None."""
+    _insert_error(conn, "f1")
+    errs = vq.open_discovery_errors(conn, source_code="us")
+    assert [e["fingerprint"] for e in errs] == ["f1"]
+    assert set(errs[0]) == set(vq.health.ERROR_COLUMNS)
+    fresh = vq.freshness(conn)
+    assert fresh["live_documents"] == 4
+    assert fresh["last_ingest_seen_at"] is not None
+    assert fresh["last_run_finished_at"] is None  # no runs in this test: None, not an error
+
+
+def test_open_discovery_errors_skips_resolved(conn):
+    """An error with resolved_at set is history, not an open failure."""
+    _insert_error(conn, "open")
+    _insert_error(conn, "closed", resolved_at="2026-10-01T00:00:00Z")
+    assert [e["fingerprint"] for e in vq.open_discovery_errors(conn)] == ["open"]
+
+
+def test_source_health_reads_the_view(conn):
+    """The view is wired: a cadence series comes back with its observed counts.
+
+    One cadence row for (central-bank, us, C1) and one recent run for 'us'
+    (plus one for 'fr', which has no cadence row and so no health row). The
+    source_code filter and a non-matching corpus are exercised too.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO cadence (corpus, source_code, doc_type, interval_days, days_until, status, "
+            "updated_at) VALUES ('central-bank', 'us', 'C1', 30, -2, 'overdue', now())"
+        )
+        cur.execute("SELECT now()")
+        now = cur.fetchone()[0]
+    _insert_run(conn, "h1", now, [{"source_code": "us", "docs_seen": 5, "docs_new": 2},
+                                  {"source_code": "fr", "docs_seen": 1, "docs_new": 1}])
+    rows = vq.source_health(conn, corpus="central-bank")
+    assert [(r["corpus"], r["source_code"], r["doc_type"]) for r in rows] == [("central-bank", "us", "C1")]
+    us = rows[0]
+    assert us["source_runs_7d"] == 1
+    assert us["source_docs_seen_7d"] == 5 and us["source_docs_new_7d"] == 2
+    assert us["last_run_id"] == "h1" and us["days_late"] == 2
+    assert vq.source_health(conn, source_code="us") == rows
+    assert vq.source_health(conn, source_code="fr") == []
+    assert vq.source_health(conn, corpus="company") == []

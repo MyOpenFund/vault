@@ -9,7 +9,9 @@ fails the test if any SQL would run.
 
 import pytest
 
-from vault_query import InvalidQuery, corpus_stats, search_documents
+from vault_query import (
+    InvalidQuery, corpus_stats, open_discovery_errors, runs_status, search_documents,
+)
 
 
 class _NoConnection:
@@ -49,3 +51,10 @@ def test_corpus_stats_refuses_bad_arguments_before_sql(args, kwargs):
     """
     with pytest.raises(InvalidQuery):
         corpus_stats(_NoConnection(), *args, **kwargs)
+
+
+@pytest.mark.parametrize("fn", [runs_status, open_discovery_errors])
+def test_health_reads_refuse_a_limit_below_one_before_sql(fn):
+    """`limit` is caller-controlled: below 1 is InvalidQuery, no SQL runs."""
+    with pytest.raises(InvalidQuery):
+        fn(_NoConnection(), limit=0)
