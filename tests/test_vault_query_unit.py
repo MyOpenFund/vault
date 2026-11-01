@@ -25,6 +25,7 @@ class _NoConnection:
     {"limit": 0},
     {"offset": -1},
     {"columns": ("doc_id", "password")},
+    {"columns": ()},
 ])
 def test_search_documents_refuses_bad_arguments_before_sql(kwargs):
     """Each bad argument raises InvalidQuery, never reaches the database.

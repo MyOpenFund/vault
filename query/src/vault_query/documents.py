@@ -28,7 +28,15 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
 
     Returns (total, rows). `total` ignores the window, so a caller can page to
     the end. `doc_id` breaks ties so pages never overlap or skip under a
-    non-unique sort key (several documents share a date).
+    non-unique sort key (several documents share a date); the tie-break is
+    always `doc_id` ascending, whatever `sort_dir` is. NULL sort keys come last
+    in both directions.
+
+    `limit` (>= 1) and `offset` (>= 0) are ints. `columns`, when given, is a
+    non-empty subset of ALL_COLUMNS; None means every column.
+
+    The COUNT and the page are two statements: under READ COMMITTED a
+    concurrent ingest between them can shift the page against the total by a row.
     """
     if sort_by not in SORTABLE_FIELDS:
         raise InvalidQuery(f"sort_by must be one of {sorted(SORTABLE_FIELDS)}")
@@ -38,6 +46,10 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
         raise InvalidQuery("limit must be >= 1")
     if offset < 0:
         raise InvalidQuery("offset must be >= 0")
+    if columns is not None:
+        columns = tuple(columns)
+        if not columns:
+            raise InvalidQuery("columns must not be empty")
     if columns is not None and not set(columns) <= ALL_COLUMNS:
         raise InvalidQuery(f"unknown columns: {sorted(set(columns) - ALL_COLUMNS)}")
 

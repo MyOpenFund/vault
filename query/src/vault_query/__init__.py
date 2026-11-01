@@ -2,6 +2,9 @@
 
 One implementation of the corpus reads, shared by the vault API and the MCP server.
 Every function takes an open psycopg2 connection owned by the caller and never commits.
+Callers should pass an autocommit connection (or roll back after each call): a read on a
+non-autocommit connection leaves it "idle in transaction", holding ACCESS SHARE locks that
+block the vault's DDL train.
 """
 from .documents import ALL_COLUMNS, SEARCH_COLUMNS, get_document, search_documents
 from .filters import FILTERABLE_FIELDS, SORTABLE_FIELDS, InvalidQuery, build_where_clause

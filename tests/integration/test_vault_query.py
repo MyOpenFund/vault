@@ -18,9 +18,11 @@ from .conftest import make_doc, run_ingest, write_manifest
 
 pytestmark = pytest.mark.integration
 
+# us2 is listed BEFORE us1: insertion order must differ from doc_id order,
+# otherwise the paging walks pass even without the `, doc_id` tie-break.
 SEED = [
-    make_doc("us1", source="us", date="2010-01-13", year=2010),
     make_doc("us2", source="us", date="2010-01-13", year=2010),  # same date as us1: tie-break
+    make_doc("us1", source="us", date="2010-01-13", year=2010),
     make_doc("us3", source="us", date=None, year=None),          # NULL date sorts last
     make_doc("fr1", source="fr", date="2011-05-01", year=2011, mime_type="text/html"),
 ]
@@ -45,6 +47,7 @@ def conn(clean_db, tmp_path, monkeypatch):
     with c.cursor() as cur:
         # runs and cadence survive clean_db and the container is module-scoped:
         # clear them so fixed run_ids and cadence keys never collide.
+        # Isolation of the run-health tests: clean_db does not drop these two tables.
         cur.execute("DELETE FROM runs")
         cur.execute("DELETE FROM cadence")
     yield c
@@ -70,6 +73,47 @@ def test_search_pages_cover_the_filtered_set_exactly_once(conn):
         offset += len(rows)
     assert total == 4
     assert seen == ["us1", "us2", "fr1", "us3"]  # tie broken by doc_id, NULL date last
+
+
+def _walk(conn, sort_dir):
+    seen, offset = [], 0
+    while True:
+        _, rows = vq.search_documents(conn, {}, sort_by="date", sort_dir=sort_dir,
+                                      limit=1, offset=offset)
+        if not rows:
+            return seen
+        seen += [r["doc_id"] for r in rows]
+        offset += len(rows)
+
+
+def test_search_desc_walk_keeps_nulls_last_and_doc_id_ascending(conn):
+    """Under DESC the NULL date still comes last and the tie stays doc_id ascending.
+
+    The tie-break is `doc_id` ascending whatever `sort_dir` is: us1 before us2
+    in both directions.
+    """
+    assert _walk(conn, "desc") == ["fr1", "us1", "us2", "us3"]
+
+
+def test_search_offset_past_the_end_is_empty_with_the_true_total(conn):
+    """Paging past the last row returns no rows, and still the full total."""
+    assert vq.search_documents(conn, {}, offset=99) == (4, [])
+
+
+def test_all_columns_matches_the_documents_table(conn):
+    """ALL_COLUMNS is the injection guard and the projection allowlist: drift guard.
+
+    After the DDL train, it must equal the real column set of `documents`; a
+    column added by a migration and not listed here would be unreachable, a
+    column dropped would turn a valid projection into a 500.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'documents'"
+        )
+        actual = {r[0] for r in cur.fetchall()}
+    assert vq.ALL_COLUMNS == actual
 
 
 def test_search_projection_and_filters(conn):
