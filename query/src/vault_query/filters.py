@@ -1,5 +1,6 @@
 """The WHERE-clause builder every document read shares, and the fields it accepts."""
 import datetime
+import re
 
 # Largest value a bound may take: Postgres reads an int parameter wider than
 # int4 as bigint/numeric, and no page or text bound needs more.
@@ -65,11 +66,16 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     return where_sql, params
 
 
+# Strict YYYY-MM-DD: `date.fromisoformat` also takes week dates ("2010-W02-3") and the
+# basic format, which Postgres may then reject after the statement has started.
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def _check_date(name, value):
-    """A `datetime.date` (or datetime), or a str `date.fromisoformat` parses; else InvalidQuery."""
+    """A `datetime.date` (or datetime), or a str `YYYY-MM-DD` that is a real date; else InvalidQuery."""
     if isinstance(value, datetime.date):
         return
-    if isinstance(value, str):
+    if isinstance(value, str) and _ISO_DATE.fullmatch(value):
         try:
             datetime.date.fromisoformat(value)
             return

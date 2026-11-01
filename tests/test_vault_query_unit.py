@@ -116,6 +116,8 @@ def test_health_reads_accept_a_date_since(fn):
     ({"year": -1}, "year must be an integer"),
     ({"date_from": "garbage"}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),
     ({"date_to": "13/01/2010"}, r"date_to must be an ISO date \(YYYY-MM-DD\)"),
+    ({"date_from": "2010-W02-3"}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),  # week date
+    ({"date_from": "2010-02-30"}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),  # not a real day
     ({"date_from": 20100113}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),
 ])
 def test_filter_values_are_refused_before_sql(filters, message):
