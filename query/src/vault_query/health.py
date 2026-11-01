@@ -1,7 +1,9 @@
 """Run telemetry and pipeline health, read from the views the DDL train owns."""
+import datetime
+
 from psycopg2.extras import RealDictCursor
 
-from .filters import InvalidQuery
+from .filters import InvalidQuery, check_int
 
 RUN_COLUMNS = (
     "run_id", "tool", "command", "corpus", "source_code", "started_at", "finished_at",
@@ -44,8 +46,25 @@ def _fetch(conn, sql, params):
 
 def _check_at_least_one(**params):
     for name, value in params.items():
-        if value < 1:
-            raise InvalidQuery(f"{name} must be >= 1")
+        check_int(name, value, 1)
+
+
+def _check_since(since):
+    """None, a datetime, or a str `datetime.fromisoformat` parses; else InvalidQuery.
+
+    Only validates: the caller's original value is what reaches SQL, so an ISO
+    string keeps Postgres's own timestamptz parsing (offset, `Z`, naive = session
+    time zone) exactly as before.
+    """
+    if since is None or isinstance(since, datetime.datetime):
+        return
+    if isinstance(since, str):
+        try:
+            datetime.datetime.fromisoformat(since)
+            return
+        except ValueError:
+            pass
+    raise InvalidQuery("since must be an ISO-8601 timestamp")
 
 
 def _since_clause(clauses, params, since):
@@ -55,7 +74,13 @@ def _since_clause(clauses, params, since):
 
 
 def _bound_samples(samples, max_samples, max_chars):
-    """First `max_samples` samples; a string sample cut to `max_chars`, others kept whole."""
+    """First `max_samples` samples; a string sample cut to `max_chars`, others kept whole.
+
+    `samples` is what the runs_sources view guarantees for `error_samples`: a
+    list (a JSON array) or None. Only top-level string samples are cut; a
+    nested value inside a sample (an object or array) is kept whole, only
+    counted against `max_samples`.
+    """
     return [s[:max_chars] if isinstance(s, str) else s for s in (samples or [])[:max_samples]]
 
 
@@ -64,8 +89,10 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
     """One row per (run, source), newest first.
 
     `since` bounds finished_at; pass a tz-aware datetime or ISO string (a naive
-    one is read in the session time zone). Runs still in flight (NULL
-    finished_at) are listed last, and excluded whenever `since` is given.
+    one is read in the session time zone); anything else (a non-ISO string, a
+    number) is InvalidQuery before SQL, and the value reaches SQL unchanged.
+    Runs still in flight (NULL finished_at) are listed last, and excluded
+    whenever `since` is given.
 
     A run with no source entry (`sources` NULL, empty or not an array) has no
     row here: use recent_runs for the run grain.
@@ -76,6 +103,7 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
     """
     _check_at_least_one(limit=limit, max_error_samples=max_error_samples,
                         max_text_chars=max_text_chars)
+    _check_since(since)
     clauses, params = _where(corpus, source_code)
     _since_clause(clauses, params, since)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
@@ -102,6 +130,7 @@ def recent_runs(conn, *, corpus=None, since=None, limit=50):
     finished_at) come last and are excluded when `since` is given.
     """
     _check_at_least_one(limit=limit)
+    _check_since(since)
     clauses, params = _where(corpus)
     _since_clause(clauses, params, since)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""

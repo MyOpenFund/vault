@@ -1,5 +1,9 @@
 """The WHERE-clause builder every document read shares, and the fields it accepts."""
 
+# Largest value a bound may take: Postgres reads an int parameter wider than
+# int4 as bigint/numeric, and no page or text bound needs more.
+MAX_BOUND = 2**31 - 1
+
 
 # Fields allowing an exact-match filter (?source_code=us for example)
 FILTERABLE_FIELDS = {
@@ -57,3 +61,15 @@ class InvalidQuery(ValueError):
     Raised before any SQL runs. The API maps it to HTTP 400, the MCP server to an
     `invalid_argument` tool error.
     """
+
+
+def check_int(name, value, minimum, maximum=MAX_BOUND):
+    """Refuse a caller-supplied bound that is not a plain int in [minimum, maximum].
+
+    A bool is refused although it is an int subclass (`limit=True` is a caller
+    bug, not "1"); so are a numeric str, a float and None. Raises InvalidQuery
+    naming the argument, before any SQL runs.
+    """
+    if not (isinstance(value, int) and not isinstance(value, bool)
+            and minimum <= value <= maximum):
+        raise InvalidQuery(f"{name} must be an integer between {minimum} and {maximum}")

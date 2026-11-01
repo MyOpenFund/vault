@@ -1,7 +1,7 @@
 """Corpus counts — the numbers behind "verifiable numbers"."""
 from psycopg2.extras import RealDictCursor
 
-from .filters import FILTERABLE_FIELDS, InvalidQuery
+from .filters import FILTERABLE_FIELDS, InvalidQuery, check_int
 
 # Interpolated into GROUP BY: this set is the injection guard. Kept in lock-step
 # with FILTERABLE_FIELDS: whatever a caller can filter on, it can group by.
@@ -20,8 +20,7 @@ def corpus_stats(conn, group_by, *, corpus=None, limit=200):
     """
     if group_by not in GROUPABLE_FIELDS:
         raise InvalidQuery(f"group_by must be one of {sorted(GROUPABLE_FIELDS)}")
-    if limit < 1:
-        raise InvalidQuery("limit must be >= 1")
+    check_int("limit", limit, 1)
     where, params = "WHERE deleted_at IS NULL", []
     if corpus is not None:
         where += " AND corpus = %s"

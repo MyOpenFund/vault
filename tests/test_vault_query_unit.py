@@ -24,6 +24,13 @@ class _NoConnection:
     {"sort_dir": "sideways"},
     {"limit": 0},
     {"offset": -1},
+    {"limit": True},
+    {"limit": "10"},
+    {"limit": None},
+    {"limit": 1.5},
+    {"offset": True},
+    {"offset": "0"},
+    {"limit": 2**31},
     {"columns": ("doc_id", "password")},
     {"columns": ()},
 ])
@@ -42,6 +49,8 @@ def test_search_documents_refuses_bad_arguments_before_sql(kwargs):
     (("local_path",), {}),
     (("year; DROP TABLE documents",), {}),
     (("year",), {"limit": 0}),
+    (("year",), {"limit": "5"}),
+    (("year",), {"limit": True}),
 ])
 def test_corpus_stats_refuses_bad_arguments_before_sql(args, kwargs):
     """An unlisted group_by or a limit below 1 raises InvalidQuery, no SQL runs.
@@ -65,8 +74,27 @@ def test_health_reads_refuse_a_limit_below_one_before_sql(fn):
     (runs_status, {"max_error_samples": 0}),
     (runs_status, {"max_text_chars": 0}),
     (open_discovery_errors, {"max_text_chars": 0}),
+    (open_discovery_errors, {"max_text_chars": True}),
+    (runs_status, {"max_error_samples": "5"}),
 ])
 def test_health_reads_refuse_text_bounds_below_one_before_sql(fn, kwargs):
     """The text bounds are caller-controlled too: below 1 is InvalidQuery, no SQL runs."""
     with pytest.raises(InvalidQuery):
         fn(_NoConnection(), **kwargs)
+
+
+@pytest.mark.parametrize("fn", [runs_status, open_discovery_errors, recent_runs])
+@pytest.mark.parametrize("limit", ["5", True, None, 2**31])
+def test_health_reads_refuse_a_non_int_limit_before_sql(fn, limit):
+    """A limit that is not a plain int in range (a str, a bool, None, past
+    int4) is InvalidQuery, not a psycopg2 error from the LIMIT parameter."""
+    with pytest.raises(InvalidQuery):
+        fn(_NoConnection(), limit=limit)
+
+
+@pytest.mark.parametrize("fn", [runs_status, recent_runs])
+@pytest.mark.parametrize("since", ["yesterday", 5, "", object()])
+def test_health_reads_refuse_a_non_iso_since_before_sql(fn, since):
+    """`since` is None, a datetime or an ISO-8601 string; anything else is refused."""
+    with pytest.raises(InvalidQuery, match="since must be an ISO-8601 timestamp"):
+        fn(_NoConnection(), since=since)

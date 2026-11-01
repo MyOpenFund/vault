@@ -184,6 +184,32 @@ def test_corpus_stats_keeps_null_keys_and_filters_by_corpus(conn):
     assert empty["total"] == 0 and empty["groups"] == []
 
 
+def test_corpus_stats_orders_many_tied_groups_by_key_null_last(conn):
+    """Every group tied on count: the order is the key ascending, NULL last.
+
+    With us2 moved to 2009 each year group (2009, 2010, 2011, NULL) counts one
+    document, so the order rests on the tie-break alone. `enable_sort = off`
+    steers the planner to a HashAggregate: a sort-based GroupAggregate already
+    emits keys ascending with NULL last, which would let a query without the
+    `key NULLS LAST` tie-break pass by luck.
+    `total` and `count` are plain ints, not the Decimal a bare SUM(bigint) gives.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE documents SET year = 2009 WHERE doc_id = 'us2'")
+        cur.execute("SET enable_sort = off")
+    try:
+        stats = vq.corpus_stats(conn, "year")
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("RESET enable_sort")
+    groups = stats["groups"]
+    assert [g["key"] for g in groups] == [2009, 2010, 2011, None]
+    assert [g["count"] for g in groups] == [1, 1, 1, 1]
+    assert stats["total"] == 4
+    assert type(stats["total"]) is int
+    assert type(groups[0]["count"]) is int
+
+
 def test_corpus_stats_limit_drops_groups_but_not_the_total(conn):
     """Groups beyond `limit` are dropped; `total` still counts every live document.
 

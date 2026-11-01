@@ -1,7 +1,7 @@
 """Document search and lookup."""
 from psycopg2.extras import RealDictCursor
 
-from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause
+from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_int
 
 # Every column of `documents` after the DDL train (ingestion/ingest.py). A
 # caller-chosen projection is checked against it: column names are
@@ -32,8 +32,9 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     always `doc_id` ascending, whatever `sort_dir` is. NULL sort keys come last
     in both directions.
 
-    `limit` (>= 1) and `offset` (>= 0) are ints. `columns`, when given, is a
-    non-empty subset of ALL_COLUMNS; None means every column.
+    `limit` (>= 1) and `offset` (>= 0) are ints (not bool), at most MAX_BOUND.
+    `columns`, when given, is a non-empty subset of ALL_COLUMNS; None means
+    every column.
 
     The COUNT and the page are two statements: under READ COMMITTED a
     concurrent ingest between them can shift the page against the total by a row.
@@ -42,10 +43,8 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
         raise InvalidQuery(f"sort_by must be one of {sorted(SORTABLE_FIELDS)}")
     if sort_dir not in ("asc", "desc"):
         raise InvalidQuery("sort_dir must be 'asc' or 'desc'")
-    if limit < 1:
-        raise InvalidQuery("limit must be >= 1")
-    if offset < 0:
-        raise InvalidQuery("offset must be >= 0")
+    check_int("limit", limit, 1)
+    check_int("offset", offset, 0)
     if columns is not None:
         columns = tuple(columns)
         if not columns:
