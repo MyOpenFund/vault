@@ -178,8 +178,21 @@ def test_corpus_stats_keeps_null_keys_and_filters_by_corpus(conn):
     stats = vq.corpus_stats(conn, "year", corpus="central-bank")
     assert {g["key"]: g["count"] for g in stats["groups"]} == {2010: 2, 2011: 1, None: 1}
     assert sum(g["count"] for g in stats["groups"]) == stats["total"] == 4
+    # Largest first; ties (2011 and None, one each) by key ascending, NULL last.
+    assert [g["key"] for g in stats["groups"]] == [2010, 2011, None]
     empty = vq.corpus_stats(conn, "year", corpus="company")
     assert empty["total"] == 0 and empty["groups"] == []
+
+
+def test_corpus_stats_limit_drops_groups_but_not_the_total(conn):
+    """Groups beyond `limit` are dropped; `total` still counts every live document.
+
+    The groups may then sum to less than the total: that is the documented
+    truncation, not a lost row.
+    """
+    stats = vq.corpus_stats(conn, "year", limit=1)
+    assert stats["groups"] == [{"key": 2010, "count": 2}]
+    assert stats["total"] == 4
 
 
 def _insert_run(conn, run_id, finished_at, sources, outcome="ok", corpus="central-bank"):
