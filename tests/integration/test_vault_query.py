@@ -196,11 +196,13 @@ def test_corpus_stats_limit_drops_groups_but_not_the_total(conn):
 
 
 def _insert_run(conn, run_id, finished_at, sources, outcome="ok", corpus="central-bank"):
+    """`sources=None` stores SQL NULL (a producer that crashed before any source)."""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO runs (run_id, tool, command, corpus, started_at, finished_at, outcome, "
             "exit_code, sources) VALUES (%s, 'central-bank-corpus', 'sync', %s, %s, %s, %s, 0, %s)",
-            (run_id, corpus, finished_at, finished_at, outcome, json.dumps(sources)),
+            (run_id, corpus, finished_at, finished_at, outcome,
+             None if sources is None else json.dumps(sources)),
         )
 
 
@@ -237,12 +239,74 @@ def test_runs_status_is_per_source_newest_first_and_filters(conn):
     assert vq.runs_status(conn, corpus="company") == []
 
 
+def test_recent_runs_lists_runs_with_no_sources(conn):
+    """A run whose `sources` is NULL or empty is invisible per source, visible per run.
+
+    A producer that crashed before reaching any source writes no source entry:
+    runs_sources (an unnest of `sources`) has no row for it, so runs_status
+    alone would hide exactly the failures a reader is looking for.
+    """
+    _insert_run(conn, "ok1", "2026-10-01T02:00:00Z", [{"source_code": "us"}])
+    _insert_run(conn, "nul", "2026-10-02T02:00:00Z", None, outcome="failed")
+    _insert_run(conn, "emp", "2026-10-03T02:00:00Z", [], outcome="failed")
+    runs = vq.recent_runs(conn)
+    assert [r["run_id"] for r in runs] == ["emp", "nul", "ok1"]
+    assert set(runs[0]) == set(vq.health.RECENT_RUN_COLUMNS)
+    assert runs[0]["outcome"] == "failed"
+    assert {r["run_id"] for r in vq.runs_status(conn)} == {"ok1"}
+    assert [r["run_id"] for r in vq.recent_runs(conn, since="2026-10-02T00:00:00Z")] == ["emp", "nul"]
+    assert [r["run_id"] for r in vq.recent_runs(conn, limit=1)] == ["emp"]
+    assert vq.recent_runs(conn, corpus="company") == []
+
+
+def test_in_flight_runs_come_last_and_drop_out_under_since(conn):
+    """A NULL finished_at (run in flight) is listed last, and excluded when `since` is given."""
+    _insert_run(conn, "done", "2026-10-01T02:00:00Z", [{"source_code": "us"}])
+    _insert_run(conn, "live", None, [{"source_code": "us"}])
+    assert [r["run_id"] for r in vq.runs_status(conn)] == ["done", "live"]
+    assert [r["run_id"] for r in vq.recent_runs(conn)] == ["done", "live"]
+    since = "2000-01-01T00:00:00Z"
+    assert [r["run_id"] for r in vq.runs_status(conn, since=since)] == ["done"]
+    assert [r["run_id"] for r in vq.recent_runs(conn, since=since)] == ["done"]
+
+
+def test_runs_status_bounds_error_samples(conn):
+    """At most `max_error_samples` samples, each string cut to `max_text_chars`.
+
+    A producer can write any number of samples of any size; the reader (an MCP
+    tool result) must stay bounded. Non-string samples are kept whole.
+    """
+    samples = ["x" * 10_000 for _ in range(50)]
+    _insert_run(conn, "big", "2026-10-01T02:00:00Z",
+                [{"source_code": "us", "error_samples": samples}])
+    row = vq.runs_status(conn)[0]
+    assert len(row["error_samples"]) == 5
+    assert all(len(e) <= 2000 for e in row["error_samples"])
+    row = vq.runs_status(conn, max_error_samples=2, max_text_chars=10)[0]
+    assert row["error_samples"] == ["x" * 10, "x" * 10]
+    _insert_run(conn, "obj", "2026-10-02T02:00:00Z",
+                [{"source_code": "us", "error_samples": [{"url": "u" * 50}, "short"]}])
+    row = vq.runs_status(conn, max_text_chars=10)[0]
+    assert row["error_samples"] == [{"url": "u" * 50}, "short"]
+
+
+def test_open_discovery_errors_bounds_error_text(conn):
+    """A huge error text comes back cut to `max_text_chars`."""
+    _insert_error(conn, "huge")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE discovery_errors SET error = repeat('e', 200000) WHERE fingerprint = 'huge'")
+    assert len(vq.open_discovery_errors(conn)[0]["error"]) <= 2000
+    assert vq.open_discovery_errors(conn, max_text_chars=3)[0]["error"] == "eee"
+
+
 def test_open_discovery_errors_and_freshness(conn):
     """Open errors are listed; freshness reports live docs and no runs as None."""
     _insert_error(conn, "f1")
     errs = vq.open_discovery_errors(conn, source_code="us")
     assert [e["fingerprint"] for e in errs] == ["f1"]
     assert set(errs[0]) == set(vq.health.ERROR_COLUMNS)
+    # The approximation flag travels with last_seen_at; last_run_id is the provenance.
+    assert errs[0]["seen_at_is_ingestion_time"] is True and "last_run_id" in errs[0]
     fresh = vq.freshness(conn)
     assert fresh["live_documents"] == 4
     assert fresh["last_ingest_seen_at"] is not None

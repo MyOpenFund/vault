@@ -10,7 +10,7 @@ fails the test if any SQL would run.
 import pytest
 
 from vault_query import (
-    InvalidQuery, corpus_stats, open_discovery_errors, runs_status, search_documents,
+    InvalidQuery, corpus_stats, open_discovery_errors, recent_runs, runs_status, search_documents,
 )
 
 
@@ -54,8 +54,19 @@ def test_corpus_stats_refuses_bad_arguments_before_sql(args, kwargs):
         corpus_stats(_NoConnection(), *args, **kwargs)
 
 
-@pytest.mark.parametrize("fn", [runs_status, open_discovery_errors])
+@pytest.mark.parametrize("fn", [runs_status, open_discovery_errors, recent_runs])
 def test_health_reads_refuse_a_limit_below_one_before_sql(fn):
     """`limit` is caller-controlled: below 1 is InvalidQuery, no SQL runs."""
     with pytest.raises(InvalidQuery):
         fn(_NoConnection(), limit=0)
+
+
+@pytest.mark.parametrize("fn, kwargs", [
+    (runs_status, {"max_error_samples": 0}),
+    (runs_status, {"max_text_chars": 0}),
+    (open_discovery_errors, {"max_text_chars": 0}),
+])
+def test_health_reads_refuse_text_bounds_below_one_before_sql(fn, kwargs):
+    """The text bounds are caller-controlled too: below 1 is InvalidQuery, no SQL runs."""
+    with pytest.raises(InvalidQuery):
+        fn(_NoConnection(), **kwargs)
