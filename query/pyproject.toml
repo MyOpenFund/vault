@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vault-query"
+version = "0.1.0"
+description = "Read-only queries over the MyOpenFund vault: documents, corpus stats, run health."
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["psycopg2-binary>=2.9.10,<3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
