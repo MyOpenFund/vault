@@ -38,3 +38,16 @@ def test_a_non_iso_date_filter_is_a_400(client, param, value):
 
 def test_a_non_integer_year_is_refused_by_fastapi(client):
     assert client.get("/documents", params={"year": "abc"}).status_code == 422
+
+
+def test_a_negative_year_is_a_400(client):
+    """FastAPI accepts -1 as an int; only the vault-query check refuses it."""
+    r = client.get("/documents", params={"year": -1})
+    assert r.status_code == 400
+    assert "year" in r.json()["detail"]
+
+
+def test_a_valid_date_passes_the_check_and_reaches_sql(client):
+    """The positive path: a real YYYY-MM-DD goes past validation to the (stub) database."""
+    with pytest.raises(AssertionError, match="before any SQL"):
+        client.get("/documents", params={"date_from": "2010-01-13"})

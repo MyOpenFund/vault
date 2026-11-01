@@ -28,8 +28,9 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
 
     Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
     bool), `date_from` / `date_to` a `datetime.date` / `datetime.datetime` or a
-    str `datetime.date.fromisoformat` parses; anything else raises InvalidQuery.
-    Only validates: the caller's original value is the bound parameter.
+    `YYYY-MM-DD` str naming a real day; an empty / falsy date is ignored (no
+    bound); anything else raises InvalidQuery. Only validates: the caller's
+    original value is the bound parameter.
     """
     clauses = []
     params = []
@@ -66,9 +67,10 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     return where_sql, params
 
 
-# Strict YYYY-MM-DD: `date.fromisoformat` also takes week dates ("2010-W02-3") and the
-# basic format, which Postgres may then reject after the statement has started.
-_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Strict ASCII YYYY-MM-DD, the documented contract. `date.fromisoformat` alone also
+# takes week dates ("2010-W02-3", a Postgres error) and the basic format
+# ("20100113", which Postgres accepts); both are refused so the contract is exact.
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 def _check_date(name, value):
