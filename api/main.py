@@ -6,7 +6,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from db import get_conn, build_where_clause, verify_connection, SORTABLE_FIELDS
+from vault_query import InvalidQuery, corpus_stats, get_document as vq_get_document, search_documents
+
+from db import get_conn, verify_connection, SORTABLE_FIELDS
 from models import Document, DocumentList, StatsSummary, CountItem
 
 RAW_DATA_DIR = Path(os.environ.get("RAW_DATA_DIR", "/data/raw")).resolve()
@@ -93,20 +95,16 @@ def list_documents(
         "date_to": date_to,
         "q": q,
     }
-    where_sql, params = build_where_clause(filters, include_deleted=include_deleted)
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) AS total FROM documents{where_sql}", params)
-            total = cur.fetchone()["total"]
-
-            query = (
-                f"SELECT * FROM documents{where_sql} "
-                f"ORDER BY {sort_by} {sort_dir} NULLS LAST "
-                f"LIMIT %s OFFSET %s"
+    # columns=None: the response model needs every column (`id` included), not
+    # the narrower SEARCH_COLUMNS projection meant for result lists.
+    try:
+        with get_conn() as conn:
+            total, rows = search_documents(
+                conn, filters, sort_by=sort_by, sort_dir=sort_dir, limit=limit,
+                offset=offset, include_deleted=include_deleted,
             )
-            cur.execute(query, params + [limit, offset])
-            rows = cur.fetchall()
+    except InvalidQuery as exc:
+        raise HTTPException(400, str(exc)) from None
 
     return DocumentList(total=total, limit=limit, offset=offset, items=rows)
 
@@ -114,9 +112,7 @@ def list_documents(
 @app.get("/documents/{doc_id}", response_model=Document)
 def get_document(doc_id: str):
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM documents WHERE doc_id = %s", (doc_id,))
-            row = cur.fetchone()
+        row = vq_get_document(conn, doc_id)
 
     if not row:
         raise HTTPException(404, f"Document {doc_id} not found")
@@ -159,26 +155,24 @@ def download_document_file(doc_id: str):
 def stats_summary():
     """Aggregate figures across the whole corpus, for dashboards/quick overview."""
 
-    def top_counts(cur, field, limit=20):
-        cur.execute(
-            f"SELECT {field} AS key, COUNT(*) AS count FROM documents "
-            f"WHERE deleted_at IS NULL "
-            f"GROUP BY {field} ORDER BY count DESC LIMIT %s",
-            (limit,),
-        )
-        return [CountItem(**r) for r in cur.fetchall()]
+    def counts(stats):
+        return [CountItem(**g) for g in stats["groups"]]
+
+    def top_counts(conn, field, limit=20):
+        return counts(corpus_stats(conn, field, limit=limit))
 
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS total FROM documents WHERE deleted_at IS NULL")
-            total = cur.fetchone()["total"]
+        # Every corpus_stats result carries the live-document total (a window
+        # total computed before the LIMIT), so the by-corpus call supplies it.
+        corpus = corpus_stats(conn, "corpus", limit=20)
+        total = corpus["total"]
 
-            by_corpus = top_counts(cur, "corpus")
-            by_source_code = top_counts(cur, "source_code")
-            by_doc_type = top_counts(cur, "doc_type")
-            by_language = top_counts(cur, "language")
-            by_year = top_counts(cur, "year", limit=200)
-            by_provenance = top_counts(cur, "provenance")
+        by_corpus = counts(corpus)
+        by_source_code = top_counts(conn, "source_code")
+        by_doc_type = top_counts(conn, "doc_type")
+        by_language = top_counts(conn, "language")
+        by_year = top_counts(conn, "year", limit=200)
+        by_provenance = top_counts(conn, "provenance")
 
     return StatsSummary(
         total_documents=total,

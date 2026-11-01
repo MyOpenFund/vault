@@ -1,0 +1,13 @@
+# The repo root is a build context (api/Dockerfile): keep secrets, history and
+# local build state out of it.
+.git
+.env
+.env.*
+!.env.example
+.venv
+**/__pycache__
+**/*.egg-info
+**/.pytest_cache
+query/build
+tests
+metabase

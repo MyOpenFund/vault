@@ -229,6 +229,35 @@ plus a certificate on the host is the next hardening step.
 `GET /documents/{doc_id}` · `GET /documents/{doc_id}/file` (serves the raw file from the
 read-only mount) · `GET /stats/summary` (totals, by_corpus, by_source_code)
 
+The document and stats routes read through `vault-query` (below); the image installs it from
+the same checkout, which is why `api`'s build context is the repo root (`api/Dockerfile`).
+
+## Read queries (`vault-query`)
+
+[`query/`](query/) is a small Python package holding the vault's read queries once, shared by
+the API and the MyOpenFund MCP server. Install it pinned to a commit of this repo:
+
+```bash
+pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdirectory=query"
+```
+
+`<sha>` is the commit to pin (a merge commit on `master`); pin a SHA rather than a branch so a
+consumer's queries only change when it bumps the pin.
+
+- Documents: `search_documents` (filters, sort, paging, total; optional column projection —
+  `SEARCH_COLUMNS` for result lists), `get_document`.
+- Counts: `corpus_stats` (live total plus per-field groups, one statement).
+- Run health: `recent_runs` (one row per run), `runs_status` (one row per run × source),
+  `source_health`, `open_discovery_errors`, `freshness`.
+- Guards: `FILTERABLE_FIELDS`, `SORTABLE_FIELDS`, `GROUPABLE_FIELDS`, `ALL_COLUMNS`, and
+  `InvalidQuery`, raised before any SQL runs on a bad argument or filter value (the API maps it
+  to a 400).
+
+Guarantees: read-only — no function writes or commits; every function takes an open psycopg2
+connection that the caller owns (opens, closes, and chooses the role — `vault_readonly`).
+Use an autocommit connection (or roll back after each call): a read left "idle in transaction"
+holds locks that block the ingester's DDL train.
+
 ## Metabase
 
 Three dashboards over the vault, defined as code in [`metabase/`](metabase/README.md)

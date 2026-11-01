@@ -1,0 +1,106 @@
+"""The WHERE-clause builder every document read shares, and the fields it accepts."""
+import datetime
+import re
+
+# Largest value a bound may take: Postgres reads an int parameter wider than
+# int4 as bigint/numeric, and no page or text bound needs more.
+MAX_BOUND = 2**31 - 1
+
+
+# Fields allowing an exact-match filter (?source_code=us for example)
+FILTERABLE_FIELDS = {
+    "corpus", "source_code", "doc_type", "language", "provenance",
+    "year", "mime_type",
+}
+
+SORTABLE_FIELDS = {
+    "date", "year", "corpus", "source_code", "doc_type", "title", "created_at",
+}
+
+
+def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[str, list]:
+    """Build a parameterized WHERE clause from a dict of filters.
+
+    - simple values -> equality
+    - `date_from` / `date_to` -> bounds on the `date` column
+    - `q` -> free-text search on `title` (ILIKE)
+    - by default, excludes soft-deleted documents (`deleted_at IS NULL`)
+
+    Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
+    bool), `date_from` / `date_to` a `datetime.date` / `datetime.datetime` or a
+    `YYYY-MM-DD` str naming a real day; an empty / falsy date is ignored (no
+    bound); anything else raises InvalidQuery. Only validates: the caller's
+    original value is the bound parameter.
+    """
+    clauses = []
+    params = []
+
+    if not include_deleted:
+        clauses.append("deleted_at IS NULL")
+
+    for field in FILTERABLE_FIELDS:
+        value = filters.get(field)
+        if value is not None:
+            if field == "year":
+                check_int("year", value, 0)
+            clauses.append(f"{field} = %s")
+            params.append(value)
+
+    date_from = filters.get("date_from")
+    if date_from:
+        _check_date("date_from", date_from)
+        clauses.append("date >= %s")
+        params.append(date_from)
+
+    date_to = filters.get("date_to")
+    if date_to:
+        _check_date("date_to", date_to)
+        clauses.append("date <= %s")
+        params.append(date_to)
+
+    q = filters.get("q")
+    if q:
+        clauses.append("title ILIKE %s")
+        params.append(f"%{q}%")
+
+    where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where_sql, params
+
+
+# Strict ASCII YYYY-MM-DD, the documented contract. `date.fromisoformat` alone also
+# takes week dates ("2010-W02-3", a Postgres error) and the basic format
+# ("20100113", which Postgres accepts); both are refused so the contract is exact.
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _check_date(name, value):
+    """A `datetime.date` (or datetime), or a str `YYYY-MM-DD` that is a real date; else InvalidQuery."""
+    if isinstance(value, datetime.date):
+        return
+    if isinstance(value, str) and _ISO_DATE.fullmatch(value):
+        try:
+            datetime.date.fromisoformat(value)
+            return
+        except ValueError:
+            pass
+    raise InvalidQuery(f"{name} must be an ISO date (YYYY-MM-DD)")
+
+
+class InvalidQuery(ValueError):
+    """A caller-supplied argument the queries refuse (unknown sort field, bad bound...).
+
+    Raised before any SQL runs. The API maps it to HTTP 400, the MCP server to an
+    `invalid_argument` tool error.
+    """
+
+
+def check_int(name, value, minimum, maximum=MAX_BOUND):
+    """Refuse a caller-supplied bound that is not a plain int in [minimum, maximum].
+
+    A bool is refused although it is an int subclass (`limit=True` is a caller
+    bug, not "1"); so are a numeric str, a float and None. Raises InvalidQuery
+    naming the argument, before any SQL runs.
+    """
+    if not (isinstance(value, int) and not isinstance(value, bool)
+            and minimum <= value <= maximum):
+        raise InvalidQuery(f"{name} must be an integer between {minimum} and {maximum}")
