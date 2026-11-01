@@ -99,7 +99,10 @@ services:
     # Run on demand: `docker compose run --rm ingestion`
     # (no restart policy, this is not a long-running service)
   api:
-    build: ./api
+    build:
+      # Repo root, not ./api: the image installs query/ (vault-query) too.
+      context: .
+      dockerfile: api/Dockerfile
     container_name: vault_api
     environment:
       # Read-only by code AND by grant (#5). On a cluster that has not yet run
