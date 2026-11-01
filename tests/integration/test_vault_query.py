@@ -104,3 +104,30 @@ def test_null_date_row_is_stored_with_no_date(conn):
     """
     doc = vq.get_document(conn, "us3")
     assert doc["date"] is None and doc["year"] is None
+
+
+def test_corpus_stats_counts_live_documents_only(conn):
+    """Totals and groups count live documents: the tombstoned de1 is absent.
+
+    A swept document left in the counts would make every "verifiable number"
+    the MCP quotes overstate the corpus.
+    """
+    stats = vq.corpus_stats(conn, "source_code")
+    assert stats["total"] == 4
+    assert stats["group_by"] == "source_code"
+    assert {g["key"]: g["count"] for g in stats["groups"]} == {"us": 3, "fr": 1}
+    assert [g["key"] for g in stats["groups"]] == ["us", "fr"]  # largest first
+
+
+def test_corpus_stats_keeps_null_keys_and_filters_by_corpus(conn):
+    """A NULL key is a real group; the corpus filter narrows the total too.
+
+    us3 has no year: dropping its group would leave the groups summing to
+    less than the total. The seed is all 'central-bank', so another corpus
+    counts nothing.
+    """
+    stats = vq.corpus_stats(conn, "year", corpus="central-bank")
+    assert {g["key"]: g["count"] for g in stats["groups"]} == {2010: 2, 2011: 1, None: 1}
+    assert sum(g["count"] for g in stats["groups"]) == stats["total"] == 4
+    empty = vq.corpus_stats(conn, "year", corpus="company")
+    assert empty["total"] == 0 and empty["groups"] == []

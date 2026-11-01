@@ -9,7 +9,7 @@ fails the test if any SQL would run.
 
 import pytest
 
-from vault_query import InvalidQuery, search_documents
+from vault_query import InvalidQuery, corpus_stats, search_documents
 
 
 class _NoConnection:
@@ -33,3 +33,19 @@ def test_search_documents_refuses_bad_arguments_before_sql(kwargs):
     """
     with pytest.raises(InvalidQuery):
         search_documents(_NoConnection(), {}, **kwargs)
+
+
+@pytest.mark.parametrize("args, kwargs", [
+    (("local_path",), {}),
+    (("year; DROP TABLE documents",), {}),
+    (("year",), {"limit": 0}),
+])
+def test_corpus_stats_refuses_bad_arguments_before_sql(args, kwargs):
+    """An unlisted group_by or a limit below 1 raises InvalidQuery, no SQL runs.
+
+    `group_by` is interpolated into GROUP BY, so GROUPABLE_FIELDS is the
+    injection guard: a column outside it (even a real one such as
+    `local_path`) must be refused before a cursor is opened.
+    """
+    with pytest.raises(InvalidQuery):
+        corpus_stats(_NoConnection(), *args, **kwargs)
