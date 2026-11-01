@@ -106,3 +106,12 @@ def test_the_ingestion_service_carries_both_role_passwords(as_committed):
     env = as_committed["services"]["ingestion"]["environment"]
     assert env["VAULT_ORCHESTRATOR_PASSWORD"]
     assert env["VAULT_READONLY_PASSWORD"]
+
+
+def test_the_api_image_builds_from_the_repo_root(as_committed):
+    """The api image installs query/ (vault-query) too, so its build context is
+    the repo root and its Dockerfile is named relative to it; `build: ./api`
+    would lose query/ from the context and fail at `COPY query`."""
+    build = as_committed["services"]["api"]["build"]
+    assert Path(build["context"]) == ROOT
+    assert build["dockerfile"] == "api/Dockerfile"

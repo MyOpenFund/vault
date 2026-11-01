@@ -1,4 +1,5 @@
 """The WHERE-clause builder every document read shares, and the fields it accepts."""
+import datetime
 
 # Largest value a bound may take: Postgres reads an int parameter wider than
 # int4 as bigint/numeric, and no page or text bound needs more.
@@ -23,6 +24,11 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     - `date_from` / `date_to` -> bounds on the `date` column
     - `q` -> free-text search on `title` (ILIKE)
     - by default, excludes soft-deleted documents (`deleted_at IS NULL`)
+
+    Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
+    bool), `date_from` / `date_to` a `datetime.date` / `datetime.datetime` or a
+    str `datetime.date.fromisoformat` parses; anything else raises InvalidQuery.
+    Only validates: the caller's original value is the bound parameter.
     """
     clauses = []
     params = []
@@ -33,16 +39,20 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     for field in FILTERABLE_FIELDS:
         value = filters.get(field)
         if value is not None:
+            if field == "year":
+                check_int("year", value, 0)
             clauses.append(f"{field} = %s")
             params.append(value)
 
     date_from = filters.get("date_from")
     if date_from:
+        _check_date("date_from", date_from)
         clauses.append("date >= %s")
         params.append(date_from)
 
     date_to = filters.get("date_to")
     if date_to:
+        _check_date("date_to", date_to)
         clauses.append("date <= %s")
         params.append(date_to)
 
@@ -53,6 +63,19 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
 
     where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
     return where_sql, params
+
+
+def _check_date(name, value):
+    """A `datetime.date` (or datetime), or a str `date.fromisoformat` parses; else InvalidQuery."""
+    if isinstance(value, datetime.date):
+        return
+    if isinstance(value, str):
+        try:
+            datetime.date.fromisoformat(value)
+            return
+        except ValueError:
+            pass
+    raise InvalidQuery(f"{name} must be an ISO date (YYYY-MM-DD)")
 
 
 class InvalidQuery(ValueError):

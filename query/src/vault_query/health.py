@@ -50,13 +50,14 @@ def _check_at_least_one(**params):
 
 
 def _check_since(since):
-    """None, a datetime, or a str `datetime.fromisoformat` parses; else InvalidQuery.
+    """None, a datetime or date, or a str `datetime.fromisoformat` parses; else InvalidQuery.
 
     Only validates: the caller's original value is what reaches SQL, so an ISO
     string keeps Postgres's own timestamptz parsing (offset, `Z`, naive = session
-    time zone) exactly as before.
+    time zone) exactly as before; a `datetime.date` passes through too (Postgres
+    reads it as midnight in the session time zone).
     """
-    if since is None or isinstance(since, datetime.datetime):
+    if since is None or isinstance(since, datetime.date):
         return
     if isinstance(since, str):
         try:

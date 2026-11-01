@@ -7,10 +7,12 @@ refusal has to happen before a cursor is opened: the connection stub below
 fails the test if any SQL would run.
 """
 
+import datetime
+
 import pytest
 
 from vault_query import (
-    InvalidQuery, corpus_stats, open_discovery_errors, recent_runs, runs_status, search_documents,
+    InvalidQuery, build_where_clause, corpus_stats, open_discovery_errors, recent_runs, runs_status, search_documents,
 )
 
 
@@ -98,3 +100,42 @@ def test_health_reads_refuse_a_non_iso_since_before_sql(fn, since):
     """`since` is None, a datetime or an ISO-8601 string; anything else is refused."""
     with pytest.raises(InvalidQuery, match="since must be an ISO-8601 timestamp"):
         fn(_NoConnection(), since=since)
+
+
+@pytest.mark.parametrize("fn", [runs_status, recent_runs])
+def test_health_reads_accept_a_date_since(fn):
+    """A `datetime.date` passes the check (it reaches SQL as-is, read as midnight)."""
+    with pytest.raises(AssertionError, match="before any SQL"):
+        fn(_NoConnection(), since=datetime.date(2010, 1, 13))
+
+
+@pytest.mark.parametrize("filters, message", [
+    ({"year": "abc"}, "year must be an integer"),
+    ({"year": True}, "year must be an integer"),
+    ({"year": 2010.0}, "year must be an integer"),
+    ({"year": -1}, "year must be an integer"),
+    ({"date_from": "garbage"}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),
+    ({"date_to": "13/01/2010"}, r"date_to must be an ISO date \(YYYY-MM-DD\)"),
+    ({"date_from": 20100113}, r"date_from must be an ISO date \(YYYY-MM-DD\)"),
+])
+def test_filter_values_are_refused_before_sql(filters, message):
+    """A filter value the column cannot hold is InvalidQuery (a 400), not a
+    psycopg2 DataError from inside the statement (a 500)."""
+    with pytest.raises(InvalidQuery, match=message):
+        build_where_clause(filters)
+    with pytest.raises(InvalidQuery, match=message):
+        search_documents(_NoConnection(), filters)
+
+
+@pytest.mark.parametrize("filters, clause, value", [
+    ({"year": 2010}, "year = %s", 2010),
+    ({"date_from": "2010-01-13"}, "date >= %s", "2010-01-13"),
+    ({"date_to": datetime.date(2010, 1, 13)}, "date <= %s", datetime.date(2010, 1, 13)),
+    ({"date_to": datetime.datetime(2010, 1, 13, 12)}, "date <= %s",
+     datetime.datetime(2010, 1, 13, 12)),
+])
+def test_valid_filter_values_reach_sql_unchanged(filters, clause, value):
+    """Validation only: the caller's original value is the bound parameter."""
+    where_sql, params = build_where_clause(filters)
+    assert clause in where_sql
+    assert params == [value]

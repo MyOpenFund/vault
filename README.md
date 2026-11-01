@@ -241,7 +241,7 @@ the API and the MyOpenFund MCP server. Install it pinned to a commit of this rep
 pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdirectory=query"
 ```
 
-`<sha>` is the commit to pin (a merge commit on `main`); pin a SHA rather than a branch so a
+`<sha>` is the commit to pin (a merge commit on `master`); pin a SHA rather than a branch so a
 consumer's queries only change when it bumps the pin.
 
 - Documents: `search_documents` (filters, sort, paging, total; optional column projection —
@@ -250,7 +250,8 @@ consumer's queries only change when it bumps the pin.
 - Run health: `recent_runs` (one row per run), `runs_status` (one row per run × source),
   `source_health`, `open_discovery_errors`, `freshness`.
 - Guards: `FILTERABLE_FIELDS`, `SORTABLE_FIELDS`, `GROUPABLE_FIELDS`, `ALL_COLUMNS`, and
-  `InvalidQuery`, raised before any SQL runs (the API maps it to a 400).
+  `InvalidQuery`, raised before any SQL runs on a bad argument or filter value (the API maps it
+  to a 400).
 
 Guarantees: read-only — no function writes or commits; every function takes an open psycopg2
 connection that the caller owns (opens, closes, and chooses the role — `vault_readonly`).
