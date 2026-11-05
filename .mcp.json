@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "myopenfund": {
+      "type": "http",
+      "url": "${MOF_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${MOF_MCP_TOKEN}"
+      }
+    }
+  }
+}
