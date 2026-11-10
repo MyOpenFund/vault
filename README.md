@@ -41,6 +41,15 @@ Every manifest column (corpus, source_code, doc_type, title, pdf_url, source_url
 
 Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs. `last_seen_at` is monotone — it only ever advances (see Concurrency below) — so a slower concurrent run can never make a live row look stale to a newer run's sweep.
 
+Which files are manifests (the run logs the layout it picked):
+- **data/ root layout** — `<DATA_DIR>/manifest/` is a directory (the repo's `compose.yaml`, where `DATA_DIR` is the corpus `data/` root): only `manifest/**/*.jsonl` and the legacy monolithic `manifest.jsonl` are read, minus the known producer file names should one land inside `manifest/`. `cadence.jsonl`, `runs.jsonl`, the producer's private and audit files, and any other root file are never treated as manifests; another `*.jsonl` at the root is named in a WARNING (it is not read).
+- **manifest-directory layout** — no `manifest/` directory (e.g. a deployment that mounts `data/manifest` itself as `DATA_DIR` and points `CADENCE_PATH`/`RUNS_PATH`/`DISCOVERY_ERRORS_PATH` at the producer files): every `**/*.jsonl` under `DATA_DIR`, minus the known producer file names — the same set the scan has always read.
+- **`MANIFEST_GLOBS`** (optional, comma-separated globs relative to `DATA_DIR`, `**` recursive) overrides both and is taken literally; an empty entry, an absolute pattern or a `..` component fails the run before it connects.
+
+In every mode only a directory whose name matches is skipped (with a WARNING). A matching file that cannot be read — a dangling symlink, a permission or I/O error on the share — fails the run before the sweep, so its rows are never mistaken for deleted ones.
+
+A `doc_id` repeated inside one manifest file keeps its **last valid line** (what two upserts in line order would store); the run logs a WARNING with the number of dropped lines and up to five of the repeated `doc_id`s (`DUPLICATE_SAMPLE_SIZE` in `ingest.py`). It used to abort the whole run (vault #6). `SWEEP_MAX_DELETE_FRACTION` unset or empty means the default `0.05`; any value that is not a number in `[0, 1]` fails the run before it connects, naming the value.
+
 ### Table `rag_ingestions`
 
 Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
@@ -60,7 +69,7 @@ Write contract (`data-orchestrator` is the only writer):
 
 ### Table `cadence`
 
-Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan.
+Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan. A snapshot line carrying a `corpus` field that contradicts the service's `CORPUS` is skipped with a WARNING (same rule as manifest lines): a foreign corpus's `cadence.jsonl` mounted by mistake is never relabeled as this one's, and a snapshot made only of such lines leaves the table untouched.
 
 ### Table `runs`
 
@@ -376,7 +385,7 @@ from cron.
 ```bash
 pip install -e cli/
 vaultctl stats                                # corpus totals from the API
-vaultctl list --source ecb --type D1          # query documents
+vaultctl list --source-code ecb --doc-type D1 # query documents
 vaultctl get <doc_id>                         # one document's metadata
 vaultctl download <doc_id>                    # fetch the raw file via the API
 ```

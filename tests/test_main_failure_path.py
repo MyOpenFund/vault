@@ -64,7 +64,7 @@ def dead_conn(monkeypatch):
     conn = _DeadConn()
     monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
     monkeypatch.setattr(ingest.psycopg2, "connect", lambda *a, **k: conn)
-    monkeypatch.setattr(ingest, "find_jsonl_files", lambda _root: [])
+    monkeypatch.setattr(ingest, "find_manifest_files", lambda *_a: [])
     return conn
 
 

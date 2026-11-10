@@ -26,6 +26,10 @@ class Document(BaseModel):
     updated_at: Optional[dt.datetime] = None
     last_seen_at: Optional[dt.datetime] = None
     deleted_at: Optional[dt.datetime] = None
+    # OCR-policy facts, written by the orchestrator's probe pass (never by
+    # manifests); NULL until a document has been probed.
+    has_text_layer: Optional[bool] = None
+    page_count: Optional[int] = None
     extra: Optional[dict[str, Any]] = None
 
 

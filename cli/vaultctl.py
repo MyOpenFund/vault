@@ -21,6 +21,7 @@ from typing import Optional
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 app = typer.Typer(help="CLI to query the vault corpus")
@@ -33,8 +34,13 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=API_URL, timeout=30.0)
 
 
+# Everything printed from the API (titles, field values, error texts) is data:
+# it goes through rich.markup.escape, so a `[bold]` in a title is shown as
+# typed and an unbalanced `[/]` cannot raise MarkupError mid-output.
+
+
 def _die(message: str):
-    console.print(f"[red]Error:[/red] {message}")
+    console.print(f"[red]Error:[/red] {escape(message)}")
     raise typer.Exit(code=1)
 
 
@@ -89,14 +95,14 @@ def list_documents(
     table.add_column("title", max_width=50)
 
     for item in data["items"]:
-        table.add_row(
+        table.add_row(*(escape(str(value)) for value in (
             item.get("doc_id", ""),
             item.get("corpus") or "",
             item.get("source_code") or "",
             item.get("doc_type") or "",
-            str(item.get("date") or ""),
+            item.get("date") or "",
             item.get("title") or "",
-        )
+        )))
 
     console.print(table)
 
@@ -117,7 +123,7 @@ def get_document(doc_id: str):
 
     doc = resp.json()
     for key, value in doc.items():
-        console.print(f"[cyan]{key}[/cyan]: {value}")
+        console.print(f"[cyan]{escape(str(key))}[/cyan]: {escape(str(value))}")
 
 
 def safe_filename(content_disposition, fallback):
@@ -153,6 +159,16 @@ def safe_filename(content_disposition, fallback):
     return name if name not in ("", ".", "..") else fallback
 
 
+def _error_detail(response: httpx.Response) -> str:
+    """FastAPI's `detail`, or "" when the body is not a JSON object carrying
+    one (a proxy's HTML 404, an empty body): an error path must not crash."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    return str(body.get("detail", "")) if isinstance(body, dict) else ""
+
+
 @app.command("download")
 def download_document(
     doc_id: str,
@@ -167,7 +183,7 @@ def download_document(
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                _die(f"File not found for '{doc_id}' ({e.response.json().get('detail', '')})")
+                _die(f"File not found for '{doc_id}' ({_error_detail(e.response)})")
             _die(str(e))
         except httpx.HTTPError as e:
             _die(str(e))
@@ -177,7 +193,7 @@ def download_document(
     # NOTE: the whole response body is buffered in memory before the write.
     # Known, and out of scope for #5 — streaming the download is its own issue.
     dest.write_bytes(resp.content)
-    console.print(f"[green]Downloaded:[/green] {dest}")
+    console.print(f"[green]Downloaded:[/green] {escape(str(dest))}")
 
 
 @app.command("stats")
@@ -204,7 +220,7 @@ def stats():
         table.add_column("Value")
         table.add_column("Count", justify="right")
         for row in data[section]:
-            table.add_row(str(row["key"]), str(row["count"]))
+            table.add_row(escape(str(row["key"])), str(row["count"]))
         console.print(table)
 
 

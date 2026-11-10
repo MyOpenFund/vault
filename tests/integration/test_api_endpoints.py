@@ -144,6 +144,27 @@ def test_get_document_returns_the_stored_row(api_db, client):
     assert body["year"] == 2011
 
 
+def test_the_probe_facts_reach_the_api(api_db, client):
+    """has_text_layer / page_count, written by the orchestrator's probe UPDATE,
+    are part of the response (pydantic used to drop them); unprobed rows say null."""
+    import psycopg2
+
+    conn = psycopg2.connect(api_db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE documents SET has_text_layer = FALSE, page_count = 7 "
+                        "WHERE doc_id = 'us2'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    body = client.get("/documents/us2").json()
+    assert (body["has_text_layer"], body["page_count"]) == (False, 7)
+    items = {i["doc_id"]: i for i in client.get("/documents").json()["items"]}
+    assert (items["us2"]["has_text_layer"], items["us2"]["page_count"]) == (False, 7)
+    assert (items["us1"]["has_text_layer"], items["us1"]["page_count"]) == (None, None)
+
+
 def test_get_document_returns_404_for_an_unknown_doc_id(api_db, client):
     """An absent doc_id is a clean 404, not a 500 on an empty result set."""
     response = client.get("/documents/no-such-doc")

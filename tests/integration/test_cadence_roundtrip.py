@@ -145,3 +145,25 @@ def test_cadence_path_env_override(clean_cadence, tmp_path, monkeypatch):
         assert run_cadence(clean_cadence, tmp_path / "empty-dir") == 1
     finally:
         monkeypatch.delenv("CADENCE_PATH")
+
+
+def test_foreign_cadence_file_is_not_relabeled(clean_cadence, tmp_path):
+    # A company corpus's cadence.jsonl mounted under the central-bank service
+    # by mistake: every line contradicts, nothing is relabeled, and the
+    # previous snapshot stays (zero valid rows never replace).
+    write_cadence(tmp_path, [make_entry()])
+    run_cadence(clean_cadence, tmp_path)
+    write_cadence(tmp_path, [make_entry(corpus="company", bank_code="edgar", doc_type="10-K")])
+    assert run_cadence(clean_cadence, tmp_path) == 0
+    assert fetch_all(clean_cadence, "SELECT corpus, source_code FROM cadence") == [
+        ("central-bank", "us")]
+
+
+def test_mixed_cadence_file_keeps_only_this_corpus(clean_cadence, tmp_path):
+    write_cadence(tmp_path, [
+        make_entry(corpus="central-bank"), make_entry(bank_code="fr"),
+        make_entry(corpus="company", bank_code="edgar"),
+    ])
+    assert run_cadence(clean_cadence, tmp_path) == 2
+    assert sorted(fetch_all(clean_cadence, "SELECT corpus, source_code, extra FROM cadence")) == [
+        ("central-bank", "fr", None), ("central-bank", "us", None)]
