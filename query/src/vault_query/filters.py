@@ -110,13 +110,21 @@ def _check_date(name, value):
 
 
 def check_text(name, value):
-    """Refuse a str holding a NUL character; any other value passes.
+    """Refuse a str holding a NUL character or not encodable as UTF-8; any other value passes.
 
     Postgres text cannot hold NUL and psycopg2 raises a bare ValueError when
-    asked to send one (an API 500): refused here as InvalidQuery instead.
+    asked to send one (an API 500); a lone surrogate (which a JSON caller can
+    send) makes it raise UnicodeEncodeError. Both are refused here as
+    InvalidQuery instead.
     """
-    if isinstance(value, str) and "\x00" in value:
+    if not isinstance(value, str):
+        return
+    if "\x00" in value:
         raise InvalidQuery(f"{name} must not contain a NUL character")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidQuery(f"{name} must be valid UTF-8 text (no lone surrogate)") from None
 
 
 class InvalidQuery(ValueError):

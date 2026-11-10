@@ -474,3 +474,18 @@ def test_a_nul_character_is_refused_before_sql(call):
     value is refused as InvalidQuery first, naming the argument."""
     with pytest.raises(InvalidQuery, match="NUL"):
         call(_NoConnection())
+
+
+@pytest.mark.parametrize("value", ["\ud800", "a\udfffb", "\udc80"])
+@pytest.mark.parametrize("call", [
+    lambda c, v: search_documents(c, {"q": v}),
+    lambda c, v: search_documents(c, {"source_code": v}),
+    lambda c, v: runs_status(c, corpus=v),
+    lambda c, v: get_document(c, v),
+], ids=["q", "source_code", "runs_corpus", "get_document"])
+def test_a_lone_surrogate_is_refused_before_sql(call, value):
+    """A str that cannot be encoded as UTF-8 (a lone surrogate, which a JSON
+    caller can send) makes psycopg2 raise UnicodeEncodeError: refused as
+    InvalidQuery first."""
+    with pytest.raises(InvalidQuery, match="UTF-8"):
+        call(_NoConnection(), value)
