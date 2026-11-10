@@ -857,6 +857,11 @@ def find_manifest_files(data_dir, env):
     return files
 
 
+# How much of a rejected doc_id the warning shows: a producer can write a
+# huge list or object there, and the line is logged once per manifest line.
+INVALID_DOC_ID_LOG_CHARS = 80
+
+
 def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
     line = line.strip()
     if not line:
@@ -879,7 +884,10 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
     # (vault #6 crash again), 1 and true one to Python, [1] unhashable.
     doc_id = obj.get("doc_id")
     if not isinstance(doc_id, str) or not doc_id or "\x00" in doc_id:
-        reason = "without doc_id" if doc_id is None else f"with invalid doc_id {doc_id!r}"
+        shown = repr(doc_id)
+        if len(shown) > INVALID_DOC_ID_LOG_CHARS:
+            shown = shown[:INVALID_DOC_ID_LOG_CHARS] + "…"
+        reason = "without doc_id" if doc_id is None else f"with invalid doc_id {shown}"
         log.warning(
             f"Skipping line {reason} ({source_file}:{line_num}): "
             "doc_id must be a non-empty string"

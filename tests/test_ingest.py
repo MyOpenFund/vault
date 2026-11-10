@@ -211,3 +211,14 @@ def test_valid_json_that_is_not_an_object_is_skipped(line, caplog):
     with caplog.at_level(logging.WARNING, logger="ingest"):
         assert parse_line(line, "f.jsonl", 2, RUN_TS, CORPUS) is None
     assert "f.jsonl:2" in caplog.records[0].getMessage()
+
+
+def test_a_huge_invalid_doc_id_is_logged_truncated(caplog):
+    import ingest
+    huge = list(range(10_000))
+    line = json.dumps({"doc_id": huge})
+    with caplog.at_level("WARNING", logger="ingest"):
+        assert ingest.parse_line(line, "f.jsonl", 1, None, "central-bank") is None
+    (message,) = [r.getMessage() for r in caplog.records]
+    assert len(message) < ingest.INVALID_DOC_ID_LOG_CHARS + 200
+    assert "…" in message
