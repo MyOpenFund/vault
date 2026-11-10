@@ -7,6 +7,10 @@ the file as a FULL snapshot: one line per (bank_code, doc_type) series with a
 frozen field set. This ingester mirrors that semantic — each run replaces the
 table's rows for its corpus in one transaction.
 
+Lines carrying a `corpus` field that contradicts the service's CORPUS are
+skipped with a WARNING, as manifest lines are: a foreign corpus's snapshot
+mounted by mistake is never relabeled as this one's.
+
 Guards: a missing file is a no-op (normal on deployments without a cadence
 producer); an existing file yielding zero valid rows does NOT replace the
 table (an implausible mass disappearance is treated as a torn input, not
@@ -22,13 +26,16 @@ import os
 
 from psycopg2.extras import execute_values
 
+from common import resolve_corpus
+
 log = logging.getLogger("ingest_cadence")
 
 # Producer-contract fields -> everything else goes into `extra` (JSONB).
 # bank_code stays listed: the producer emits it (mapped to source_code),
-# and it must not fall into extra.
+# and it must not fall into extra. corpus is checked against the service's
+# CORPUS (resolve_corpus) and stored in the corpus column, never in extra.
 KNOWN_FIELDS = {
-    "bank_code", "source_code", "doc_type", "last", "interval_days",
+    "corpus", "bank_code", "source_code", "doc_type", "last", "interval_days",
     "next_expected", "days_until", "status", "expected_per_year", "n_3y",
 }
 
@@ -58,7 +65,7 @@ INSERT INTO cadence (
 """
 
 
-def parse_cadence_line(line, source_file, line_num, run_ts, default_corpus):
+def parse_cadence_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
     line = line.strip()
     if not line:
         return None
@@ -77,10 +84,23 @@ def parse_cadence_line(line, source_file, line_num, run_ts, default_corpus):
         )
         return None
 
+    # Same rule as manifest lines (ingest.parse_line): a corpus field that
+    # contradicts the service's means another corpus's snapshot is mounted
+    # here by mistake -- skip the line rather than relabel it (vault #6).
+    corpus = resolve_corpus(obj.get("corpus"), default_corpus)
+    if corpus is None:
+        log.warning(
+            f"Skipping line ({source_file}:{line_num}): corpus "
+            f"{obj.get('corpus')!r} contradicts this service's {default_corpus!r}"
+        )
+        if counters is not None:
+            counters["corpus_conflict"] = counters.get("corpus_conflict", 0) + 1
+        return None
+
     extra = {k: v for k, v in obj.items() if k not in KNOWN_FIELDS}
 
     return (
-        default_corpus,
+        corpus,
         source_code,
         doc_type,
         obj.get("last") or None,
@@ -98,11 +118,17 @@ def parse_cadence_line(line, source_file, line_num, run_ts, default_corpus):
 def load_cadence_rows(path, run_ts, default_corpus):
     """Parse every line of a cadence snapshot file into insert-ready rows."""
     rows = []
+    counters = {"corpus_conflict": 0}
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
-            row = parse_cadence_line(line, path, i, run_ts, default_corpus)
+            row = parse_cadence_line(line, path, i, run_ts, default_corpus, counters)
             if row:
                 rows.append(row)
+    if counters["corpus_conflict"]:
+        log.warning(
+            f"Rejected {counters['corpus_conflict']} cadence line(s) with a "
+            f"corpus contradicting this service's {default_corpus!r}"
+        )
     return rows
 
 

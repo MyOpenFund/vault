@@ -67,7 +67,7 @@ Write contract (`data-orchestrator` is the only writer):
 
 ### Table `cadence`
 
-Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan.
+Publication-cadence report, one row per `(corpus, source_code, doc_type)` series — the corpus producer's `data/cadence.jsonl` snapshot (a frozen 9-field contract) ingested by the service with full-replace semantics, scoped to the service's corpus. An empty snapshot never replaces existing rows (torn-input guard). `cadence_state.jsonl` is the producer's private state and is excluded from all vault ingestion, as is `cadence.jsonl` itself from the documents manifest scan. A snapshot line carrying a `corpus` field that contradicts the service's `CORPUS` is skipped with a WARNING (same rule as manifest lines): a foreign corpus's `cadence.jsonl` mounted by mistake is never relabeled as this one's, and a snapshot made only of such lines leaves the table untouched.
 
 ### Table `runs`
 
@@ -383,7 +383,7 @@ from cron.
 ```bash
 pip install -e cli/
 vaultctl stats                                # corpus totals from the API
-vaultctl list --source ecb --type D1          # query documents
+vaultctl list --source-code ecb --doc-type D1 # query documents
 vaultctl get <doc_id>                         # one document's metadata
 vaultctl download <doc_id>                    # fetch the raw file via the API
 ```

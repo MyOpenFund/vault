@@ -76,22 +76,25 @@ def fast_ddl_retries(monkeypatch):
     monkeypatch.setenv("VAULT_DDL_RETRY_DELAYS", "0.05,0.05")
 
 
+# Every table the ingestion run creates (the DDL train, ingest_cadence,
+# ingest_runs, ingest_discovery_errors). Dropping them all hands each test an
+# empty schema: a row or a table a previous test left behind (cadence used to
+# survive, vault #6) can neither leak into an assertion nor mask a missing
+# CREATE. vault_schema holds the train's fingerprint, so a test never inherits
+# "schema current" either. The views go with their tables (CASCADE).
+OWNED_TABLES = (
+    "rag_ingestions", "documents", "cadence", "runs", "discovery_errors", "vault_schema",
+)
+
+
 @pytest.fixture()
 def clean_db(pg_url):
-    """Drop the tables the DDL train recreates (documents, rag_ingestions,
-    discovery_errors) between tests; CASCADE because views depend on them.
-
-    vault_schema goes too: it holds the train's fingerprint, and a test must
-    not inherit "schema current" from the previous one (the dropped views
-    would re-run the train anyway, but the gate's own state starts clean)."""
+    """Drop every table (and, by CASCADE, every view) a run creates."""
     conn = psycopg2.connect(pg_url)
     conn.autocommit = True
     with conn.cursor() as cur:
-        # CASCADE: the DDL train creates views over documents/runs/cadence.
-        cur.execute("DROP TABLE IF EXISTS rag_ingestions CASCADE")
-        cur.execute("DROP TABLE IF EXISTS documents CASCADE")
-        cur.execute("DROP TABLE IF EXISTS discovery_errors CASCADE")
-        cur.execute("DROP TABLE IF EXISTS vault_schema")
+        for table in OWNED_TABLES:
+            cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
     conn.close()
     return pg_url
 

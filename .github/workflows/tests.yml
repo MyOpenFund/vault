@@ -17,5 +17,21 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Unit tests
         run: python -m pytest tests/ -q
+      # The integration fixture starts one postgres:16 container per module and
+      # skips (rather than fails) when `docker run` times out, which is the
+      # right fallback on a laptop but would hide a hung registry pull in CI.
+      # Pull up front, retried, so a registry hiccup fails or heals here.
+      - name: Pre-pull postgres:16
+        env:
+          PULL_ATTEMPTS: "3"           # tries before the job fails
+          PULL_TIMEOUT_SECONDS: "300"  # per try; a hung pull is killed and retried
+          PULL_BACKOFF_SECONDS: "15"   # wait after try n: n * this
+        run: |
+          for attempt in $(seq 1 "$PULL_ATTEMPTS"); do
+            if timeout "$PULL_TIMEOUT_SECONDS" docker pull postgres:16; then exit 0; fi
+            echo "docker pull postgres:16 failed (attempt $attempt/$PULL_ATTEMPTS)"
+            if [ "$attempt" -lt "$PULL_ATTEMPTS" ]; then sleep $((attempt * PULL_BACKOFF_SECONDS)); fi
+          done
+          exit 1
       - name: Integration tests (throwaway Postgres via docker)
         run: python -m pytest tests/ -q -m integration

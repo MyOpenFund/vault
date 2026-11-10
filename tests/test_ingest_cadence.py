@@ -104,3 +104,53 @@ def test_load_cadence_rows_skips_bad_lines_keeps_good(tmp_path):
     path.write_text("{corrupt\n" + make_line() + "\n\n")
     rows = load_cadence_rows(str(path), RUN_TS, CORPUS)
     assert len(rows) == 1
+
+
+# --- corpus contradiction (vault #6 bundled item, Spec W18) ----------------
+
+import logging  # noqa: E402
+
+from ingest_cadence import load_cadence_rows  # noqa: E402
+
+
+def test_matching_corpus_field_is_accepted_and_not_copied_to_extra():
+    row = parse_cadence_line(make_line(corpus=CORPUS), "cadence.jsonl", 1, RUN_TS, CORPUS)
+    assert row[0] == CORPUS
+    assert row[-1] is None
+
+
+def test_contradicting_corpus_skips_the_line_with_a_warning(caplog):
+    counters = {}
+    with caplog.at_level(logging.WARNING, logger="ingest_cadence"):
+        row = parse_cadence_line(make_line(corpus="company"), "cadence.jsonl", 3,
+                                 RUN_TS, CORPUS, counters)
+    assert row is None
+    assert counters == {"corpus_conflict": 1}
+    msg = caplog.records[0].getMessage()
+    assert "cadence.jsonl:3" in msg and "'company'" in msg and "'central-bank'" in msg
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("value", ["", "Central-Bank", "central-bank ", 0, False, ["central-bank"]])
+def test_near_miss_corpus_values_are_contradictions(value):
+    # Exact comparison, as for documents: no case folding, no trimming.
+    assert parse_cadence_line(make_line(corpus=value), "c", 1, RUN_TS, CORPUS) is None
+
+
+def test_explicit_null_corpus_means_absent():
+    # JSON null is the same as no field (resolve_corpus), as for documents.
+    assert parse_cadence_line(make_line(corpus=None), "c", 1, RUN_TS, CORPUS)[0] == CORPUS
+
+
+def test_load_cadence_rows_summarises_rejections(tmp_path, caplog):
+    p = tmp_path / "cadence.jsonl"
+    p.write_text(
+        make_line(corpus="company") + "\n" + make_line(bank_code="fr") + "\n"
+        + make_line(corpus="company", bank_code="de") + "\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="ingest_cadence"):
+        rows = load_cadence_rows(str(p), RUN_TS, CORPUS)
+    assert [r[1] for r in rows] == ["fr"]
+    assert any("Rejected 2 cadence line(s)" in r.getMessage() for r in caplog.records)
