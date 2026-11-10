@@ -76,6 +76,20 @@ def test_every_connection_carries_a_connect_timeout(monkeypatch):
     assert db.CONNECT_TIMEOUT_SECONDS == 10
 
 
+def test_get_conn_yields_an_autocommit_connection(monkeypatch):
+    """Autocommit from the first statement: vault-query's search then runs its
+    COUNT and page in one read-only snapshot, and no request leaves a read
+    transaction open (it would block the DDL train)."""
+    conn = FakeConn()
+    conn.autocommit = False
+    monkeypatch.setattr(db, "DATABASE_URL", URL)
+    monkeypatch.setattr(db.psycopg2, "connect", lambda *a, **k: conn)
+    with db.get_conn() as yielded:
+        assert yielded is conn
+        assert yielded.autocommit is True
+    assert conn.closed
+
+
 def test_a_missing_role_is_reported_loudly_with_the_command_that_fixes_it(
     monkeypatch, caplog
 ):

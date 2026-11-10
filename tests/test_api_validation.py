@@ -51,3 +51,22 @@ def test_a_valid_date_passes_the_check_and_reaches_sql(client):
     """The positive path: a real YYYY-MM-DD goes past validation to the (stub) database."""
     with pytest.raises(AssertionError, match="before any SQL"):
         client.get("/documents", params={"date_from": "2010-01-13"})
+
+
+@pytest.mark.parametrize("params", [
+    {"q": "a\x00b"},
+    {"source_code": "\x00"},
+    {"corpus": "central-bank\x00"},
+])
+def test_a_nul_character_in_a_filter_is_a_400(client, params):
+    """psycopg2 cannot send a NUL: refused as a 400, never a driver ValueError (500)."""
+    r = client.get("/documents", params=params)
+    assert r.status_code == 400
+    assert "NUL" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("path", ["/documents/a%00b", "/documents/a%00b/file"])
+def test_a_nul_character_in_a_doc_id_is_a_400(client, path):
+    r = client.get(path)
+    assert r.status_code == 400
+    assert "NUL" in r.json()["detail"]

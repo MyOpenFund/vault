@@ -1,7 +1,9 @@
 """Read-only queries over the MyOpenFund vault.
 
 One implementation of the corpus reads, shared by the vault API and the MCP server.
-Every function takes an open psycopg2 connection owned by the caller and never commits.
+Every function takes an open psycopg2 connection owned by the caller and never commits the
+caller's transaction (search_documents opens and ends its own read-only snapshot, only on an
+idle autocommit connection).
 Callers should pass an autocommit connection (or roll back after each call): a read on a
 non-autocommit connection leaves it "idle in transaction", holding ACCESS SHARE locks that
 block the vault's DDL train.

@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from vault_query import InvalidQuery, corpus_stats, get_document as vq_get_document, search_documents
+from vault_query.filters import check_text
 
 from db import get_conn, verify_connection, SORTABLE_FIELDS
 from models import Document, DocumentList, StatsSummary, CountItem
@@ -70,7 +71,10 @@ def list_documents(
     mime_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    q: Optional[str] = Query(None, description="Free-text search on the title"),
+    q: Optional[str] = Query(
+        None,
+        description="Literal, case-insensitive substring of the title (% and _ are not wildcards)",
+    ),
     sort_by: str = "date",
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=1000),
@@ -111,6 +115,10 @@ def list_documents(
 
 @app.get("/documents/{doc_id}", response_model=Document)
 def get_document(doc_id: str):
+    try:
+        check_text("doc_id", doc_id)
+    except InvalidQuery as exc:
+        raise HTTPException(400, str(exc)) from None
     with get_conn() as conn:
         row = vq_get_document(conn, doc_id)
 
@@ -122,6 +130,10 @@ def get_document(doc_id: str):
 @app.get("/documents/{doc_id}/file")
 def download_document_file(doc_id: str):
     """Download the actual file (PDF...) matching the document."""
+    try:
+        check_text("doc_id", doc_id)
+    except InvalidQuery as exc:
+        raise HTTPException(400, str(exc)) from None
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT local_path, title FROM documents WHERE doc_id = %s", (doc_id,))

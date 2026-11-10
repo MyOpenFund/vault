@@ -7,6 +7,7 @@ train included) and is deliberately uneven: two documents share a date, one has
 no date at all, one is html, and one is tombstoned by a second run's sweep.
 """
 
+import datetime
 import json
 
 import psycopg2
@@ -371,3 +372,349 @@ def test_source_health_reads_the_view(conn):
     assert vq.source_health(conn, source_code="us") == rows
     assert vq.source_health(conn, source_code="fr") == []
     assert vq.source_health(conn, corpus="company") == []
+
+
+# Same list as ACCEPTED_SINCE in tests/test_vault_query_unit.py: the contract is
+# "accepted by _check_since => runs on Postgres with no DataError".
+ACCEPTED_SINCE = [
+    "2026-10-01",
+    "2026-10-01T00:00",
+    "2026-10-01T00:00:00",
+    "2026-10-01T00:00:00.1",
+    "2026-10-01T00:00:00.123456",
+    "2026-10-01T00:00Z",
+    "2026-10-01T00:00+15:59",
+    "2026-10-01T00:00-15:59",
+    "2026-10-01T23:59:59+00:00",
+    "2024-02-29T12:00",
+    "0001-01-01T00:00Z",
+    "9999-12-31T23:59:59Z",
+]
+
+_UTC_PLUS = lambda **kw: datetime.timezone(datetime.timedelta(**kw))  # noqa: E731
+
+ACCEPTED_SINCE_OBJECTS = [
+    datetime.date(1, 1, 1),
+    datetime.datetime(2010, 1, 13, 12),
+    datetime.datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=datetime.timezone.utc),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=15, minutes=59, seconds=59)),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=-15, minutes=-59, seconds=-59)),
+]
+
+
+@pytest.mark.parametrize("since", ACCEPTED_SINCE + ACCEPTED_SINCE_OBJECTS, ids=repr)
+def test_every_accepted_since_runs_on_postgres(conn, since):
+    """Accepted by the check => Postgres parses it: no DataError, no 500.
+
+    A run at the far past makes the comparison really evaluate a row.
+    """
+    _insert_run(conn, "old", "0001-01-02T00:00:00Z", [{"source_code": "us"}])
+    assert isinstance(vq.runs_status(conn, since=since), list)
+    assert isinstance(vq.recent_runs(conn, since=since), list)
+
+
+@pytest.mark.parametrize("since", [
+    "2026-W40-1T00:00", "2026-W40-1", "2026-10-01T00:00+16:00", "2026-10-01T00:00-16:00",
+    "2026-10-01T00:00+05:60", "2026-10-01T00:00+00:60", "2026-10-01T00:00+14:99",
+    "2026-10-01T00:00-09:75",
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=16)),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=1, microseconds=5)),
+], ids=repr)
+def test_refusals_python_would_pass_are_postgres_errors(conn, since):
+    """Why the check is stricter than fromisoformat: these reach Postgres as a DataError.
+
+    If Postgres ever starts accepting one of them, this fails and the refusal
+    can be reconsidered; until then the check turns it into InvalidQuery.
+    """
+    with pytest.raises(psycopg2.DataError):
+        with conn.cursor() as cur:
+            cur.execute("SELECT %s::timestamptz", (since,))
+    with pytest.raises(vq.InvalidQuery):
+        vq.recent_runs(conn, since=since)
+
+
+def test_since_offset_is_read_by_postgres_at_the_boundary(conn):
+    """The offset in an accepted string is applied by Postgres, to the minute.
+
+    The run finished at 15:59Z; +08:01 on the next day is the same instant
+    (>= keeps it), +08:00 is one minute later (drops it).
+    """
+    _insert_run(conn, "edge", "2026-10-01T15:59:00Z", [{"source_code": "us"}])
+    assert [r["run_id"] for r in vq.recent_runs(conn, since="2026-10-02T00:00+08:01")] == ["edge"]
+    assert vq.recent_runs(conn, since="2026-10-02T00:00+08:00") == []
+    assert [r["run_id"] for r in vq.runs_status(conn, since="2026-10-01T00:00-15:59")] == ["edge"]
+    assert vq.runs_status(conn, since="2026-10-01T00:01-15:59") == []
+
+
+# --- q is literal -------------------------------------------------------------
+
+LITERAL_TITLES = {
+    "pct": "100% growth",
+    "nopct": "1000 growth",
+    "under": "a_b",
+    "nounder": "axb",
+    "bslash": "back\\slash",
+    "nobslash": "backslash",
+    "mix": "mix %_\\ end",
+    "bang": "wow!",
+    "nobang": "wow",
+}
+
+
+@pytest.fixture()
+def title_conn(clean_db, tmp_path, monkeypatch):
+    """Titles that differ only by a wildcard or the escape character, ingested for real."""
+    manifests = tmp_path / "titles"
+    write_manifest(manifests, "corpus.jsonl",
+                   [make_doc(doc_id, title=title) for doc_id, title in LITERAL_TITLES.items()])
+    run_ingest(monkeypatch, clean_db, manifests)
+    c = psycopg2.connect(clean_db)
+    c.autocommit = True
+    yield c
+    c.close()
+
+
+@pytest.mark.parametrize("q, expected", [
+    ("100%", {"pct"}),                       # was a wildcard: also matched 1000 growth
+    ("a_b", {"under"}),                      # was a wildcard: also matched axb
+    ("back\\slash", {"bslash"}),             # was an escape: matched backslash instead
+    ("%", {"pct", "mix"}),                   # was match-everything
+    ("_", {"under", "mix"}),
+    ("\\", {"bslash", "mix"}),
+    ("%_\\", {"mix"}),
+    ("%%", set()),
+    ("__", set()),
+    ("GROWTH", {"pct", "nopct"}),            # still case-insensitive
+    ("!", {"bang"}),                         # the escape character is literal too
+    ("wow!", {"bang"}),
+    ("!%", set()),
+    ("!_", set()),
+])
+def test_q_matches_the_literal_substring_only(title_conn, q, expected):
+    """`q` is a literal, case-insensitive substring of the title; total agrees with rows."""
+    total, rows = vq.search_documents(title_conn, {"q": q}, limit=100)
+    assert {r["doc_id"] for r in rows} == expected
+    assert total == len(expected)
+
+
+# --- COUNT and page in one snapshot ------------------------------------------
+
+def _insert_document(pg_url, doc_id):
+    """A committed insert from another session, as a concurrent ingest would make."""
+    other = psycopg2.connect(pg_url)
+    try:
+        with other, other.cursor() as cur:
+            cur.execute("INSERT INTO documents (doc_id, corpus, title) VALUES (%s, 'central-bank', %s)",
+                        (doc_id, doc_id))
+    finally:
+        other.close()
+
+
+class _Interleaving:
+    """Proxy connection: runs `between()` right after the COUNT statement.
+
+    Lets a test put a concurrent commit (or an error) exactly between the two
+    statements of search_documents, which no real timing could do reliably.
+    """
+
+    def __init__(self, conn, between):
+        self._conn, self._between = conn, between
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def cursor(self, *a, **k):
+        real, between = self._conn.cursor(*a, **k), self._between
+
+        class _Cursor:
+            def __enter__(self):
+                real.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, params=None):
+                real.execute(sql, params)
+                if "COUNT(*)" in sql:
+                    between()
+
+        return _Cursor()
+
+
+def test_search_total_and_page_share_one_snapshot_on_autocommit(conn, clean_db):
+    """A document committed between the COUNT and the page is in neither.
+
+    Under READ COMMITTED the page would see it and the total would not.
+    """
+    proxy = _Interleaving(conn, lambda: _insert_document(clean_db, "late"))
+    total, rows = vq.search_documents(proxy, {}, limit=100)
+    assert total == len(rows) == 4
+    assert "late" not in {r["doc_id"] for r in rows}
+    assert vq.search_documents(conn, {}, limit=100)[0] == 5  # committed, visible next call
+
+
+def test_search_snapshot_is_repeatable_read_and_read_only(conn):
+    """Inside the snapshot the session really is REPEATABLE READ and READ ONLY."""
+    seen = {}
+
+    def probe():
+        # Same session, its own cursor: the search's cursor keeps its result set.
+        with conn.cursor() as cur:
+            cur.execute("SHOW transaction_isolation")
+            seen["isolation"] = cur.fetchone()[0]
+            cur.execute("SHOW transaction_read_only")
+            seen["read_only"] = cur.fetchone()[0]
+
+    vq.search_documents(_Interleaving(conn, probe), {})
+    assert seen == {"isolation": "repeatable read", "read_only": "on"}
+
+
+def test_search_leaves_an_autocommit_connection_idle(conn):
+    """After the call nothing is left open: no read transaction to block the DDL train."""
+    from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+    vq.search_documents(conn, {"q": "doc"})
+    assert conn.autocommit is True
+    assert conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+
+
+def test_search_error_in_the_page_rolls_back_and_keeps_the_connection_usable(conn):
+    """A failing statement inside the snapshot: the error propagates, the
+    snapshot is rolled back, and the next call on the same connection works."""
+    from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+    def fail():
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 / 0")
+
+    with pytest.raises(psycopg2.errors.DivisionByZero):
+        vq.search_documents(_Interleaving(conn, fail), {})
+    assert conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+    assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_search_error_on_a_dropped_connection_propagates_the_original_error(clean_db, conn):
+    """The server ends the session mid-snapshot: the caller sees the connection
+    error itself, not a secondary error from the ROLLBACK attempt."""
+    victim = psycopg2.connect(clean_db)
+    victim.autocommit = True
+    try:
+        with victim.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid()")
+            pid = cur.fetchone()[0]
+
+        def kill():
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+
+        with pytest.raises(psycopg2.OperationalError):
+            vq.search_documents(_Interleaving(victim, kill), {})
+    finally:
+        victim.close()
+
+
+def test_search_does_not_touch_a_caller_transaction(clean_db, conn):
+    """Non-autocommit: the caller's transaction stays open, its own uncommitted
+    write is counted, and its rollback still undoes it (nothing was committed)."""
+    from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+    caller = psycopg2.connect(clean_db)
+    try:
+        with caller.cursor() as cur:
+            cur.execute("INSERT INTO documents (doc_id, corpus) VALUES ('mine', 'central-bank')")
+        assert vq.search_documents(caller, {})[0] == 5
+        assert caller.get_transaction_status() == TRANSACTION_STATUS_INTRANS
+        caller.rollback()
+    finally:
+        caller.close()
+    assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_search_does_not_commit_an_explicit_begin_on_autocommit(clean_db, conn):
+    """Autocommit, but the caller sent BEGIN itself: the snapshot is not opened
+    and the caller's transaction is neither committed nor ended."""
+    from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+    caller = psycopg2.connect(clean_db)
+    caller.autocommit = True
+    try:
+        with caller.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute("INSERT INTO documents (doc_id, corpus) VALUES ('mine', 'central-bank')")
+        assert vq.search_documents(caller, {})[0] == 5
+        assert caller.get_transaction_status() == TRANSACTION_STATUS_INTRANS
+        with caller.cursor() as cur:
+            cur.execute("ROLLBACK")
+    finally:
+        caller.close()
+    assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_q_is_literal_with_standard_conforming_strings_off(title_conn, clean_db):
+    """The pattern and its ESCAPE clause read the same with
+    standard_conforming_strings off (a server or role setting the package does
+    not control): a backslash in `q` is still one literal character."""
+    c = psycopg2.connect(clean_db, options="-c standard_conforming_strings=off")
+    c.autocommit = True
+    try:
+        with c.cursor() as cur:
+            cur.execute("SHOW standard_conforming_strings")
+            assert cur.fetchone()[0] == "off"
+        for q, expected in [("back\\slash", {"bslash"}), ("\\", {"bslash", "mix"}),
+                            ("%_\\", {"mix"}), ("100%", {"pct"}), ("!", {"bang"})]:
+            total, rows = vq.search_documents(c, {"q": q}, limit=100)
+            assert {r["doc_id"] for r in rows} == expected, q
+            assert total == len(expected)
+    finally:
+        c.close()
+
+
+# --- since: generated grammar sweep against Postgres -------------------------
+
+SWEEP_DATES = ["2026-10-01", "2024-02-29", "2026-02-29", "0001-01-01", "9999-12-31", "2026-13-01"]
+SWEEP_TIMES = ["", "T00:00", "T23:59", "T24:00", "T23:60", "T19:00", "T20:00", "T09:59:59",
+               "T12:00:59", "T12:00:60", "T12:00:00.123456", "T12:00:00.1234567", "T9:00"]
+SWEEP_OFFSETS = ["", "Z", "+00:00", "-00:00", "+05:30", "+09:59", "+10:00", "+15:59", "-15:59",
+                 "+16:00", "-16:00", "+19:00", "+20:00", "+23:59", "+05:60", "+00:60",
+                 "+14:99", "-09:75", "+1:00", "+0100"]
+
+
+def test_since_grammar_sweep_agrees_with_postgres(conn):
+    """Every generated string `since` accepts is a valid Postgres timestamptz.
+
+    Dates x time shapes x offsets, boundary hours and minutes included. Postgres
+    16's pg_input_is_valid judges all of them in one statement; then every
+    accepted string is cast for real in one more. The sweep must contain
+    strings Postgres rejects (else it proves nothing), and each of those must
+    be refused by the check.
+    """
+    from vault_query.health import _check_since
+
+    values = [d + t + o for d in SWEEP_DATES for t in SWEEP_TIMES for o in SWEEP_OFFSETS]
+
+    def accepted(v):
+        try:
+            _check_since(v)
+            return True
+        except vq.InvalidQuery:
+            return False
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT v, pg_input_is_valid(v, 'timestamptz') AS ok "
+                    "FROM unnest(%s::text[]) AS v", (values,))
+        valid = dict(cur.fetchall())
+        ours = [v for v in values if accepted(v)]
+        cur.execute("SELECT count(v::timestamptz) FROM unnest(%s::text[]) AS v", (ours,))
+        assert cur.fetchone()[0] == len(ours)
+    rejected_by_postgres = [v for v in values if not valid[v]]
+    assert len(rejected_by_postgres) > 100 and len(ours) > 100
+    assert [v for v in ours if not valid[v]] == []
+    assert not any(accepted(v) for v in rejected_by_postgres)
+    # The sweep reaches the real entry points too, for a sample at the edges.
+    for since in ["0001-01-01T00:00+15:59", "9999-12-31T23:59-15:59", "2026-10-01T09:59:59-00:00"]:
+        assert since in ours
+        assert isinstance(vq.recent_runs(conn, since=since), list)
