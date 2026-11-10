@@ -234,3 +234,28 @@ def test_the_app_refuses_to_start_when_its_role_does_not_exist(clean_db, monkeyp
     assert "vault_readonly" in logged
     assert "docker compose run --rm ingestion" in logged
     assert "s3cr3t" not in logged
+
+
+def test_list_documents_runs_on_an_autocommit_connection_left_idle(api_db, client, monkeypatch):
+    """/documents gets vault-query's one-snapshot COUNT and page: its connection
+    is in autocommit, and after the search nothing is left open on it."""
+    from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+    from contextlib import contextmanager
+
+    import db
+    import main as api_main
+
+    seen = []
+
+    @contextmanager
+    def spying_get_conn():
+        with db.get_conn() as conn:
+            yield conn
+            seen.append((conn.autocommit, conn.get_transaction_status()))
+
+    monkeypatch.setattr(api_main, "get_conn", spying_get_conn)
+    r = client.get("/documents", params={"q": "doc", "limit": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 4 and len(body["items"]) == 2
+    assert seen == [(True, TRANSACTION_STATUS_IDLE)]

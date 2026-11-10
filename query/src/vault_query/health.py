@@ -4,7 +4,7 @@ import re
 
 from psycopg2.extras import RealDictCursor
 
-from .filters import InvalidQuery, check_int
+from .filters import InvalidQuery, check_int, check_text
 
 RUN_COLUMNS = (
     "run_id", "tool", "command", "corpus", "source_code", "started_at", "finished_at",
@@ -30,6 +30,8 @@ DEFAULT_MAX_TEXT_CHARS = 2000
 
 def _where(corpus=None, source_code=None):
     clauses, params = [], []
+    check_text("corpus", corpus)
+    check_text("source_code", source_code)
     if corpus is not None:
         clauses.append("corpus = %s")
         params.append(corpus)
@@ -52,12 +54,17 @@ def _check_at_least_one(**params):
 
 # The `since` grammar, ASCII only: YYYY-MM-DD[THH:MM[:SS[.f{1,6}]][Z|+HH:MM|-HH:MM]],
 # an offset only after a time. `datetime.fromisoformat` alone also takes week
-# dates ("2026-W40-1") and offsets past 15:59, which Postgres rejects with a
-# DataError; the regex makes the accepted set exact, fromisoformat then refuses
-# what is not a real instant (month 13, hour 24, second 60, Feb 29 of a common year).
+# dates ("2026-W40-1"), offsets past 15:59 and offset minutes 60-99 (it
+# normalises "+05:60" to +06:00), all of which Postgres rejects with a
+# DataError. The regex carries every time-of-day and offset range itself (hour
+# 00-23, minute and second 00-59, offset hour 00-19, offset minute 00-59), so
+# the accepted set does not depend on a Python version; fromisoformat then
+# only rules on the calendar (month 13, Feb 29 of a common year) and the offset
+# magnitude is checked against POSTGRES_MAX_UTC_OFFSET.
 _SINCE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
-    r"(T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,6})?)?(Z|[+-][0-9]{2}:[0-9]{2})?)?"
+    r"(T([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]{1,6})?)?"
+    r"(Z|[+-][01][0-9]:[0-5][0-9])?)?"
 )
 SINCE_GRAMMAR = "YYYY-MM-DD[THH:MM[:SS[.ffffff]][Z|+HH:MM|-HH:MM]]"
 

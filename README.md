@@ -261,7 +261,10 @@ takes an open psycopg2 connection that the caller owns (opens, closes, and choos
 Behaviour notes (0.2.0):
 
 - `q` (document search) is a **literal**, case-insensitive substring of the title: `%`, `_` and
-  `\` match themselves, so `q="50%"` finds "50%" and no longer acts as a wildcard.
+  `\` match themselves, so `q="50%"` finds "50%" and no longer acts as a wildcard. (The
+  pattern is escaped with `!`, so it reads the same whatever `standard_conforming_strings` is.)
+- A string argument holding a NUL character (`q`, a filter value, `corpus`, `source_code`,
+  `doc_id`) is `InvalidQuery` before SQL: Postgres text cannot hold one.
 - `since` (`runs_status`, `recent_runs`) is a `date`, a `datetime`, or a string in the grammar
   `YYYY-MM-DD[THH:MM[:SS[.ffffff]][Z|+HH:MM|-HH:MM]]` (ASCII digits, upper-case `T`/`Z`, a real
   instant, UTC offset at most ±15:59 — Postgres's limit). Anything else (a week date, a space
@@ -271,7 +274,9 @@ Behaviour notes (0.2.0):
   on an idle autocommit connection, so the total and the page agree under a concurrent ingest.
   On a connection already in a transaction (or not in autocommit) it sends no BEGIN, COMMIT or
   ROLLBACK and the caller's isolation level applies. After an error inside its snapshot the
-  connection is rolled back and left usable.
+  connection is rolled back and left usable. One connection per concurrent call: do not share
+  a connection across threads. The API opens its connections in autocommit, so `/documents`
+  gets the snapshot.
 
 ## Metabase
 

@@ -415,6 +415,8 @@ def test_every_accepted_since_runs_on_postgres(conn, since):
 
 @pytest.mark.parametrize("since", [
     "2026-W40-1T00:00", "2026-W40-1", "2026-10-01T00:00+16:00", "2026-10-01T00:00-16:00",
+    "2026-10-01T00:00+05:60", "2026-10-01T00:00+00:60", "2026-10-01T00:00+14:99",
+    "2026-10-01T00:00-09:75",
     datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=16)),
     datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=1, microseconds=5)),
 ], ids=repr)
@@ -454,6 +456,8 @@ LITERAL_TITLES = {
     "bslash": "back\\slash",
     "nobslash": "backslash",
     "mix": "mix %_\\ end",
+    "bang": "wow!",
+    "nobang": "wow",
 }
 
 
@@ -481,6 +485,10 @@ def title_conn(clean_db, tmp_path, monkeypatch):
     ("%%", set()),
     ("__", set()),
     ("GROWTH", {"pct", "nopct"}),            # still case-insensitive
+    ("!", {"bang"}),                         # the escape character is literal too
+    ("wow!", {"bang"}),
+    ("!%", set()),
+    ("!_", set()),
 ])
 def test_q_matches_the_literal_substring_only(title_conn, q, expected):
     """`q` is a literal, case-insensitive substring of the title; total agrees with rows."""
@@ -644,3 +652,69 @@ def test_search_does_not_commit_an_explicit_begin_on_autocommit(clean_db, conn):
     finally:
         caller.close()
     assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_q_is_literal_with_standard_conforming_strings_off(title_conn, clean_db):
+    """The pattern and its ESCAPE clause read the same with
+    standard_conforming_strings off (a server or role setting the package does
+    not control): a backslash in `q` is still one literal character."""
+    c = psycopg2.connect(clean_db, options="-c standard_conforming_strings=off")
+    c.autocommit = True
+    try:
+        with c.cursor() as cur:
+            cur.execute("SHOW standard_conforming_strings")
+            assert cur.fetchone()[0] == "off"
+        for q, expected in [("back\\slash", {"bslash"}), ("\\", {"bslash", "mix"}),
+                            ("%_\\", {"mix"}), ("100%", {"pct"}), ("!", {"bang"})]:
+            total, rows = vq.search_documents(c, {"q": q}, limit=100)
+            assert {r["doc_id"] for r in rows} == expected, q
+            assert total == len(expected)
+    finally:
+        c.close()
+
+
+# --- since: generated grammar sweep against Postgres -------------------------
+
+SWEEP_DATES = ["2026-10-01", "2024-02-29", "2026-02-29", "0001-01-01", "9999-12-31", "2026-13-01"]
+SWEEP_TIMES = ["", "T00:00", "T23:59", "T24:00", "T23:60", "T19:00", "T20:00", "T09:59:59",
+               "T12:00:59", "T12:00:60", "T12:00:00.123456", "T12:00:00.1234567", "T9:00"]
+SWEEP_OFFSETS = ["", "Z", "+00:00", "-00:00", "+05:30", "+09:59", "+10:00", "+15:59", "-15:59",
+                 "+16:00", "-16:00", "+19:00", "+20:00", "+23:59", "+05:60", "+00:60",
+                 "+14:99", "-09:75", "+1:00", "+0100"]
+
+
+def test_since_grammar_sweep_agrees_with_postgres(conn):
+    """Every generated string `since` accepts is a valid Postgres timestamptz.
+
+    Dates x time shapes x offsets, boundary hours and minutes included. Postgres
+    16's pg_input_is_valid judges all of them in one statement; then every
+    accepted string is cast for real in one more. The sweep must contain
+    strings Postgres rejects (else it proves nothing), and each of those must
+    be refused by the check.
+    """
+    from vault_query.health import _check_since
+
+    values = [d + t + o for d in SWEEP_DATES for t in SWEEP_TIMES for o in SWEEP_OFFSETS]
+
+    def accepted(v):
+        try:
+            _check_since(v)
+            return True
+        except vq.InvalidQuery:
+            return False
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT v, pg_input_is_valid(v, 'timestamptz') AS ok "
+                    "FROM unnest(%s::text[]) AS v", (values,))
+        valid = dict(cur.fetchall())
+        ours = [v for v in values if accepted(v)]
+        cur.execute("SELECT count(v::timestamptz) FROM unnest(%s::text[]) AS v", (ours,))
+        assert cur.fetchone()[0] == len(ours)
+    rejected_by_postgres = [v for v in values if not valid[v]]
+    assert len(rejected_by_postgres) > 100 and len(ours) > 100
+    assert [v for v in ours if not valid[v]] == []
+    assert not any(accepted(v) for v in rejected_by_postgres)
+    # The sweep reaches the real entry points too, for a sample at the edges.
+    for since in ["0001-01-01T00:00+15:59", "9999-12-31T23:59-15:59", "2026-10-01T09:59:59-00:00"]:
+        assert since in ours
+        assert isinstance(vq.recent_runs(conn, since=since), list)

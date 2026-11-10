@@ -58,6 +58,11 @@ def get_conn():
         cursor_factory=psycopg2.extras.RealDictCursor,
         connect_timeout=CONNECT_TIMEOUT_SECONDS,
     )
+    # Autocommit before the first statement: vault-query's search_documents then
+    # runs its COUNT and page in one read-only snapshot (it leaves a caller's
+    # transaction alone otherwise), and no request holds a read transaction
+    # open against the DDL train. Every route is read-only.
+    conn.autocommit = True
     try:
         yield conn
     finally:

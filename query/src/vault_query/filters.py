@@ -24,14 +24,15 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     - simple values -> equality
     - `date_from` / `date_to` -> bounds on the `date` column
     - `q` -> literal, case-insensitive substring of `title` (ILIKE with `%`,
-      `_` and `\\` escaped: `q="50%"` finds "50%", it is not a wildcard)
+      `_` and LIKE_ESCAPE escaped: `q="50%"` finds "50%", it is not a wildcard)
     - by default, excludes soft-deleted documents (`deleted_at IS NULL`)
 
     Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
     bool), `date_from` / `date_to` a `datetime.date` / `datetime.datetime` or a
     `YYYY-MM-DD` str naming a real day; an empty / falsy date is ignored (no
     bound); anything else raises InvalidQuery. Only validates: the caller's
-    original value is the bound parameter.
+    original value is the bound parameter. A str value (`q` included) holding
+    a NUL character is InvalidQuery: the driver cannot send one.
     """
     clauses = []
     params = []
@@ -42,6 +43,7 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     for field in FILTERABLE_FIELDS:
         value = filters.get(field)
         if value is not None:
+            check_text(field, value)
             if field == "year":
                 check_int("year", value, 0)
             clauses.append(f"{field} = %s")
@@ -60,6 +62,7 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
         params.append(date_to)
 
     q = filters.get("q")
+    check_text("q", q)
     if q:
         clauses.append(f"title ILIKE %s ESCAPE '{LIKE_ESCAPE}'")
         params.append(f"%{escape_like(q)}%")
@@ -69,9 +72,11 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
 
 
 # The ILIKE escape character `q` is escaped with, declared in the SQL with
-# ESCAPE (standard_conforming_strings is on, Postgres's default since 9.1, so
-# '\' is one backslash).
-LIKE_ESCAPE = "\\"
+# ESCAPE. Not a backslash: '\' is one character only while
+# standard_conforming_strings is on, and that is a server / role setting this
+# package does not control; '!' reads the same either way. A backslash in `q`
+# is then an ordinary character.
+LIKE_ESCAPE = "!"
 
 
 def escape_like(text):
@@ -102,6 +107,16 @@ def _check_date(name, value):
         except ValueError:
             pass
     raise InvalidQuery(f"{name} must be an ISO date (YYYY-MM-DD)")
+
+
+def check_text(name, value):
+    """Refuse a str holding a NUL character; any other value passes.
+
+    Postgres text cannot hold NUL and psycopg2 raises a bare ValueError when
+    asked to send one (an API 500): refused here as InvalidQuery instead.
+    """
+    if isinstance(value, str) and "\x00" in value:
+        raise InvalidQuery(f"{name} must not contain a NUL character")
 
 
 class InvalidQuery(ValueError):

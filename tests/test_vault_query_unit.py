@@ -12,7 +12,8 @@ import datetime
 import pytest
 
 from vault_query import (
-    InvalidQuery, build_where_clause, corpus_stats, open_discovery_errors, recent_runs, runs_status, search_documents,
+    InvalidQuery, build_where_clause, corpus_stats, get_document, open_discovery_errors, recent_runs,
+    runs_status, search_documents, source_health,
 )
 
 
@@ -148,6 +149,16 @@ REFUSED_SINCE = [
     "2026-13-01",
     "2026-00-10",
     "2026-10-32",
+    "2026-10-01T25:00",
+    "2026-10-01T12:60",
+    "2026-10-01T12:00:61",
+    # Offset minutes 60-99: Python normalises "+05:60" to +06:00, Postgres
+    # rejects it (time zone displacement out of range).
+    "2026-10-01T00:00+05:60",
+    "2026-10-01T00:00+00:60",
+    "2026-10-01T00:00+14:99",
+    "2026-10-01T00:00-09:75",
+    "2026-10-01T00:00+29:00",
     # Not ASCII digits (str.isdigit and the `\d` class would take them).
     "２０２６-１０-０１",  # full-width
     "٢٠٢٦-١٠-٠١",  # Arabic-Indic
@@ -157,6 +168,7 @@ REFUSED_SINCE = [
     " 2026-10-01",
     "2026-10-01 ",
     "2026-10-01T00:00Z\n",
+    "2026-10-01\x00",
     # Not a timestamp at all.
     "",
     "yesterday",
@@ -300,22 +312,31 @@ def test_valid_filter_values_reach_sql_unchanged(filters, clause, value):
 
 @pytest.mark.parametrize("q, param", [
     ("housing", "%housing%"),
-    ("50%", "%50\\%%"),
-    ("a_b", "%a\\_b%"),
-    ("back\\slash", "%back\\\\slash%"),
-    ("%_\\", "%\\%\\_\\\\%"),
-    ("%", "%\\%%"),
-    ("_", "%\\_%"),
-    ("\\", "%\\\\%"),
-    ("\\%", "%\\\\\\%%"),        # an escaped-looking % is still two literals
-    ("%%", "%\\%\\%%"),
-    ("café §", "%café §%"),  # non-ASCII is untouched
+    ("50%", "%50!%%"),
+    ("a_b", "%a!_b%"),
+    ("wow!", "%wow!!%"),
+    ("!%_", "%!!!%!_%"),          # the escape character is escaped first
+    ("%", "%!%%"),
+    ("_", "%!_%"),
+    ("!", "%!!%"),
+    ("%%", "%!%!%%"),
+    ("back\\slash", "%back\\slash%"),  # a backslash is an ordinary character now
+    ("\\%", "%\\!%%"),
+    ("caf\u00e9 \u00a7", "%caf\u00e9 \u00a7%"),  # non-ASCII is untouched
 ])
 def test_q_is_escaped_into_a_literal_ilike_pattern(q, param):
     """`%`, `_` and the escape character itself are escaped; the rest is untouched."""
     where_sql, params = build_where_clause({"q": q})
-    assert "title ILIKE %s ESCAPE '\\'" in where_sql
+    assert "title ILIKE %s ESCAPE '!'" in where_sql
     assert params == [param]
+
+
+def test_like_escape_needs_no_backslash():
+    """The escape character is not `\\`: the SQL literal then reads the same
+    whatever standard_conforming_strings is."""
+    from vault_query import filters
+
+    assert filters.LIKE_ESCAPE == "!"
 
 
 def test_empty_q_adds_no_clause():
@@ -410,3 +431,46 @@ def test_search_argument_errors_open_no_snapshot():
     """Argument checks still run before any SQL, the BEGIN included."""
     with pytest.raises(InvalidQuery):
         search_documents(_NoConnection(), {"q": "x"}, limit=0)
+
+
+# --- the since grammar is self-contained --------------------------------------
+
+@pytest.mark.parametrize("value", [
+    "2026-10-01T24:00", "2026-10-01T23:60", "2026-10-01T23:59:60", "2026-10-01T30:00",
+    "2026-10-01T00:00+05:60", "2026-10-01T00:00+20:00",
+    "2026-10-01T00:00-09:75",
+])
+def test_since_regex_alone_refuses_out_of_range_fields(value):
+    """Hour, minute, second and offset ranges are in the regex itself, not left
+    to whatever a given Python's fromisoformat normalises or refuses."""
+    from vault_query import health
+
+    assert health._SINCE.fullmatch(value) is None
+
+
+# --- NUL characters are InvalidQuery, not a driver ValueError -----------------
+
+NUL = "a\x00b"
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: search_documents(c, {"q": NUL}),
+    lambda c: search_documents(c, {"source_code": NUL}),
+    lambda c: search_documents(c, {"corpus": NUL}),
+    lambda c: search_documents(c, {"doc_type": "\x00"}),
+    lambda c: build_where_clause({"language": NUL}),
+    lambda c: runs_status(c, corpus=NUL),
+    lambda c: runs_status(c, source_code=NUL),
+    lambda c: recent_runs(c, corpus=NUL),
+    lambda c: open_discovery_errors(c, source_code=NUL),
+    lambda c: source_health(c, corpus=NUL),
+    lambda c: corpus_stats(c, "year", corpus=NUL),
+    lambda c: get_document(c, NUL),
+], ids=["q", "source_code", "corpus", "doc_type", "where_language", "runs_corpus",
+        "runs_source", "recent_corpus", "errors_source", "health_corpus",
+        "stats_corpus", "get_document"])
+def test_a_nul_character_is_refused_before_sql(call):
+    """psycopg2 cannot send a NUL in a string (ValueError, an API 500): the
+    value is refused as InvalidQuery first, naming the argument."""
+    with pytest.raises(InvalidQuery, match="NUL"):
+        call(_NoConnection())

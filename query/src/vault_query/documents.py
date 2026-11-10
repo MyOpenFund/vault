@@ -3,7 +3,7 @@ import psycopg2
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from psycopg2.extras import RealDictCursor
 
-from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_int
+from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_int, check_text
 
 # Every column of `documents` after the DDL train (ingestion/ingest.py). A
 # caller-chosen projection is checked against it: column names are
@@ -42,8 +42,9 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     `columns`, when given, is a non-empty subset of ALL_COLUMNS; None means
     every column.
 
-    `filters["q"]` is a literal, case-insensitive substring of the title: `%`,
-    `_` and `\\` match themselves (`q="50%"` finds "50%", not "500").
+    `filters["q"]` is a literal, case-insensitive substring of the title: every
+    character, `%`, `_`, `!` and `\\` included, matches itself (`q="50%"` finds
+    "50%", not "500").
 
     The COUNT and the page are two statements. On an autocommit connection
     that is idle (the documented caller contract) both run inside one
@@ -55,6 +56,10 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     alone: no BEGIN, COMMIT or ROLLBACK is sent, and the two statements see
     whatever the caller's isolation level gives them (READ COMMITTED by default:
     a concurrent commit between them can shift the page by a row).
+
+    One connection per concurrent call: a psycopg2 connection must not be
+    shared across threads for this function (the snapshot is the
+    connection's, so two interleaved calls would share or end each other's).
     """
     if sort_by not in SORTABLE_FIELDS:
         raise InvalidQuery(f"sort_by must be one of {sorted(SORTABLE_FIELDS)}")
@@ -108,7 +113,11 @@ def _rollback_quietly(cur):
 
 
 def get_document(conn, doc_id):
-    """Every stored fact of one document, soft-deleted or not; None if unknown."""
+    """Every stored fact of one document, soft-deleted or not; None if unknown.
+
+    A doc_id holding a NUL character is InvalidQuery (no stored id can hold one).
+    """
+    check_text("doc_id", doc_id)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM documents WHERE doc_id = %s", (doc_id,))
         row = cur.fetchone()
