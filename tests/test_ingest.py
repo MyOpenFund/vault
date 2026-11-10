@@ -97,8 +97,8 @@ def test_empty_date_becomes_none():
 
 # --- documents-scan exclusion of cadence files ---------------------------
 
-def test_find_jsonl_files_excludes_cadence_files(tmp_path):
-    from ingest import find_jsonl_files
+def test_find_manifest_files_excludes_cadence_files(tmp_path):
+    from ingest import find_manifest_files
 
     (tmp_path / "us.jsonl").write_text("{}\n")
     (tmp_path / "cadence.jsonl").write_text("{}\n")
@@ -107,16 +107,16 @@ def test_find_jsonl_files_excludes_cadence_files(tmp_path):
     (tmp_path / "sub" / "cadence.jsonl").write_text("{}\n")
     (tmp_path / "sub" / "fr.jsonl").write_text("{}\n")
 
-    found = find_jsonl_files(str(tmp_path))
+    found = find_manifest_files(str(tmp_path), {})
     basenames = sorted(p.split("/")[-1] for p in found)
     assert basenames == ["fr.jsonl", "us.jsonl"]
 
 
-def test_find_jsonl_files_skips_every_producer_root_file(tmp_path):
+def test_find_manifest_files_skips_every_producer_root_file(tmp_path):
     # U2 — the seven root-level .jsonl files the producer writes beside
     # manifest/ must never be read as document manifests, at the root AND
     # nested (the glob is recursive).
-    from ingest import EXCLUDED_BASENAMES, find_jsonl_files
+    from ingest import EXCLUDED_BASENAMES, find_manifest_files
     expected = {
         "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
         "discovery_errors.jsonl", "download_errors.jsonl",
@@ -129,15 +129,15 @@ def test_find_jsonl_files_skips_every_producer_root_file(tmp_path):
         (tmp_path / "nested" / name).write_text("{}\n")
     (tmp_path / "manifest").mkdir()
     (tmp_path / "manifest" / "us.jsonl").write_text("{}\n")
-    found = [p.rsplit("/", 1)[1] for p in find_jsonl_files(str(tmp_path))]
+    found = [p.rsplit("/", 1)[1] for p in find_manifest_files(str(tmp_path), {})]
     assert found == ["us.jsonl"]
 
 
-def test_find_jsonl_files_keeps_legacy_monolithic_manifest(tmp_path):
+def test_find_manifest_files_keeps_legacy_monolithic_manifest(tmp_path):
     # U3 — data/manifest.jsonl is the legacy single-file manifest: in scope.
-    from ingest import find_jsonl_files
+    from ingest import find_manifest_files
     (tmp_path / "manifest.jsonl").write_text("{}\n")
-    assert [p.rsplit("/", 1)[1] for p in find_jsonl_files(str(tmp_path))] == ["manifest.jsonl"]
+    assert [p.rsplit("/", 1)[1] for p in find_manifest_files(str(tmp_path), {})] == ["manifest.jsonl"]
 
 
 def test_upsert_refreshes_extra_on_conflict():

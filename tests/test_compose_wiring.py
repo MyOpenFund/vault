@@ -70,3 +70,9 @@ def test_ingestion_forwards_the_ddl_gate_settings_as_optional():
     for var in ("VAULT_DDL_LOCK_TIMEOUT", "VAULT_DDL_RETRY_DELAYS", "VAULT_DDL_FORCE"):
         assert f"{var}: ${{{var}:-}}" in COMPOSE
         assert f"#{var}=" in ENV_EXAMPLE
+
+
+def test_ingestion_forwards_manifest_globs_as_optional():
+    # Empty = layout detection (ingest.find_manifest_files); the NAS sets nothing.
+    assert "MANIFEST_GLOBS: ${MANIFEST_GLOBS:-}" in COMPOSE
+    assert "#MANIFEST_GLOBS=" in ENV_EXAMPLE

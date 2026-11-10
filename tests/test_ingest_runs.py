@@ -56,11 +56,11 @@ def test_load_run_rows_skips_bad_keeps_good(tmp_path):
 
 
 def test_runs_jsonl_excluded_from_documents_scan(tmp_path):
-    from ingest import find_jsonl_files
+    from ingest import find_manifest_files
 
     (tmp_path / "us.jsonl").write_text("{}\n")
     (tmp_path / "runs.jsonl").write_text("{}\n")
-    found = find_jsonl_files(str(tmp_path))
+    found = find_manifest_files(str(tmp_path), {})
     assert [f.split("/")[-1] for f in found] == ["us.jsonl"]
 
 

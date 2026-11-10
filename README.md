@@ -41,6 +41,13 @@ Every manifest column (corpus, source_code, doc_type, title, pdf_url, source_url
 
 Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs. `last_seen_at` is monotone — it only ever advances (see Concurrency below) — so a slower concurrent run can never make a live row look stale to a newer run's sweep.
 
+Which files are manifests (the run logs the layout it picked):
+- **data/ root layout** — `<DATA_DIR>/manifest/` is a directory (the repo's `compose.yaml`, where `DATA_DIR` is the corpus `data/` root): only `manifest/**/*.jsonl` and the legacy monolithic `manifest.jsonl` are read. `cadence.jsonl`, `runs.jsonl`, the producer's private and audit files, and any other root file are never treated as manifests.
+- **manifest-directory layout** — no `manifest/` directory (e.g. a deployment that mounts `data/manifest` itself as `DATA_DIR` and points `CADENCE_PATH`/`RUNS_PATH`/`DISCOVERY_ERRORS_PATH` at the producer files): every `**/*.jsonl` under `DATA_DIR`, minus the known producer file names — the same set the scan has always read.
+- **`MANIFEST_GLOBS`** (optional, comma-separated globs relative to `DATA_DIR`, `**` recursive) overrides both and is taken literally; an empty entry, an absolute pattern or a `..` component fails the run before it connects.
+
+A `doc_id` repeated inside one manifest file keeps its **last valid line** (what two upserts in line order would store); the run logs a WARNING with the number of dropped lines and up to five of the repeated `doc_id`s (`DUPLICATE_SAMPLE_SIZE` in `ingest.py`). It used to abort the whole run (vault #6). `SWEEP_MAX_DELETE_FRACTION` unset or empty means the default `0.05`; any value that is not a number in `[0, 1]` fails the run before it connects, naming the value.
+
 ### Table `rag_ingestions`
 
 Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.

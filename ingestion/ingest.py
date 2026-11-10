@@ -2,8 +2,12 @@
 """
 Ingest .jsonl document inventories into PostgreSQL.
 
-Finds every .jsonl under DATA_DIR (recursively), parses each line and
-upserts it into the `documents` table keyed on doc_id. Documents belong
+Finds the manifest .jsonl files under DATA_DIR (find_manifest_files: the
+data/ root layout reads manifest/**/*.jsonl + manifest.jsonl only, a DATA_DIR
+that is the manifest directory itself is read recursively, MANIFEST_GLOBS
+overrides), parses each line and upserts it into the `documents` table keyed
+on doc_id. A doc_id repeated inside one file keeps its last valid line, with a
+WARNING (vault #6). Documents belong
 to a corpus: the service-level CORPUS env var provides the default, a
 "corpus" field on a manifest line is checked against it, and a
 contradiction rejects the line (this service is being fed another
@@ -52,6 +56,7 @@ as a fingerprint-keyed snapshot upsert (ingest_discovery_errors.py).
 """
 
 import json
+import math
 import os
 import sys
 import glob
@@ -617,14 +622,114 @@ def release_lock(conn, key):
         log.warning(f"lock {key!r} was not held at release time")
 
 
-# Files the documents scan must never treat as manifests. All of them are
-# written by the producer at the data/ root, beside manifest/: the cadence
-# snapshot and the watchdog's private state (ingest_cadence.py; the state
-# file never enters the vault), the runs telemetry (ingest_runs.py), the
-# discovery-error trail (ingest_discovery_errors.py), and three producer
-# audit files nothing in the vault reads yet. Mounting data/ (so cadence and
-# runs can reach the ingester) is only safe with this list complete.
-# data/manifest.jsonl — the legacy monolithic manifest — stays IN scope.
+class IngestSettingsError(ValueError):
+    """An ingestion setting is invalid; the run exits 1 before connecting."""
+
+
+class ManifestGlobsError(IngestSettingsError):
+    """MANIFEST_GLOBS is malformed or reaches outside DATA_DIR."""
+
+
+# Torn-share guard default (see should_sweep). 1.0 is the operator override.
+SWEEP_MAX_DELETE_FRACTION_DEFAULT = 0.05
+
+
+def parse_sweep_fraction(env):
+    """Read SWEEP_MAX_DELETE_FRACTION from `env` (vault #6, F12).
+
+    Unset or empty (e.g. `SWEEP_MAX_DELETE_FRACTION=` in .env) -> the default,
+    with an INFO. Anything else must be a finite number in [0, 1]: a value
+    outside it used to either crash the run (empty, garbage) or silently block
+    every sweep forever (negative), so it now fails the run before connecting
+    with a message naming the variable and the value. 0 = never sweep;
+    1.0 = the guard is off (operator override).
+    """
+    raw = env.get("SWEEP_MAX_DELETE_FRACTION")
+    if raw is None or not raw.strip():
+        log.info(
+            f"SWEEP_MAX_DELETE_FRACTION unset or empty — using the default "
+            f"{SWEEP_MAX_DELETE_FRACTION_DEFAULT}"
+        )
+        return SWEEP_MAX_DELETE_FRACTION_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise IngestSettingsError(
+            f"SWEEP_MAX_DELETE_FRACTION={raw!r} is invalid: expected a number "
+            "between 0 and 1 (default 0.05; 1.0 disables the guard)"
+        )
+    return value
+
+
+# How many repeated doc_ids the duplicate WARNING quotes (dedupe_rows). The
+# count is always complete; only the sample is capped, to keep one glitched
+# manifest from flooding the log.
+DUPLICATE_SAMPLE_SIZE = 5
+
+
+def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
+    """Keep one row per doc_id within one manifest file: the LAST one (vault #6).
+
+    Two rows sharing a doc_id in one execute_values page make Postgres raise
+    CardinalityViolation (ON CONFLICT DO UPDATE cannot affect a row twice) and
+    kill the run; in different pages they went through silently. Last wins is
+    what two upserts issued in line order would have stored. The kept rows are
+    returned in the order of their (last) occurrence. doc_ids are compared
+    exactly, as the UNIQUE constraint does. A WARNING gives the number of
+    dropped lines, the number of doc_ids concerned and up to `sample_size` of
+    them (first-seen order).
+    """
+    last = {}
+    for i, row in enumerate(rows):
+        last[row[0]] = i
+    if len(last) == len(rows):
+        return rows
+    kept = [row for i, row in enumerate(rows) if last[row[0]] == i]
+    repeated = []
+    seen = set()
+    for i, row in enumerate(rows):
+        doc_id = row[0]
+        if last[doc_id] != i and doc_id not in seen:
+            seen.add(doc_id)
+            repeated.append(doc_id)
+    sample = ", ".join(repr(d) for d in repeated[:sample_size])
+    more = ", …" if len(repeated) > sample_size else ""
+    log.warning(
+        f"{source_file}: dropped {len(rows) - len(kept)} duplicate line(s) for "
+        f"{len(repeated)} doc_id(s) repeated in this file — the last valid line "
+        f"of each wins (e.g. {sample}{more})"
+    )
+    return kept
+
+
+# Which .jsonl files the documents pass reads (Spec W5). Two layouts exist:
+#
+# - Root layout: DATA_DIR is the corpus data/ ROOT (the repo's compose.yaml).
+#   Detected by <DATA_DIR>/manifest being a directory (a symlink to one
+#   counts). Only an allowlist is read: manifest/**/*.jsonl plus the legacy
+#   monolithic data/manifest.jsonl. Every other root file -- cadence.jsonl,
+#   runs.jsonl, the producer's private and audit files, and any file a
+#   producer adds tomorrow -- is ignored without having to be named.
+# - Manifest-dir layout: DATA_DIR is the manifest directory itself (the NAS,
+#   where cadence/runs/discovery_errors come from the *_PATH variables on
+#   another mount). Everything under it, recursively -- with the producer
+#   basenames below still skipped, so this mode finds exactly what the scan
+#   found before the allowlist existed.
+#
+# MANIFEST_GLOBS (comma-separated glob patterns relative to DATA_DIR, `**`
+# recursive) overrides both and is taken literally (no basename filter).
+# Hidden files never match (glob's default), as before.
+MANIFEST_SUBDIR = "manifest"
+ROOT_LAYOUT_GLOBS = ("manifest/**/*.jsonl", "manifest.jsonl")
+MANIFEST_DIR_LAYOUT_GLOBS = ("**/*.jsonl",)
+
+# Producer files that are not manifests, skipped by basename in the
+# manifest-dir layout only (the root layout's allowlist never reaches them):
+# the cadence snapshot and the watchdog's private state (ingest_cadence.py),
+# the runs telemetry (ingest_runs.py), the discovery-error trail
+# (ingest_discovery_errors.py), and three producer audit files.
 EXCLUDED_BASENAMES = frozenset({
     "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
     "discovery_errors.jsonl", "download_errors.jsonl",
@@ -632,12 +737,68 @@ EXCLUDED_BASENAMES = frozenset({
 })
 
 
-def find_jsonl_files(root):
-    return sorted(
-        p
-        for p in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
-        if os.path.basename(p) not in EXCLUDED_BASENAMES
+def parse_manifest_globs(raw):
+    """MANIFEST_GLOBS -> tuple of patterns, or None when unset/empty.
+
+    Refused (ManifestGlobsError): an empty entry (`a,,b`, a trailing comma), an
+    absolute pattern, or a `..` component -- the override selects files inside
+    DATA_DIR, it never reaches outside it.
+    """
+    if raw is None or not raw.strip():
+        return None
+    patterns = tuple(p.strip() for p in raw.split(","))
+    for pattern in patterns:
+        if not pattern:
+            raise ManifestGlobsError(
+                f"MANIFEST_GLOBS={raw!r} is invalid: empty pattern "
+                "(comma-separated globs relative to DATA_DIR)"
+            )
+        if os.path.isabs(pattern) or ".." in pattern.replace("\\", "/").split("/"):
+            raise ManifestGlobsError(
+                f"MANIFEST_GLOBS={raw!r} is invalid: {pattern!r} must be "
+                "relative to DATA_DIR and stay inside it"
+            )
+    return patterns
+
+
+def _glob_files(data_dir, patterns, excluded=frozenset()):
+    found = set()
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(data_dir, pattern), recursive=True):
+            if os.path.basename(path) in excluded:
+                continue
+            if not os.path.isfile(path):
+                log.warning(f"manifest scan: {path} matches but is not a file — skipped")
+                continue
+            found.add(path)
+    return sorted(found)
+
+
+def find_manifest_files(data_dir, env):
+    """The manifest files of this run, sorted; the layout used is logged."""
+    patterns = parse_manifest_globs(env.get("MANIFEST_GLOBS"))
+    excluded = frozenset()
+    subdir = os.path.join(data_dir, MANIFEST_SUBDIR)
+    if patterns is not None:
+        mode = "MANIFEST_GLOBS override"
+    elif os.path.isdir(subdir):
+        mode = f"root layout ({subdir}/ is a directory)"
+        patterns = ROOT_LAYOUT_GLOBS
+    else:
+        if os.path.lexists(subdir):
+            log.warning(
+                f"manifest scan: {subdir} exists but is not a directory — "
+                "treating DATA_DIR as the manifest directory itself"
+            )
+        mode = "manifest-dir layout (DATA_DIR is the manifest directory)"
+        patterns = MANIFEST_DIR_LAYOUT_GLOBS
+        excluded = EXCLUDED_BASENAMES
+    files = _glob_files(data_dir, patterns, excluded)
+    log.info(
+        f"manifest scan under {data_dir}: {mode}, patterns "
+        f"{', '.join(patterns)} — {len(files)} file(s)"
     )
+    return files
 
 
 def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
@@ -768,18 +929,18 @@ def main(*, corpus=None, data_dir=None):
     if data_dir is None:
         data_dir = os.environ.get("DATA_DIR", "/data")
     default_corpus = corpus if corpus is not None else os.environ.get("CORPUS", "central-bank")
-    sweep_max_fraction = float(os.environ.get("SWEEP_MAX_DELETE_FRACTION", "0.05"))
 
     if not database_url:
         log.error("DATABASE_URL is not set")
         sys.exit(1)
     try:
         gate = schema_gate.load_settings(os.environ)
-    except schema_gate.SettingsError as exc:
+        sweep_max_fraction = parse_sweep_fraction(os.environ)
+        jsonl_files = find_manifest_files(data_dir, os.environ)
+    except (schema_gate.SettingsError, IngestSettingsError) as exc:
         log.error(str(exc))
         sys.exit(1)
 
-    jsonl_files = find_jsonl_files(data_dir)
     if jsonl_files:
         log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
     else:
@@ -821,6 +982,7 @@ def main(*, corpus=None, data_dir=None):
                     row = parse_line(line, filepath, i, run_ts, default_corpus, counters)
                     if row:
                         rows.append(row)
+            rows = dedupe_rows(rows, filepath)
 
             if not rows:
                 log.info(f"{filepath}: 0 valid lines")

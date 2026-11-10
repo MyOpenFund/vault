@@ -136,7 +136,7 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
     late_holds_the_lock = threading.Event()  # LATE has it and is at the upsert
     early_blocked_on_lock = threading.Event()  # the database refused EARLY
 
-    def per_thread_manifests(_root):
+    def per_thread_manifests(*_args):
         return [str(manifests[threading.current_thread().name])]
 
     def probed_execute_values(cur, sql, rows, **kwargs):
@@ -175,7 +175,7 @@ def _run_both_concurrently(monkeypatch, stamps, manifests):
                 in_flight -= 1
 
     monkeypatch.setattr(ingest, "datetime", _PerThreadClock(stamps))
-    monkeypatch.setattr(ingest, "find_jsonl_files", per_thread_manifests)
+    monkeypatch.setattr(ingest, "find_manifest_files", per_thread_manifests)
     monkeypatch.setattr(ingest, "execute_values", probed_execute_values)
 
     failures = {}
