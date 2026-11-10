@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS runs (
 -- AND writers of this table. CREATE TABLE IF NOT EXISTS on an existing table
 -- locks nothing, but CREATE INDEX IF NOT EXISTS takes SHARE on the table
 -- before it notices the index exists -- which waits behind any uncommitted
--- INSERT (the orchestrator's) and then queues every reader behind it. So each
+-- INSERT (the orchestrator's) and then queues every later writer behind it. So each
 -- index is created only when to_regclass says it is missing; IF NOT EXISTS
 -- stays inside the guard as a race-proof no-op.
 DO $$
