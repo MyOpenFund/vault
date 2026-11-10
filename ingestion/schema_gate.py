@@ -44,7 +44,10 @@ ENV_LOCK_TIMEOUT = "VAULT_DDL_LOCK_TIMEOUT"
 ENV_RETRY_DELAYS = "VAULT_DDL_RETRY_DELAYS"
 ENV_FORCE = "VAULT_DDL_FORCE"
 
-# Defaults. 5 s bounds the queue a waiting train imposes on new readers; three
+# Defaults. 5 s bounds the queue a waiting train imposes on new readers. Below
+# about 1 s the train can lose against autovacuum: a vacuum holding SHARE
+# UPDATE EXCLUSIVE only yields to a waiting lock after deadlock_timeout
+# (1 s by default), so a shorter lock_timeout fires first. Three
 # attempts spread over ~45 s ride out a dashboard refresh or an API page
 # without stretching a nightly run. Both are operator-tunable (README,
 # .env.example), these are only the values used when nothing is set.
@@ -249,6 +252,10 @@ JOIN pg_class c ON c.oid = l.relation
 JOIN pg_stat_activity a ON a.pid = l.pid
 WHERE l.granted
   AND l.pid <> pg_backend_pid()
+  -- pg_locks spans the cluster: an OID from another database is not ours.
+  -- Database 0 holds the shared catalogs (pg_authid, for the roles).
+  AND (l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       OR l.database = 0)
   AND l.relation = ANY (
         SELECT to_regclass(r)::oid FROM unnest(%s::text[]) AS r
          WHERE to_regclass(r) IS NOT NULL)
@@ -275,7 +282,7 @@ def _describe_blockers(conn, relations):
             pass
         return f"could not list the blocking sessions ({type(exc).__name__})"
     if not rows:
-        return "no session holds a lock on the train's relations any more"
+        return "no session holds a lock on them any more"
     return "; ".join(
         f"pid={pid} user={user!r} application={app!r} state={state!r} "
         f"xact_age={age}s relations={rels}"
@@ -288,8 +295,15 @@ def _describe_blockers(conn, relations):
 _sleep = time.sleep
 
 
-def run_with_lock_retries(conn, apply, settings, relations, sleep=None):
+DEFAULT_LABEL = "schema/roles transaction"
+
+
+def run_with_lock_retries(conn, apply, settings, relations, sleep=None, label=DEFAULT_LABEL):
     """Run `apply(cur)` in one transaction under a bounded lock wait, retrying.
+
+    `label` names what the transaction holds (the train and the roles, or the
+    roles alone when the train is skipped), so the WARNINGs and the final
+    error say what was actually waiting.
 
     Each attempt: `SET LOCAL lock_timeout`, `apply(cur)`, commit. On
     LockNotAvailable: rollback, one WARNING naming the sessions holding locks
@@ -307,7 +321,7 @@ def run_with_lock_retries(conn, apply, settings, relations, sleep=None):
                 apply(cur)
             conn.commit()
             if attempt > 1:
-                log.info(f"DDL train applied on attempt {attempt}/{attempts}")
+                log.info(f"{label}: applied on attempt {attempt}/{attempts}")
             return
         except psycopg2.errors.LockNotAvailable:
             conn.rollback()
@@ -315,22 +329,19 @@ def run_with_lock_retries(conn, apply, settings, relations, sleep=None):
             conn.rollback()
             raise
         blockers = _describe_blockers(conn, relations)
+        head = (
+            f"{label}: attempt {attempt}/{attempts} could not get its locks within "
+            f"{settings.lock_timeout} ({ENV_LOCK_TIMEOUT}); sessions holding locks on "
+            f"the relations it needs: {blockers}"
+        )
         if attempt < attempts:
             delay = settings.retry_delays[attempt - 1]
-            log.warning(
-                f"DDL train attempt {attempt}/{attempts} could not get its locks within "
-                f"{settings.lock_timeout} ({ENV_LOCK_TIMEOUT}); blocking sessions: "
-                f"{blockers}; retrying in {delay:g}s"
-            )
+            log.warning(f"{head}; retrying in {delay:g}s")
             sleep(delay)
         else:
-            log.warning(
-                f"DDL train attempt {attempt}/{attempts} could not get its locks within "
-                f"{settings.lock_timeout} ({ENV_LOCK_TIMEOUT}); blocking sessions: "
-                f"{blockers}; giving up"
-            )
+            log.warning(f"{head}; giving up")
     raise TrainLockTimeout(
-        f"DDL train could not get its locks after {attempts} attempt(s) "
+        f"{label}: could not get its locks after {attempts} attempt(s) "
         f"({ENV_LOCK_TIMEOUT}={settings.lock_timeout}, "
         f"{ENV_RETRY_DELAYS}={','.join(f'{d:g}' for d in settings.retry_delays) or NO_RETRY}); "
         "nothing was ingested — see the WARNINGs above for the sessions holding the locks"

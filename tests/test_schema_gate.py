@@ -321,6 +321,33 @@ def test_a_failing_blocker_listing_never_masks_the_retry(caplog):
     assert any("could not list" in r.getMessage() for r in caplog.records)
 
 
+def test_the_blocker_query_is_scoped_to_this_database():
+    # pg_locks spans the cluster: a relation OID from another database (the
+    # Metabase application database) must not be reported as ours. Shared
+    # catalogs (pg_authid, for the roles) live in database 0.
+    assert "current_database()" in schema_gate.BLOCKERS_SQL
+    assert "l.database = 0" in schema_gate.BLOCKERS_SQL
+
+
+def test_the_label_names_what_was_running(caplog):
+    conn, apply = FakeConn(blockers=[]), Apply(fail=99)
+    settings = load_settings({"VAULT_DDL_RETRY_DELAYS": "none"})
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        with pytest.raises(schema_gate.TrainLockTimeout) as exc:
+            schema_gate.run_with_lock_retries(conn, apply, settings, RELATIONS,
+                                              sleep=lambda _s: None, label="roles only")
+    assert caplog.records[0].getMessage().startswith("roles only: attempt 1/1")
+    assert str(exc.value).startswith("roles only: ")
+
+
+def test_the_default_label_is_neutral(caplog):
+    conn, apply = FakeConn(blockers=[]), Apply(fail=1)
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        schema_gate.run_with_lock_retries(conn, apply, SETTINGS, RELATIONS, sleep=lambda _s: None)
+    assert caplog.records[0].getMessage().startswith("schema/roles transaction: attempt 1/3")
+    assert "sessions holding locks on the relations it needs" in caplog.records[0].getMessage()
+
+
 def test_the_blocker_query_never_reads_query_text():
     # pg_stat_activity.query can carry literals (a password in an ALTER ROLE,
     # client data in a WHERE): it must never reach the log.
@@ -389,33 +416,46 @@ def test_vault_schema_is_created_by_the_train_after_every_view():
         "sources_without_cadence", "source_health"))
 
 
+def _strip_comments(text):
+    import re
+    return re.sub(r"--[^\n]*", "", text)
+
+
+def _outside_do_blocks(text):
+    import re
+    return re.sub(r"DO \$\$.*?\$\$;", "", _strip_comments(text), flags=re.S)
+
+
 def test_runs_standalone_ddl_never_takes_a_lock_when_the_column_exists():
     # A bare ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
-    # even as a no-op (measured): it must sit behind an information_schema check.
-    import re
+    # even as a no-op (measured): it must sit behind an information_schema
+    # check; the IF NOT EXISTS stays inside the guard (a race-proof no-op).
     import ingest_runs
-    body = re.sub(r"--[^\n]*", "", ingest_runs.CREATE_RUNS_SQL)
-    assert "ADD COLUMN IF NOT EXISTS" not in body
+    body = _strip_comments(ingest_runs.CREATE_RUNS_SQL)
+    assert "ADD COLUMN IF NOT EXISTS corpus" in body
+    assert "ADD COLUMN" not in _outside_do_blocks(ingest_runs.CREATE_RUNS_SQL)
     assert "information_schema.columns" in body
     assert "UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator'" in body
 
 
 @pytest.mark.parametrize("module", ["ingest_cadence", "ingest_discovery_errors", "ingest_runs"])
-def test_no_per_pass_ddl_takes_an_access_exclusive_lock(module):
-    # Everything outside the gated train runs on every pass, next to readers:
-    # only statements measured as non-blocking are allowed there.
+def test_per_pass_ddl_is_all_behind_a_catalog_check(module):
+    # Everything outside the gated train runs on every pass, next to readers
+    # AND writers (the orchestrator INSERTs into runs). CREATE INDEX IF NOT
+    # EXISTS takes SHARE on its table before noticing the index exists, which
+    # waits behind any uncommitted INSERT; ALTER TABLE takes ACCESS EXCLUSIVE.
+    # So outside a DO block guarded by to_regclass / information_schema, only
+    # CREATE TABLE IF NOT EXISTS is allowed (on an existing table it locks
+    # nothing).
     import importlib
-    import re
     mod = importlib.import_module(module)
-    for name in dir(mod):
-        value = getattr(mod, name)
-        if not (name.startswith("CREATE_") and isinstance(value, str)):
-            continue
-        body = re.sub(r"--[^\n]*", "", value).upper()
-        for forbidden in ("DROP ", "TRUNCATE", "ALTER TABLE", "LOCK TABLE"):
-            if forbidden == "ALTER TABLE" and module == "ingest_runs":
-                continue  # inside the information_schema-guarded DO block, pinned above
-            assert forbidden not in body, f"{module}.{name} runs {forbidden.strip()} on every pass"
+    names = [n for n in dir(mod) if n.startswith("CREATE_") and isinstance(getattr(mod, n), str)]
+    assert names
+    for name in names:
+        bare = _outside_do_blocks(getattr(mod, name)).upper()
+        for forbidden in ("CREATE INDEX", "CREATE UNIQUE INDEX", "ALTER TABLE", "DROP ",
+                          "TRUNCATE", "LOCK TABLE"):
+            assert forbidden not in bare, f"{module}.{name} runs {forbidden.strip()} unguarded"
 
 
 def test_settings_are_validated_before_connecting(monkeypatch):

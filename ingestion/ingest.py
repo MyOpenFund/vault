@@ -134,8 +134,10 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- The rename only happens when source_code is absent. When BOTH columns exist
 -- (a half-applied migration, a column added by hand), renaming would fail and
 -- dropping would lose data: source_code is filled from bank_code where it is
--- NULL, bank_code is KEPT for a human to inspect and drop, and a WARNING says
--- so (forwarded to the ingester's log).
+-- NULL, bank_code is KEPT for a human to inspect and drop (made nullable: the
+-- upsert writes source_code only, so a NOT NULL bank_code would reject every
+-- new document), and a WARNING says so. ingest.py also detects this state
+-- from the catalog and logs it on every pass until bank_code is dropped.
 DO $$
 DECLARE
     has_bank   boolean;
@@ -151,6 +153,7 @@ BEGIN
     IF has_bank AND NOT has_source THEN
         ALTER TABLE documents RENAME COLUMN bank_code TO source_code;
     ELSIF has_bank AND has_source THEN
+        ALTER TABLE documents ALTER COLUMN bank_code DROP NOT NULL;
         UPDATE documents SET source_code = bank_code
          WHERE source_code IS NULL AND bank_code IS NOT NULL;
         GET DIAGNOSTICS filled = ROW_COUNT;
@@ -686,15 +689,35 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
     )
 
 
-def _forward_server_warnings(conn):
-    """Log the train's RAISE WARNINGs (e.g. both bank_code and source_code)."""
-    notices = getattr(conn, "notices", None)
-    if notices is None:
-        return
-    for notice in notices:
-        if notice.startswith("WARNING:"):
-            log.warning(f"DDL train: {notice.strip()}")
-    del notices[:]
+# Shared catalog the roles' ALTER ROLE / CREATE ROLE write to: a session
+# altering a vault role holds a lock on it, so the blocker listing includes it
+# whenever roles are provisioned.
+ROLES_CATALOG = "pg_authid"
+
+BOTH_CODE_COLUMNS_SQL = """
+SELECT count(*) = 2 FROM information_schema.columns
+ WHERE table_schema = current_schema() AND table_name = 'documents'
+   AND column_name IN ('bank_code', 'source_code')
+"""
+
+
+def warn_if_both_code_columns(conn):
+    """F8 leftover: a catalog read (no table lock), logged on every pass.
+
+    Not taken from the train's RAISE WARNING (a server notice the driver may
+    drop, and emitted only on the night the train runs): the state is checked
+    directly, so the WARNING repeats until a human drops bank_code.
+    """
+    with conn.cursor() as cur:
+        cur.execute(BOTH_CODE_COLUMNS_SQL)
+        (both,) = cur.fetchone()
+    conn.commit()
+    if both:
+        log.warning(
+            "documents has both bank_code and source_code: source_code was filled "
+            "from bank_code where NULL and bank_code was kept (nullable). Check it, "
+            "then drop it by hand: ALTER TABLE documents DROP COLUMN bank_code"
+        )
 
 
 def apply_schema(conn, gate, passwords):
@@ -720,16 +743,17 @@ def apply_schema(conn, gate, passwords):
 
     def apply(cur):
         if reason is not None:
-            if getattr(conn, "notices", None) is not None:
-                del conn.notices[:]          # only this attempt's notices are reported
             cur.execute(CREATE_TABLE_SQL)
             cur.execute(RECORD_FINGERPRINT_SQL, (TRAIN_FINGERPRINT,))
         roles.ensure_roles(cur, passwords)
 
-    schema_gate.run_with_lock_retries(conn, apply, gate, EXPECTED_RELATIONS)
+    label = (f"{schema_gate.DEFAULT_LABEL} (DDL train + roles)" if reason is not None
+             else f"{schema_gate.DEFAULT_LABEL} (roles only, DDL train skipped)")
+    relations = EXPECTED_RELATIONS + ((ROLES_CATALOG,) if passwords else ())
+    schema_gate.run_with_lock_retries(conn, apply, gate, relations, label=label)
     if reason is not None:
-        _forward_server_warnings(conn)
         log.info(f"DDL train applied; fingerprint {TRAIN_FINGERPRINT[:12]} recorded")
+    warn_if_both_code_columns(conn)
 
 
 def main(*, corpus=None, data_dir=None):

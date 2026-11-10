@@ -88,9 +88,10 @@ def _min_retain_fraction():
     )
 
 # Discovery-failure table, owned and populated by this module. Included here
-# too (verbatim, indexes included) so this module stays usable standalone,
+# too (same table and indexes) so this module stays usable standalone,
 # mirroring ingest.py's DDL train — the duplication between the two is
-# deliberate, not drift (see ingest_runs.py for the same pattern).
+# deliberate, not drift (see ingest_runs.py for the same pattern). Unlike the
+# train, every index here sits behind a catalog check (see below).
 CREATE_ERRORS_SQL = """
 CREATE TABLE IF NOT EXISTS discovery_errors (
     fingerprint   TEXT PRIMARY KEY,  -- sha256(corpus|source_code|context|url|error_class)
@@ -112,13 +113,29 @@ CREATE TABLE IF NOT EXISTS discovery_errors (
     extra         JSONB
 );
 
-CREATE INDEX IF NOT EXISTS idx_discovery_errors_corpus_source
-    ON discovery_errors (corpus, source_code);
-CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
-    ON discovery_errors (corpus, source_code, last_seen_at DESC)
-    WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
-    ON discovery_errors (last_run_id);
+-- Runs on EVERY pass, outside the gated DDL train (vault #4), next to readers
+-- AND writers of this table. CREATE TABLE IF NOT EXISTS on an existing table
+-- locks nothing, but CREATE INDEX IF NOT EXISTS takes SHARE on the table
+-- before it notices the index exists -- which waits behind any uncommitted
+-- INSERT (the orchestrator's) and then queues every reader behind it. So each
+-- index is created only when to_regclass says it is missing; IF NOT EXISTS
+-- stays inside the guard as a race-proof no-op.
+DO $$
+BEGIN
+    IF to_regclass('idx_discovery_errors_corpus_source') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_discovery_errors_corpus_source
+            ON discovery_errors (corpus, source_code);
+    END IF;
+    IF to_regclass('idx_discovery_errors_open') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
+            ON discovery_errors (corpus, source_code, last_seen_at DESC)
+            WHERE resolved_at IS NULL;
+    END IF;
+    IF to_regclass('idx_discovery_errors_last_run') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
+            ON discovery_errors (last_run_id);
+    END IF;
+END $$;
 """
 
 UPSERT_ERRORS_SQL = """

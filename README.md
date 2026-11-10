@@ -130,30 +130,49 @@ them (#4). So the train is **gated** (`ingestion/schema_gate.py`):
 - It runs only when the sha256 of its SQL differs from the one recorded in the one-row table
   `vault_schema`, when one of the tables or views it owns is missing, or when
   `VAULT_DDL_FORCE=1`. Otherwise the run logs `schema current (fingerprint …) — DDL train
-  skipped` and takes no DDL lock at all. Editing the train (comments included) re-runs it once.
-- When it runs, each lock wait is bounded by `VAULT_DDL_LOCK_TIMEOUT` (default `5s`; a
-  Postgres duration: `500ms`, `5s`, `1min`), and the train is retried after each delay of
+  skipped` and issues no DDL against an existing table, index or view (see the per-pass list
+  below). Editing the train (comments included) re-runs it once.
+- When it runs, each lock wait is bounded by `VAULT_DDL_LOCK_TIMEOUT` (default `5s`; an
+  integer with an optional unit `ms`, `s` or `min`, no unit = milliseconds). Below about `1s`
+  the train can lose against autovacuum, which only yields to a waiting lock after
+  `deadlock_timeout` (1 s by default). The transaction is retried after each delay of
   `VAULT_DDL_RETRY_DELAYS` (default `10,30` seconds = three attempts; `none` = one attempt).
-  Each failed attempt logs one WARNING listing the sessions holding locks on the train's
-  relations (pid, user, application, state, transaction age — never their query text).
+  Each failed attempt logs one WARNING, prefixed `schema/roles transaction (DDL train + roles)`
+  or `(roles only, DDL train skipped)`, listing the sessions holding locks on the relations it
+  needs (pid, user, application, state, transaction age — never their query text).
 - After the last attempt the run **fails** (non-zero exit, `TrainLockTimeout`) and ingests
   nothing: new code may need the new schema. Re-run when the listed sessions are gone, or with
   a longer `VAULT_DDL_LOCK_TIMEOUT`.
 - `VAULT_DDL_FORCE=1` is for drift the gate cannot see (a column dropped or an index changed by
   hand): `docker compose run --rm -e VAULT_DDL_FORCE=1 ingestion`, once. Left set, it brings
   the nightly lock convoy back.
-- The roles and grants (see [Access & roles](#access--roles)) and the per-pass statements of the
-  cadence, runs and discovery-error passes run on every pass; they only take locks that coexist
-  with readers (`CREATE … IF NOT EXISTS` on existing objects, `GRANT`, `ALTER ROLE`, row
-  updates). `runs.corpus` is added behind a catalog check, not with `ADD COLUMN IF NOT EXISTS`.
+- What runs on every pass, train skipped or not: the roles and grants (see
+  [Access & roles](#access--roles); `GRANT`/`REVOKE`/`ALTER ROLE`, inside the same bounded,
+  retried transaction), `CREATE TABLE IF NOT EXISTS` for `cadence`, `runs` and
+  `discovery_errors` (locks nothing when the table exists), and row-level `INSERT`/`UPDATE`/
+  `DELETE`. Every `CREATE INDEX` and the `runs.corpus` `ADD COLUMN` of those passes sit behind
+  a `to_regclass` / `information_schema` check, because even as no-ops they would take SHARE
+  (waits behind an uncommitted writer) or ACCESS EXCLUSIVE (waits behind any reader). Tested:
+  a skipped pass completes beside a reader holding every table and view, and beside
+  uncommitted `INSERT`s into `runs` and `discovery_errors`.
+- The `rag-orchestrator` → `data-orchestrator` relabel of `runs.tool` runs whenever the train
+  runs and on every pass whose `runs.jsonl` offers rows.
 - Legacy shapes converge in the train: each of `created_at`, `updated_at`, `last_seen_at`,
   `deleted_at` is upgraded from naive `TIMESTAMP` on its own (`AT TIME ZONE 'UTC'`);
   `bank_code` is renamed to `source_code` only when `source_code` is absent — when both exist,
-  `source_code` is filled from `bank_code` where NULL, `bank_code` is **kept**, and a WARNING
-  asks for it to be dropped by hand.
+  `source_code` is filled from `bank_code` where NULL, `bank_code` is **kept** (made nullable),
+  and a WARNING on every pass asks for it to be dropped by hand.
 
 First run after deploying the gate: `vault_schema` does not exist yet, so that run applies the
 train once (under the timeout) and records the fingerprint; later runs skip it.
+
+**Rollback and mixed versions.** Code from before the gate ignores `vault_schema` and runs its
+own train on every pass, so after a rollback to it — and once more after rolling forward again —
+the recorded fingerprint can no longer be trusted to describe the schema: run the gated code once
+with `VAULT_DDL_FORCE=1`. Two services on different code versions against the same database
+(e.g. two corpora deployed at different times) see different fingerprints and re-run the train
+alternately, each time the other one has recorded its own — the nightly lock convoy comes back
+until both run the same tree.
 
 ### Migration (2026-09 substrate)
 

@@ -162,8 +162,10 @@ def test_a_full_pass_completes_beside_a_reader_holding_every_relation(
     assert "DDL train skipped" in caplog.text
     assert reader.held(clean_db) >= set(TABLES + VIEWS), "the reader lost its locks mid-test"
     assert fetch_all(clean_db, "SELECT count(*) FROM documents")[0][0] == 3
-    assert fetch_all(clean_db, "SELECT count(*) FROM runs")[0][0] == 2
-    assert fetch_all(clean_db, "SELECT count(*) FROM cadence")[0][0] == 1
+    assert fetch_all(clean_db, "SELECT run_id FROM runs WHERE run_id IN ('r1', 'r2') "
+                               "ORDER BY run_id") == [("r1",), ("r2",)]
+    assert fetch_all(clean_db, "SELECT count(*) FROM cadence "
+                               "WHERE corpus = 'central-bank'")[0][0] == 1
     assert fetch_all(clean_db, "SELECT count(*) FROM discovery_errors")[0][0] == 3
     assert view_oids(clean_db) == oids
 
@@ -190,8 +192,9 @@ def test_a_stale_train_behind_a_stuck_reader_fails_after_every_attempt(
             run_ingest(monkeypatch, clean_db, tmp_path)
 
     attempts = [r.getMessage() for r in caplog.records
-                if r.levelno == logging.WARNING and "DDL train attempt" in r.getMessage()]
+                if r.levelno == logging.WARNING and "could not get its locks" in r.getMessage()]
     assert len(attempts) == 3
+    assert all(m.startswith("schema/roles transaction (DDL train + roles)") for m in attempts)
     assert [m.split("attempt ")[1].split(" ")[0] for m in attempts] == ["1/3", "2/3", "3/3"]
     for message in attempts:
         assert f"pid={reader.pid}" in message
@@ -451,9 +454,38 @@ def test_both_code_columns_with_data_backfill_and_keep_bank_code(
                if "bank_code" in r.getMessage() and "source_code" in r.getMessage()]
     assert warning, "the both-columns case was not reported"
 
+    # Reported on every pass until a human drops bank_code, not only by the
+    # train that saw it: a one-off WARNING on one night is a forgotten one.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        run_ingest(monkeypatch, clean_db, tmp_path)        # train skipped
+    assert any("bank_code" in r.getMessage() and "source_code" in r.getMessage()
+               for r in caplog.records), "the both-columns state is no longer reported"
+
     monkeypatch.setenv("VAULT_DDL_FORCE", "1")    # the train again, on the converged shape
     run_ingest(monkeypatch, clean_db, tmp_path)
     assert fetch_all(clean_db, "SELECT count(*) FROM documents WHERE bank_code IS NOT NULL")[0][0] == 2
+
+
+def test_a_not_null_bank_code_beside_source_code_does_not_break_the_upsert(
+    clean_db, tmp_path, monkeypatch
+):
+    # The upsert writes source_code only: a bank_code kept NOT NULL would make
+    # every new document fail. The train relaxes it (the column is kept).
+    _exec(clean_db, LEGACY_DOCUMENTS.format(
+        code_columns="bank_code TEXT NOT NULL, source_code TEXT",
+        created_type="TIMESTAMPTZ", updated_type="TIMESTAMPTZ",
+        last_seen_type="TIMESTAMPTZ", deleted_type="TIMESTAMPTZ",
+    ) + "INSERT INTO documents (doc_id, bank_code, source_code) VALUES ('old', 'fr', NULL);")
+    write_manifest(tmp_path, "m.jsonl", [make_doc("old", source="fr"), make_doc("brand-new")])
+
+    run_ingest(monkeypatch, clean_db, tmp_path)
+
+    assert fetch_all(clean_db, "SELECT doc_id, bank_code, source_code FROM documents "
+                               "ORDER BY doc_id") == [
+        ("brand-new", None, "us"),
+        ("old", "fr", "fr"),
+    ]
 
 
 def test_runs_pass_adds_the_corpus_column_and_renames_the_old_tool(clean_db, tmp_path, monkeypatch):
@@ -495,3 +527,158 @@ def test_runs_standalone_ddl_adds_a_missing_corpus_column(clean_db, monkeypatch,
         conn.close()
     assert fetch_all(clean_db, "SELECT run_id, tool, corpus FROM runs") == [
         ("old", "data-orchestrator", "central-bank")]
+
+
+# ---------------------------------------------------------------------------
+# Upgrade of a database built by the pre-gate code (master 7642aa5).
+
+PRE_GATE_TRAIN = (Path(__file__).parent.parent / "fixtures" / "pre_gate_train.sql").read_text(
+    encoding="utf-8")
+
+
+def test_a_pre_gate_database_is_upgraded_once_then_skipped(
+    clean_db, tmp_path, monkeypatch, caplog
+):
+    """The NAS on deploy day: schema, roles, grants and data all built by the old
+    train, no vault_schema. The first gated run applies the train once (views
+    recreated, grants re-issued on them), touches no data, records the
+    fingerprint; the second run skips."""
+    import ingest
+    import roles
+
+    _exec(clean_db, "DROP TABLE IF EXISTS cadence, runs CASCADE")
+    conn = psycopg2.connect(clean_db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(PRE_GATE_TRAIN)
+            roles.ensure_roles(cur, {"vault_orchestrator": ORCH_PW, "vault_readonly": RO_PW})
+            cur.execute(
+                "INSERT INTO documents (doc_id, corpus, source_code, title, last_seen_at) VALUES "
+                "('keep-1', 'central-bank', 'us', 't1', now()), "
+                "('keep-2', 'central-bank', 'fr', 't2', now())")
+            cur.execute(
+                "INSERT INTO rag_ingestions (doc_id, collection, corpus, embedding_model, chunk_count) "
+                "VALUES ('keep-1', 'c1', 'central-bank', 'e1', 3)")
+            cur.execute(
+                "INSERT INTO runs (run_id, tool, corpus, finished_at, sources) VALUES "
+                "('pre-1', 'central-bank-corpus', 'central-bank', now(), "
+                "'[{\"source_code\": \"us\", \"docs_seen\": 2}]')")
+        conn.commit()
+    finally:
+        conn.close()
+    assert fetch_all(clean_db, "SELECT to_regclass('vault_schema')") == [(None,)]
+
+    def data():
+        return (
+            fetch_all(clean_db, "SELECT doc_id, corpus, source_code, title, deleted_at "
+                                "FROM documents ORDER BY doc_id"),
+            fetch_all(clean_db, "SELECT doc_id, collection, chunk_count FROM rag_ingestions"),
+            fetch_all(clean_db, "SELECT run_id, tool, corpus FROM runs"),
+            fetch_all(clean_db, "SELECT run_id, source_code, docs_seen FROM runs_sources"),
+        )
+
+    before_data, before_oids = data(), view_oids(clean_db)
+    monkeypatch.setenv("VAULT_ORCHESTRATOR_PASSWORD", ORCH_PW)
+    monkeypatch.setenv("VAULT_READONLY_PASSWORD", RO_PW)
+
+    with caplog.at_level(logging.INFO):
+        run_ingest(monkeypatch, clean_db, tmp_path)     # empty data dir: no sweep
+    assert "DDL train running: missing relation(s): vault_schema" in caplog.text
+    assert fetch_all(clean_db, "SELECT fingerprint FROM vault_schema") == [
+        (ingest.TRAIN_FINGERPRINT,)]
+    assert data() == before_data
+    after_first = view_oids(clean_db)
+    assert after_first != before_oids, "the first gated run did not apply the train"
+
+    def grants_hold():
+        for role, pw in (("vault_orchestrator", ORCH_PW), ("vault_readonly", RO_PW)):
+            c = role_conn(clean_db, role, pw)
+            try:
+                for rel in TABLES + VIEWS:
+                    with c.cursor() as cur:
+                        cur.execute(f"SELECT count(*) FROM {rel}")
+                        cur.fetchone()
+            finally:
+                c.close()
+
+    grants_hold()
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert "DDL train skipped" in caplog.text
+    assert view_oids(clean_db) == after_first
+    assert data() == before_data
+    grants_hold()
+
+
+# ---------------------------------------------------------------------------
+# Roles under the bounded wait, and writers beside a skipped pass.
+
+
+def test_roles_blocked_by_an_uncommitted_alter_role_are_retried_and_diagnosed(
+    clean_db, tmp_path, monkeypatch, fast_gate, caplog
+):
+    import schema_gate
+
+    monkeypatch.setenv("VAULT_ORCHESTRATOR_PASSWORD", ORCH_PW)
+    monkeypatch.setenv("VAULT_READONLY_PASSWORD", RO_PW)
+    run_ingest(monkeypatch, clean_db, tmp_path)        # schema current, roles exist
+
+    blocker = psycopg2.connect(clean_db, application_name="role-editor")
+    try:
+        with blocker.cursor() as cur:
+            cur.execute("ALTER ROLE vault_orchestrator CONNECTION LIMIT 7")   # not committed
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(schema_gate.TrainLockTimeout) as exc:
+                run_ingest(monkeypatch, clean_db, tmp_path)
+        attempts = [r.getMessage() for r in caplog.records
+                    if "could not get its locks" in r.getMessage()]
+        assert len(attempts) == 3, "role lock waits were not retried"
+        for message in attempts:
+            assert message.startswith("schema/roles transaction (roles only, DDL train skipped)")
+            assert f"pid={blocker.get_backend_pid()}" in message
+            assert "'role-editor'" in message
+        assert "DDL train skipped" in caplog.text
+        assert "roles only" in str(exc.value)
+        # secrets discipline on the new path: no password anywhere
+        assert ORCH_PW not in caplog.text and RO_PW not in caplog.text
+        chained = exc.value.__cause__ or exc.value.__context__
+        assert chained is None or ORCH_PW not in repr(chained)
+    finally:
+        blocker.rollback()
+        blocker.close()
+    run_ingest(monkeypatch, clean_db, tmp_path)        # the blocker gone: the run passes
+
+
+def test_a_skipped_pass_completes_beside_uncommitted_writers(
+    clean_db, tmp_path, monkeypatch, fast_gate, caplog
+):
+    """The orchestrator INSERTs into runs (and a future writer into
+    discovery_errors) on its own schedule. A skipped pass must not take any
+    lock that conflicts with their ROW EXCLUSIVE: no CREATE INDEX on an
+    existing table, no ALTER."""
+    monkeypatch.setenv("VAULT_ORCHESTRATOR_PASSWORD", ORCH_PW)
+    monkeypatch.setenv("VAULT_READONLY_PASSWORD", RO_PW)
+    data = full_data_dir(tmp_path)
+    run_ingest(monkeypatch, clean_db, data)
+
+    writer = psycopg2.connect(clean_db, application_name="open-writer")
+    try:
+        with writer.cursor() as cur:
+            cur.execute("INSERT INTO runs (run_id, tool) VALUES ('writer-1', 'data-orchestrator')")
+            cur.execute("INSERT INTO discovery_errors (fingerprint, corpus, first_seen_at, "
+                        "last_seen_at) VALUES ('writer-fp', 'other-corpus', now(), now())")
+        monkeypatch.setenv("PGOPTIONS", "-c lock_timeout=2000")
+        (data / "runs.jsonl").write_text(
+            (data / "runs.jsonl").read_text(encoding="utf-8")
+            + json.dumps({"run_id": "r2", "tool": "central-bank-corpus"}) + "\n",
+            encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            run_ingest(monkeypatch, clean_db, data)
+        assert "DDL train skipped" in caplog.text
+    finally:
+        writer.rollback()
+        writer.close()
+    assert fetch_all(clean_db, "SELECT run_id FROM runs WHERE run_id IN ('r1', 'r2', 'writer-1') "
+                               "ORDER BY run_id") == [("r1",), ("r2",)]

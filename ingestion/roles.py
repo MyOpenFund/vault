@@ -30,6 +30,7 @@ interpolated, never logged, and never allowed to travel inside an exception
 
 import logging
 
+import psycopg2.errors
 from psycopg2 import sql
 
 log = logging.getLogger("ingest")
@@ -216,16 +217,27 @@ def _provision(cur, role, password, dbname, quiet=False):
         for tpl in grant_templates(role)
     ]
     failed = False
+    lock_timeout = False
     for statement in statements:
         try:
             cur.execute(statement)
-        except Exception:
+        except Exception as exc:
             # Clear this frame before the traceback captures it: `statement`,
             # `statements` and `alter_role` hold a Literal whose repr is the
             # password, and a --showlocals-style reporter would print it.
             statement = statements = alter_role = password = None
+            lock_timeout = isinstance(exc, psycopg2.errors.LockNotAvailable)
+            exc = None
             failed = True
             break
+    if lock_timeout:
+        # A lock wait cut short by the schema/roles transaction's lock_timeout
+        # (another session altering the same role, typically). Re-raised as a
+        # FRESH LockNotAvailable -- no cursor, no cur.query, no password, no
+        # chained driver error -- so schema_gate's retry wrapper recognises it,
+        # retries and lists the sessions in the way, instead of failing hard.
+        raise psycopg2.errors.LockNotAvailable(
+            f"lock timeout while provisioning role {role}") from None
     if failed:
         # Raised OUTSIDE the handler on purpose: inside it, Python would set
         # __context__ to the driver error being handled, and that error carries

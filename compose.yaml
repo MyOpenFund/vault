@@ -90,7 +90,9 @@ services:
       # ingestion/schema_gate.py. The train only runs when its text changed
       # (or a relation it owns is missing), under this lock_timeout, retried
       # after each delay; if it never gets its locks the run fails, ingesting
-      # nothing. VAULT_DDL_FORCE=1 runs it anyway (manual drift) — one run only.
+      # nothing. VAULT_DDL_LOCK_TIMEOUT: integer + ms/s/min (below ~1s it can
+      # lose against autovacuum). VAULT_DDL_FORCE=1 runs it anyway (manual
+      # drift, or after a rollback to pre-gate code) — one run only.
       VAULT_DDL_LOCK_TIMEOUT: ${VAULT_DDL_LOCK_TIMEOUT:-}
       VAULT_DDL_RETRY_DELAYS: ${VAULT_DDL_RETRY_DELAYS:-}
       VAULT_DDL_FORCE: ${VAULT_DDL_FORCE:-}

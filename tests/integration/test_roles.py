@@ -148,7 +148,9 @@ def test_view_grants_survive_the_nightly_drop_and_recreate(clean_db, tmp_path, m
     # The regression this chantier exists for: the train DROPs every view at its
     # head and recreates it at its tail, so a grant issued once would be gone
     # after the second run. One train would pass even with a broken design.
+    # The train is gated (#4): the second one must be forced to really re-run.
     train(monkeypatch, clean_db, tmp_path)
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")
     train(monkeypatch, clean_db, tmp_path)
     for role in ROLES:
         for view in VIEWS:

@@ -34,6 +34,9 @@ def _names(pg_url, sql):
 
 def test_new_indexes_exist_and_train_is_idempotent(clean_db, tmp_path, monkeypatch):
     run_ingest(monkeypatch, clean_db, tmp_path)  # empty data dir: DDL only
+    # The train is gated (#4): force it, or the second run would skip it and
+    # prove nothing about the train's idempotency.
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")
     run_ingest(monkeypatch, clean_db, tmp_path)  # run twice: prove idempotency
     defs = dict(fetch_all(
         clean_db,
@@ -47,6 +50,7 @@ def test_new_indexes_exist_and_train_is_idempotent(clean_db, tmp_path, monkeypat
 
 
 def test_views_exist_and_train_is_idempotent(clean_db, tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")  # gated (#4): three real trains
     for _ in range(3):  # I6: three consecutive trains
         run_ingest(monkeypatch, clean_db, tmp_path)
     names = _names(clean_db, "SELECT table_name FROM information_schema.views WHERE table_schema = current_schema()")
@@ -97,6 +101,7 @@ def test_three_whole_ingester_runs_are_idempotent(clean_db, tmp_path, monkeypatc
     assert len(first["errors"]) == 3
     assert first["cadence"] == 2 and first["runs"] == 1
 
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")  # gated (#4): the train re-runs too
     for _ in range(2):  # runs 2 and 3
         run_ingest(monkeypatch, clean_db, tmp_path)
         assert _snapshot(clean_db) == first
