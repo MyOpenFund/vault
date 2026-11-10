@@ -122,7 +122,20 @@ CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
 -- corpus's data/ get the ingesting service's CORPUS; the data-orchestrator
 -- is corpus-agnostic and leaves it NULL. Rows ingested before the column
 -- existed carried `corpus` inside extra (unknown-field rule): backfilled.
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+-- This SQL runs on EVERY pass, outside the gated DDL train, next to readers
+-- of `runs` (the MCP's vault_runs_status): a bare ADD COLUMN IF NOT EXISTS
+-- takes ACCESS EXCLUSIVE even when it is a no-op (measured, vault #4), so the
+-- ALTER only runs when the catalog says the column is really missing.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'runs' AND column_name = 'corpus'
+    ) THEN
+        ALTER TABLE runs ADD COLUMN corpus TEXT;
+    END IF;
+END $$;
 -- The type guard matters: `extra ->> 'corpus'` renders a JSON number or
 -- object as text, so an unguarded backfill would promote `{"corpus": 42}`
 -- into a corpus named '42'. The value is otherwise taken as-is -- this is a
@@ -131,6 +144,12 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
 UPDATE runs SET corpus = extra ->> 'corpus'
  WHERE corpus IS NULL AND jsonb_typeof(extra -> 'corpus') = 'string';
 CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
+
+-- Producer rename (2026-09-02), same as in the DDL train: rows written under
+-- the old 'rag-orchestrator' identity are relabeled 'data-orchestrator'.
+-- Repeated here because the train no longer runs on every pass; row locks
+-- only, and a no-op once applied.
+UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
 """
 
 INSERT_RUNS_SQL = """

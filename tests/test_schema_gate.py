@@ -328,3 +328,105 @@ def test_the_blocker_query_never_reads_query_text():
     assert not re.search(r"\bquery\b", schema_gate.BLOCKERS_SQL, re.IGNORECASE)
     for column in ("pid", "usename", "application_name", "state", "xact_start"):
         assert column in schema_gate.BLOCKERS_SQL
+
+
+# ---------------------------------------------------------------------------
+# stale_reason: the gate decision itself
+
+
+FP = "a" * 64
+
+
+def test_current_schema_needs_no_train():
+    assert schema_gate.stale_reason(FP, FP, missing=(), force=False) is None
+
+
+def test_force_always_runs_the_train():
+    assert "VAULT_DDL_FORCE" in schema_gate.stale_reason(FP, FP, missing=(), force=True)
+
+
+def test_no_stored_fingerprint_runs_the_train():
+    assert "no fingerprint" in schema_gate.stale_reason(None, FP, missing=(), force=False)
+
+
+def test_changed_fingerprint_runs_the_train():
+    reason = schema_gate.stale_reason("b" * 64, FP, missing=(), force=False)
+    assert "changed" in reason and "bbbbbbbbbbbb" in reason and "aaaaaaaaaaaa" in reason
+
+
+def test_missing_relation_runs_the_train_even_with_a_matching_fingerprint():
+    reason = schema_gate.stale_reason(FP, FP, missing=("source_health", "cadence"), force=False)
+    assert "source_health" in reason and "cadence" in reason
+
+
+# ---------------------------------------------------------------------------
+# the real train
+
+
+def test_the_real_train_owns_exactly_these_relations():
+    # Hand-written on purpose: a parse slip in expected_relations (a comment
+    # read as a statement, a view missed) would silently weaken the gate.
+    import ingest
+    assert set(ingest.EXPECTED_RELATIONS) == {
+        "documents", "rag_ingestions", "cadence", "runs", "discovery_errors",
+        "vault_schema", "runs_sources", "rag_backlog", "rag_backlog_any",
+        "sources_without_cadence", "source_health",
+    }
+    assert len(ingest.EXPECTED_RELATIONS) == 11
+
+
+def test_the_fingerprint_is_the_hash_of_the_train_text():
+    import ingest
+    assert ingest.TRAIN_FINGERPRINT == schema_gate.fingerprint(ingest.CREATE_TABLE_SQL)
+
+
+def test_vault_schema_is_created_by_the_train_after_every_view():
+    import ingest
+    sql_text = ingest.CREATE_TABLE_SQL
+    tail = sql_text.index("CREATE TABLE IF NOT EXISTS vault_schema")
+    assert all(sql_text.index(f"CREATE VIEW {v}") < tail for v in (
+        "runs_sources", "rag_backlog", "rag_backlog_any",
+        "sources_without_cadence", "source_health"))
+
+
+def test_runs_standalone_ddl_never_takes_a_lock_when_the_column_exists():
+    # A bare ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
+    # even as a no-op (measured): it must sit behind an information_schema check.
+    import re
+    import ingest_runs
+    body = re.sub(r"--[^\n]*", "", ingest_runs.CREATE_RUNS_SQL)
+    assert "ADD COLUMN IF NOT EXISTS" not in body
+    assert "information_schema.columns" in body
+    assert "UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator'" in body
+
+
+@pytest.mark.parametrize("module", ["ingest_cadence", "ingest_discovery_errors", "ingest_runs"])
+def test_no_per_pass_ddl_takes_an_access_exclusive_lock(module):
+    # Everything outside the gated train runs on every pass, next to readers:
+    # only statements measured as non-blocking are allowed there.
+    import importlib
+    import re
+    mod = importlib.import_module(module)
+    for name in dir(mod):
+        value = getattr(mod, name)
+        if not (name.startswith("CREATE_") and isinstance(value, str)):
+            continue
+        body = re.sub(r"--[^\n]*", "", value).upper()
+        for forbidden in ("DROP ", "TRUNCATE", "ALTER TABLE", "LOCK TABLE"):
+            if forbidden == "ALTER TABLE" and module == "ingest_runs":
+                continue  # inside the information_schema-guarded DO block, pinned above
+            assert forbidden not in body, f"{module}.{name} runs {forbidden.strip()} on every pass"
+
+
+def test_settings_are_validated_before_connecting(monkeypatch):
+    import ingest
+
+    def never(*_a, **_k):
+        raise AssertionError("connected despite an invalid VAULT_DDL_* setting")
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    monkeypatch.setenv("VAULT_DDL_RETRY_DELAYS", "10,,30")
+    monkeypatch.setattr(ingest.psycopg2, "connect", never)
+    with pytest.raises(SystemExit) as exc:
+        ingest.main(corpus="central-bank", data_dir="/nowhere")
+    assert exc.value.code == 1

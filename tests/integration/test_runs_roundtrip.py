@@ -147,6 +147,9 @@ def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
         )
     conn.close()
 
+    # The train is gated (#4): force it, so this pins the train's own rename.
+    # The runs pass renames too, on every pass (test_schema_gate.py).
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")
     run_ingest(monkeypatch, clean_db, tmp_path)  # train runs again: migration fires
 
     rows = _rows(clean_db, "SELECT run_id, tool FROM runs ORDER BY run_id")
@@ -157,9 +160,9 @@ def test_legacy_tool_identity_is_renamed_by_the_ddl_train(
 
 
 def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
-    # Every service run re-executes the full DDL train, so the rename UPDATE
-    # must be safe to run repeatedly: once rows are relabeled, later runs
-    # must not touch row count or values again.
+    # The rename UPDATE runs whenever the train does (forced here: it is gated,
+    # #4) and on every runs pass, so it must be safe to run repeatedly: once
+    # rows are relabeled, later runs must not touch row count or values again.
     from .conftest import run_ingest
 
     conn = psycopg2.connect(clean_db)
@@ -179,6 +182,7 @@ def test_tool_identity_migration_is_idempotent(clean_db, tmp_path, monkeypatch):
         )
     conn.close()
 
+    monkeypatch.setenv("VAULT_DDL_FORCE", "1")
     run_ingest(monkeypatch, clean_db, tmp_path)  # first migration
     first = _rows(clean_db, "SELECT run_id, tool FROM runs ORDER BY run_id")
 

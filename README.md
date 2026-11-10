@@ -93,7 +93,7 @@ One row per failure fingerprint `sha256(corpus|source_code|context|url|error_cla
 
 ### Views
 
-Dropped and recreated by every ingestion run, in dependency order, without CASCADE — nothing outside the ingester's DDL train may depend on them (Metabase and the agent reference them by name at query time, which is fine).
+Dropped and recreated by the DDL train whenever it runs (see [Schema migrations](#schema-migrations): only when the train's SQL changed or a relation is missing, not every night), in dependency order, without CASCADE — nothing outside the ingester's DDL train may depend on them (Metabase and the agent reference them by name at query time, which is fine).
 
 | view | grain | what it answers |
 |---|---|---|
@@ -119,6 +119,41 @@ Consumer contract:
 ### Concurrency
 
 Each ingestion run holds two session-level Postgres advisory locks on its own connection: `vault-ddl` around the DDL train only (the `CREATE TABLE`/`ALTER`/view block above, serialized across every service and corpus), then `vault-ingest-<corpus>` for the documents, cadence, runs, and discovery-error passes, held through the end of the run. A run that finds a lock already held logs a WARNING naming the key and blocks until it is free — it never skips its work. Both locks are released on explicit unlock or when the connection closes, so a killed run never leaves one behind — that holds for a killed *process* (the OS closes the socket and Postgres releases the session's locks immediately); a vanished *host* keeps them until TCP keepalive notices the dead peer, which can take minutes. On an hourly cron, one `waiting for it` WARNING per overlap is the expected signal that the lock did its job, not an error to page on. Two overlapping runs of the *same* corpus serialize; different corpora run in parallel and never block each other. `documents.last_seen_at` is written as `GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at)` on upsert, so even a writer that bypassed the lock could not rewind a stamp a newer run already set. The orchestrator's own writes (`runs`, `rag_ingestions`, and the probe `UPDATE` of `has_text_layer`/`page_count` on `documents`) take neither lock — a separate writer outside the ingestion service's transaction. Calling `ingest_cadence.run()` / `ingest_runs.run()` / `ingest_discovery_errors.run()` directly, outside `ingest.py`'s `main()`, bypasses the DDL lock entirely (each issues its own `CREATE TABLE IF NOT EXISTS`).
+
+### Schema migrations
+
+The DDL train (the `CREATE TABLE`/`ALTER`/view block in `ingestion/ingest.py`) takes ACCESS
+EXCLUSIVE locks: `DROP VIEW` and `ALTER TABLE` (even a no-op `ADD COLUMN IF NOT EXISTS`) wait
+behind any open reader — Metabase, the API, the MCP — and every new reader then queues behind
+them (#4). So the train is **gated** (`ingestion/schema_gate.py`):
+
+- It runs only when the sha256 of its SQL differs from the one recorded in the one-row table
+  `vault_schema`, when one of the tables or views it owns is missing, or when
+  `VAULT_DDL_FORCE=1`. Otherwise the run logs `schema current (fingerprint …) — DDL train
+  skipped` and takes no DDL lock at all. Editing the train (comments included) re-runs it once.
+- When it runs, each lock wait is bounded by `VAULT_DDL_LOCK_TIMEOUT` (default `5s`; a
+  Postgres duration: `500ms`, `5s`, `1min`), and the train is retried after each delay of
+  `VAULT_DDL_RETRY_DELAYS` (default `10,30` seconds = three attempts; `none` = one attempt).
+  Each failed attempt logs one WARNING listing the sessions holding locks on the train's
+  relations (pid, user, application, state, transaction age — never their query text).
+- After the last attempt the run **fails** (non-zero exit, `TrainLockTimeout`) and ingests
+  nothing: new code may need the new schema. Re-run when the listed sessions are gone, or with
+  a longer `VAULT_DDL_LOCK_TIMEOUT`.
+- `VAULT_DDL_FORCE=1` is for drift the gate cannot see (a column dropped or an index changed by
+  hand): `docker compose run --rm -e VAULT_DDL_FORCE=1 ingestion`, once. Left set, it brings
+  the nightly lock convoy back.
+- The roles and grants (see [Access & roles](#access--roles)) and the per-pass statements of the
+  cadence, runs and discovery-error passes run on every pass; they only take locks that coexist
+  with readers (`CREATE … IF NOT EXISTS` on existing objects, `GRANT`, `ALTER ROLE`, row
+  updates). `runs.corpus` is added behind a catalog check, not with `ADD COLUMN IF NOT EXISTS`.
+- Legacy shapes converge in the train: each of `created_at`, `updated_at`, `last_seen_at`,
+  `deleted_at` is upgraded from naive `TIMESTAMP` on its own (`AT TIME ZONE 'UTC'`);
+  `bank_code` is renamed to `source_code` only when `source_code` is absent — when both exist,
+  `source_code` is filled from `bank_code` where NULL, `bank_code` is **kept**, and a WARNING
+  asks for it to be dropped by hand.
+
+First run after deploying the gate: `vault_schema` does not exist yet, so that run applies the
+train once (under the timeout) and records the fingerprint; later runs skip it.
 
 ### Migration (2026-09 substrate)
 
@@ -162,8 +197,9 @@ business in.
 
 Every service used to connect as `docuser`, which in the `postgres:16` image is a full cluster
 superuser. Two least-privilege roles now do the work instead. They are owned by the DDL train:
-the ingestion service creates them and **re-issues their grants on every run** — the views are
-dropped and recreated nightly, and a grant dies with its view.
+the ingestion service creates them and **re-issues their grants on every run**, whether the
+DDL train ran or was skipped — a grant dies with its view whenever the train recreates the views,
+and re-issuing it was measured not to wait behind readers.
 
 | Object | `docuser` | `vault_orchestrator` | `vault_readonly` |
 |---|---|---|---|
@@ -194,7 +230,7 @@ SQL literal), but the resulting DSN for the API and the orchestrator is malforme
 crash-loop on a libpq error that does not say "bad password".
 
 **Rotation**: change the value in `.env` — same charset rule — run
-`docker compose run --rm ingestion` once (the train re-applies the password every run), then
+`docker compose run --rm ingestion` once (the password is re-applied on every run, DDL train skipped or not), then
 update the consumer. Nothing is ever run by hand against the cluster.
 
 **First boot ordering.** The roles do not exist until the first ingestion run of *this* tree, so

@@ -8,9 +8,11 @@ connection, the API, the future agent: SELECT and nothing else).
 
 Why here and not in deploy/initdb/: initdb runs once, on an empty data dir, so
 it would never execute on an existing cluster -- and the train DROPs and
-recreates all five views on every run, which destroys any grant held on them.
-Re-issuing the grants after the CREATE VIEWs, inside the same transaction, is
-what makes them survive the night.
+recreates all five views whenever it runs, which destroys any grant held on
+them. Re-issuing the grants after the CREATE VIEWs, inside the same
+transaction, is what makes them survive. ensure_roles runs on every pass,
+train skipped or not (schema_gate.py): its statements do not wait behind
+readers, and rotation stays "change the variable, run once".
 
 The same pass also revokes PUBLIC's inherited CREATE right on schema `public`
 (see _HARDEN_PUBLIC_SCHEMA_SQL), so "these roles cannot create anything" holds

@@ -187,6 +187,51 @@ def expected_relations(sql_text):
     return tuple(names)
 
 
+def stale_reason(stored, expected, missing, force):
+    """Why the train must run, or None when the schema is current.
+
+    `stored` is the fingerprint read from vault_schema (None when the table or
+    its row is absent), `expected` the fingerprint of the train in this code,
+    `missing` the train's relations that do not exist right now.
+    """
+    if force:
+        return f"forced by {ENV_FORCE}"
+    if missing:
+        return f"missing relation(s): {', '.join(missing)}"
+    if stored is None:
+        return "no fingerprint recorded yet (first run with the gate)"
+    if stored != expected:
+        return f"train changed (recorded {stored[:12]}, code {expected[:12]})"
+    return None
+
+
+MISSING_RELATIONS_SQL = (
+    "SELECT r FROM unnest(%s::text[]) WITH ORDINALITY AS t(r, i) "
+    "WHERE to_regclass(r) IS NULL ORDER BY i"
+)
+STORED_FINGERPRINT_SQL = "SELECT fingerprint FROM vault_schema WHERE singleton"
+GATE_TABLE = "vault_schema"
+
+
+def read_state(conn, relations):
+    """(stored fingerprint or None, missing relations) in one short transaction.
+
+    Only catalog lookups and a one-row SELECT: ACCESS SHARE at most, so the
+    gate read itself never waits behind a reader. Must run under the
+    `vault-ddl` advisory lock, like the train it decides about.
+    """
+    with conn.cursor() as cur:
+        cur.execute(MISSING_RELATIONS_SQL, (list(relations),))
+        missing = tuple(r for (r,) in cur.fetchall())
+        stored = None
+        if GATE_TABLE not in missing:
+            cur.execute(STORED_FINGERPRINT_SQL)
+            row = cur.fetchone()
+            stored = row[0] if row else None
+    conn.commit()
+    return stored, missing
+
+
 SET_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = %s"
 
 # Sessions holding a granted lock on one of the train's relations. Not
@@ -238,7 +283,12 @@ def _describe_blockers(conn, relations):
     )
 
 
-def run_with_lock_retries(conn, apply, settings, relations, sleep=time.sleep):
+# Indirection so a test can act between two attempts (release a reader)
+# without patching time.sleep for the whole process.
+_sleep = time.sleep
+
+
+def run_with_lock_retries(conn, apply, settings, relations, sleep=None):
     """Run `apply(cur)` in one transaction under a bounded lock wait, retrying.
 
     Each attempt: `SET LOCAL lock_timeout`, `apply(cur)`, commit. On
@@ -247,6 +297,8 @@ def run_with_lock_retries(conn, apply, settings, relations, sleep=time.sleep):
     TrainLockTimeout. Any other error is rolled back and re-raised at once (a
     broken train is not made better by retrying it).
     """
+    if sleep is None:
+        sleep = _sleep
     attempts = settings.attempts
     for attempt in range(1, attempts + 1):
         try:
