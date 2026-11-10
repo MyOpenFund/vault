@@ -253,10 +253,25 @@ consumer's queries only change when it bumps the pin.
   `InvalidQuery`, raised before any SQL runs on a bad argument or filter value (the API maps it
   to a 400).
 
-Guarantees: read-only — no function writes or commits; every function takes an open psycopg2
-connection that the caller owns (opens, closes, and chooses the role — `vault_readonly`).
-Use an autocommit connection (or roll back after each call): a read left "idle in transaction"
-holds locks that block the ingester's DDL train.
+Guarantees: read-only — no function writes or commits the caller's transaction; every function
+takes an open psycopg2 connection that the caller owns (opens, closes, and chooses the role —
+`vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
+"idle in transaction" holds locks that block the ingester's DDL train.
+
+Behaviour notes (0.2.0):
+
+- `q` (document search) is a **literal**, case-insensitive substring of the title: `%`, `_` and
+  `\` match themselves, so `q="50%"` finds "50%" and no longer acts as a wildcard.
+- `since` (`runs_status`, `recent_runs`) is a `date`, a `datetime`, or a string in the grammar
+  `YYYY-MM-DD[THH:MM[:SS[.ffffff]][Z|+HH:MM|-HH:MM]]` (ASCII digits, upper-case `T`/`Z`, a real
+  instant, UTC offset at most ±15:59 — Postgres's limit). Anything else (a week date, a space
+  separator, `+16:00`, a number) is `InvalidQuery` before SQL, never a Postgres `DataError`. A
+  naive value is read in the session time zone; the caller's value reaches SQL unchanged.
+- `search_documents` runs its COUNT and its page in one `REPEATABLE READ, READ ONLY` transaction
+  on an idle autocommit connection, so the total and the page agree under a concurrent ingest.
+  On a connection already in a transaction (or not in autocommit) it sends no BEGIN, COMMIT or
+  ROLLBACK and the caller's isolation level applies. After an error inside its snapshot the
+  connection is rolled back and left usable.
 
 ## Metabase
 

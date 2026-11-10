@@ -442,3 +442,205 @@ def test_since_offset_is_read_by_postgres_at_the_boundary(conn):
     assert vq.recent_runs(conn, since="2026-10-02T00:00+08:00") == []
     assert [r["run_id"] for r in vq.runs_status(conn, since="2026-10-01T00:00-15:59")] == ["edge"]
     assert vq.runs_status(conn, since="2026-10-01T00:01-15:59") == []
+
+
+# --- q is literal -------------------------------------------------------------
+
+LITERAL_TITLES = {
+    "pct": "100% growth",
+    "nopct": "1000 growth",
+    "under": "a_b",
+    "nounder": "axb",
+    "bslash": "back\\slash",
+    "nobslash": "backslash",
+    "mix": "mix %_\\ end",
+}
+
+
+@pytest.fixture()
+def title_conn(clean_db, tmp_path, monkeypatch):
+    """Titles that differ only by a wildcard or the escape character, ingested for real."""
+    manifests = tmp_path / "titles"
+    write_manifest(manifests, "corpus.jsonl",
+                   [make_doc(doc_id, title=title) for doc_id, title in LITERAL_TITLES.items()])
+    run_ingest(monkeypatch, clean_db, manifests)
+    c = psycopg2.connect(clean_db)
+    c.autocommit = True
+    yield c
+    c.close()
+
+
+@pytest.mark.parametrize("q, expected", [
+    ("100%", {"pct"}),                       # was a wildcard: also matched 1000 growth
+    ("a_b", {"under"}),                      # was a wildcard: also matched axb
+    ("back\\slash", {"bslash"}),             # was an escape: matched backslash instead
+    ("%", {"pct", "mix"}),                   # was match-everything
+    ("_", {"under", "mix"}),
+    ("\\", {"bslash", "mix"}),
+    ("%_\\", {"mix"}),
+    ("%%", set()),
+    ("__", set()),
+    ("GROWTH", {"pct", "nopct"}),            # still case-insensitive
+])
+def test_q_matches_the_literal_substring_only(title_conn, q, expected):
+    """`q` is a literal, case-insensitive substring of the title; total agrees with rows."""
+    total, rows = vq.search_documents(title_conn, {"q": q}, limit=100)
+    assert {r["doc_id"] for r in rows} == expected
+    assert total == len(expected)
+
+
+# --- COUNT and page in one snapshot ------------------------------------------
+
+def _insert_document(pg_url, doc_id):
+    """A committed insert from another session, as a concurrent ingest would make."""
+    other = psycopg2.connect(pg_url)
+    try:
+        with other, other.cursor() as cur:
+            cur.execute("INSERT INTO documents (doc_id, corpus, title) VALUES (%s, 'central-bank', %s)",
+                        (doc_id, doc_id))
+    finally:
+        other.close()
+
+
+class _Interleaving:
+    """Proxy connection: runs `between()` right after the COUNT statement.
+
+    Lets a test put a concurrent commit (or an error) exactly between the two
+    statements of search_documents, which no real timing could do reliably.
+    """
+
+    def __init__(self, conn, between):
+        self._conn, self._between = conn, between
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def cursor(self, *a, **k):
+        real, between = self._conn.cursor(*a, **k), self._between
+
+        class _Cursor:
+            def __enter__(self):
+                real.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, params=None):
+                real.execute(sql, params)
+                if "COUNT(*)" in sql:
+                    between()
+
+        return _Cursor()
+
+
+def test_search_total_and_page_share_one_snapshot_on_autocommit(conn, clean_db):
+    """A document committed between the COUNT and the page is in neither.
+
+    Under READ COMMITTED the page would see it and the total would not.
+    """
+    proxy = _Interleaving(conn, lambda: _insert_document(clean_db, "late"))
+    total, rows = vq.search_documents(proxy, {}, limit=100)
+    assert total == len(rows) == 4
+    assert "late" not in {r["doc_id"] for r in rows}
+    assert vq.search_documents(conn, {}, limit=100)[0] == 5  # committed, visible next call
+
+
+def test_search_snapshot_is_repeatable_read_and_read_only(conn):
+    """Inside the snapshot the session really is REPEATABLE READ and READ ONLY."""
+    seen = {}
+
+    def probe():
+        # Same session, its own cursor: the search's cursor keeps its result set.
+        with conn.cursor() as cur:
+            cur.execute("SHOW transaction_isolation")
+            seen["isolation"] = cur.fetchone()[0]
+            cur.execute("SHOW transaction_read_only")
+            seen["read_only"] = cur.fetchone()[0]
+
+    vq.search_documents(_Interleaving(conn, probe), {})
+    assert seen == {"isolation": "repeatable read", "read_only": "on"}
+
+
+def test_search_leaves_an_autocommit_connection_idle(conn):
+    """After the call nothing is left open: no read transaction to block the DDL train."""
+    from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+    vq.search_documents(conn, {"q": "doc"})
+    assert conn.autocommit is True
+    assert conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+
+
+def test_search_error_in_the_page_rolls_back_and_keeps_the_connection_usable(conn):
+    """A failing statement inside the snapshot: the error propagates, the
+    snapshot is rolled back, and the next call on the same connection works."""
+    from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+    def fail():
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 / 0")
+
+    with pytest.raises(psycopg2.errors.DivisionByZero):
+        vq.search_documents(_Interleaving(conn, fail), {})
+    assert conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+    assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_search_error_on_a_dropped_connection_propagates_the_original_error(clean_db, conn):
+    """The server ends the session mid-snapshot: the caller sees the connection
+    error itself, not a secondary error from the ROLLBACK attempt."""
+    victim = psycopg2.connect(clean_db)
+    victim.autocommit = True
+    try:
+        with victim.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid()")
+            pid = cur.fetchone()[0]
+
+        def kill():
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+
+        with pytest.raises(psycopg2.OperationalError):
+            vq.search_documents(_Interleaving(victim, kill), {})
+    finally:
+        victim.close()
+
+
+def test_search_does_not_touch_a_caller_transaction(clean_db, conn):
+    """Non-autocommit: the caller's transaction stays open, its own uncommitted
+    write is counted, and its rollback still undoes it (nothing was committed)."""
+    from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+    caller = psycopg2.connect(clean_db)
+    try:
+        with caller.cursor() as cur:
+            cur.execute("INSERT INTO documents (doc_id, corpus) VALUES ('mine', 'central-bank')")
+        assert vq.search_documents(caller, {})[0] == 5
+        assert caller.get_transaction_status() == TRANSACTION_STATUS_INTRANS
+        caller.rollback()
+    finally:
+        caller.close()
+    assert vq.search_documents(conn, {})[0] == 4
+
+
+def test_search_does_not_commit_an_explicit_begin_on_autocommit(clean_db, conn):
+    """Autocommit, but the caller sent BEGIN itself: the snapshot is not opened
+    and the caller's transaction is neither committed nor ended."""
+    from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+    caller = psycopg2.connect(clean_db)
+    caller.autocommit = True
+    try:
+        with caller.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute("INSERT INTO documents (doc_id, corpus) VALUES ('mine', 'central-bank')")
+        assert vq.search_documents(caller, {})[0] == 5
+        assert caller.get_transaction_status() == TRANSACTION_STATUS_INTRANS
+        with caller.cursor() as cur:
+            cur.execute("ROLLBACK")
+    finally:
+        caller.close()
+    assert vq.search_documents(conn, {})[0] == 4

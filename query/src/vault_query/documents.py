@@ -1,4 +1,6 @@
 """Document search and lookup."""
+import psycopg2
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from psycopg2.extras import RealDictCursor
 
 from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_int
@@ -12,6 +14,10 @@ ALL_COLUMNS = frozenset({
     "created_at", "updated_at", "last_seen_at", "deleted_at", "extra",
     "has_text_layer", "page_count",
 })
+
+# How search_documents opens its snapshot on an autocommit connection: the
+# COUNT and the page see the same committed state, and nothing can be written.
+SNAPSHOT_BEGIN = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 
 # The projection for result lists: what a reader needs to pick a document.
 # `extra` (free-form, can be large) and host-layout columns stay in get_document.
@@ -36,8 +42,19 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     `columns`, when given, is a non-empty subset of ALL_COLUMNS; None means
     every column.
 
-    The COUNT and the page are two statements: under READ COMMITTED a
-    concurrent ingest between them can shift the page against the total by a row.
+    `filters["q"]` is a literal, case-insensitive substring of the title: `%`,
+    `_` and `\\` match themselves (`q="50%"` finds "50%", not "500").
+
+    The COUNT and the page are two statements. On an autocommit connection
+    that is idle (the documented caller contract) both run inside one
+    `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY ... COMMIT`, so a
+    concurrent ingest cannot shift the page against the total; on an error the
+    snapshot is rolled back, the error propagates and the connection is left
+    idle and usable. On a connection already in a transaction (or not in
+    autocommit, where psycopg2 opens one), the caller's transaction is left
+    alone: no BEGIN, COMMIT or ROLLBACK is sent, and the two statements see
+    whatever the caller's isolation level gives them (READ COMMITTED by default:
+    a concurrent commit between them can shift the page by a row).
     """
     if sort_by not in SORTABLE_FIELDS:
         raise InvalidQuery(f"sort_by must be one of {sorted(SORTABLE_FIELDS)}")
@@ -55,16 +72,39 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     projection = "*" if columns is None else ", ".join(columns)
     where_sql, params = build_where_clause(filters, include_deleted=include_deleted)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(f"SELECT COUNT(*) AS total FROM documents{where_sql}", params)
-        total = cur.fetchone()["total"]
-        cur.execute(
-            f"SELECT {projection} FROM documents{where_sql} "
-            f"ORDER BY {sort_by} {sort_dir} NULLS LAST, doc_id "
-            f"LIMIT %s OFFSET %s",
-            params + [limit, offset],
-        )
-        rows = [dict(r) for r in cur.fetchall()]
+        own_snapshot = conn.autocommit and conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
+        if own_snapshot:
+            cur.execute(SNAPSHOT_BEGIN)
+        try:
+            cur.execute(f"SELECT COUNT(*) AS total FROM documents{where_sql}", params)
+            total = cur.fetchone()["total"]
+            cur.execute(
+                f"SELECT {projection} FROM documents{where_sql} "
+                f"ORDER BY {sort_by} {sort_dir} NULLS LAST, doc_id "
+                f"LIMIT %s OFFSET %s",
+                params + [limit, offset],
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        except BaseException:
+            if own_snapshot:
+                _rollback_quietly(cur)
+            raise
+        if own_snapshot:
+            cur.execute("COMMIT")
     return total, rows
+
+
+def _rollback_quietly(cur):
+    """End the snapshot after a failure without masking the original error.
+
+    A connection the server already closed cannot roll back; the error that
+    closed it is the one the caller needs, so the ROLLBACK's own failure is
+    dropped (the session, and its snapshot, are gone anyway).
+    """
+    try:
+        cur.execute("ROLLBACK")
+    except psycopg2.Error:
+        pass
 
 
 def get_document(conn, doc_id):

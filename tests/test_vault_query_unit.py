@@ -294,3 +294,119 @@ def test_valid_filter_values_reach_sql_unchanged(filters, clause, value):
     where_sql, params = build_where_clause(filters)
     assert clause in where_sql
     assert params == [value]
+
+
+# --- q is a literal substring (ILIKE with every wildcard escaped) -------------
+
+@pytest.mark.parametrize("q, param", [
+    ("housing", "%housing%"),
+    ("50%", "%50\\%%"),
+    ("a_b", "%a\\_b%"),
+    ("back\\slash", "%back\\\\slash%"),
+    ("%_\\", "%\\%\\_\\\\%"),
+    ("%", "%\\%%"),
+    ("_", "%\\_%"),
+    ("\\", "%\\\\%"),
+    ("\\%", "%\\\\\\%%"),        # an escaped-looking % is still two literals
+    ("%%", "%\\%\\%%"),
+    ("café §", "%café §%"),  # non-ASCII is untouched
+])
+def test_q_is_escaped_into_a_literal_ilike_pattern(q, param):
+    """`%`, `_` and the escape character itself are escaped; the rest is untouched."""
+    where_sql, params = build_where_clause({"q": q})
+    assert "title ILIKE %s ESCAPE '\\'" in where_sql
+    assert params == [param]
+
+
+def test_empty_q_adds_no_clause():
+    """An empty `q` is no filter, as before (not a match-everything ILIKE)."""
+    where_sql, params = build_where_clause({"q": ""})
+    assert "ILIKE" not in where_sql and params == []
+
+
+# --- COUNT and page in one snapshot ------------------------------------------
+
+class _RecordingCursor:
+    def __init__(self, log, fail_on=None):
+        self.log, self.fail_on = log, fail_on
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.log.append(sql)
+        if self.fail_on and self.fail_on in sql:
+            raise RuntimeError("boom in " + self.fail_on)
+
+    def fetchone(self):
+        return {"total": 0}
+
+    def fetchall(self):
+        return []
+
+
+class _RecordingConnection:
+    """Records the SQL `search_documents` sends; `status` is psycopg2's transaction status."""
+
+    def __init__(self, autocommit, status=0, fail_on=None):
+        self.autocommit, self.status, self.fail_on, self.log = autocommit, status, fail_on, []
+
+    def cursor(self, *a, **k):
+        return _RecordingCursor(self.log, self.fail_on)
+
+    def get_transaction_status(self):
+        return self.status
+
+    def commit(self):
+        raise AssertionError("search_documents must not call commit() on the caller's connection")
+
+    def rollback(self):
+        raise AssertionError("search_documents must not call rollback() on the caller's connection")
+
+
+def _kinds(log):
+    return [s.split()[0] + (" COUNT" if "COUNT(*)" in s else "") for s in log]
+
+
+def test_search_runs_count_and_page_in_one_read_only_snapshot_on_autocommit():
+    """Autocommit and idle: BEGIN REPEATABLE READ READ ONLY, COUNT, page, COMMIT."""
+    conn = _RecordingConnection(autocommit=True)
+    search_documents(conn, {"q": "x"})
+    assert conn.log[0] == "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    assert _kinds(conn.log) == ["BEGIN", "SELECT COUNT", "SELECT", "COMMIT"]
+
+
+@pytest.mark.parametrize("autocommit, status", [
+    (False, 0),   # psycopg2 will open its own transaction: the caller owns it
+    (False, 2),   # already in a transaction
+    (True, 2),    # autocommit, but the caller sent BEGIN itself
+    (True, 3),    # autocommit, caller's transaction already failed
+])
+def test_search_leaves_a_caller_transaction_alone(autocommit, status):
+    """Outside the autocommit-and-idle case, no BEGIN, COMMIT or ROLLBACK is sent.
+
+    Committing would end a transaction the caller opened (an explicit BEGIN on
+    an autocommit connection included); the caller owns its consistency.
+    """
+    conn = _RecordingConnection(autocommit=autocommit, status=status)
+    search_documents(conn, {})
+    assert _kinds(conn.log) == ["SELECT COUNT", "SELECT"]
+
+
+@pytest.mark.parametrize("fail_on", ["COUNT(*)", "LIMIT"])
+def test_search_rolls_the_snapshot_back_when_a_statement_fails(fail_on):
+    """An error inside the snapshot ends it with ROLLBACK and propagates unchanged."""
+    conn = _RecordingConnection(autocommit=True, fail_on=fail_on)
+    with pytest.raises(RuntimeError, match="boom"):
+        search_documents(conn, {})
+    assert conn.log[0].startswith("BEGIN") and conn.log[-1] == "ROLLBACK"
+    assert "COMMIT" not in conn.log
+
+
+def test_search_argument_errors_open_no_snapshot():
+    """Argument checks still run before any SQL, the BEGIN included."""
+    with pytest.raises(InvalidQuery):
+        search_documents(_NoConnection(), {"q": "x"}, limit=0)

@@ -70,7 +70,10 @@ def list_documents(
     mime_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    q: Optional[str] = Query(None, description="Free-text search on the title"),
+    q: Optional[str] = Query(
+        None,
+        description="Literal, case-insensitive substring of the title (% and _ are not wildcards)",
+    ),
     sort_by: str = "date",
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(50, ge=1, le=1000),

@@ -23,7 +23,8 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
 
     - simple values -> equality
     - `date_from` / `date_to` -> bounds on the `date` column
-    - `q` -> free-text search on `title` (ILIKE)
+    - `q` -> literal, case-insensitive substring of `title` (ILIKE with `%`,
+      `_` and `\\` escaped: `q="50%"` finds "50%", it is not a wildcard)
     - by default, excludes soft-deleted documents (`deleted_at IS NULL`)
 
     Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
@@ -60,11 +61,28 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
 
     q = filters.get("q")
     if q:
-        clauses.append("title ILIKE %s")
-        params.append(f"%{q}%")
+        clauses.append(f"title ILIKE %s ESCAPE '{LIKE_ESCAPE}'")
+        params.append(f"%{escape_like(q)}%")
 
     where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
     return where_sql, params
+
+
+# The ILIKE escape character `q` is escaped with, declared in the SQL with
+# ESCAPE (standard_conforming_strings is on, Postgres's default since 9.1, so
+# '\' is one backslash).
+LIKE_ESCAPE = "\\"
+
+
+def escape_like(text):
+    """`text` with the LIKE wildcards `%`, `_` and LIKE_ESCAPE itself escaped.
+
+    The escape character goes first, so the escapes added for `%` and `_`
+    are not escaped again.
+    """
+    return (text.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+                .replace("%", LIKE_ESCAPE + "%")
+                .replace("_", LIKE_ESCAPE + "_"))
 
 
 # Strict ASCII YYYY-MM-DD, the documented contract. `date.fromisoformat` alone also
