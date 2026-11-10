@@ -7,6 +7,7 @@ train included) and is deliberately uneven: two documents share a date, one has
 no date at all, one is html, and one is tombstoned by a second run's sweep.
 """
 
+import datetime
 import json
 
 import psycopg2
@@ -371,3 +372,73 @@ def test_source_health_reads_the_view(conn):
     assert vq.source_health(conn, source_code="us") == rows
     assert vq.source_health(conn, source_code="fr") == []
     assert vq.source_health(conn, corpus="company") == []
+
+
+# Same list as ACCEPTED_SINCE in tests/test_vault_query_unit.py: the contract is
+# "accepted by _check_since => runs on Postgres with no DataError".
+ACCEPTED_SINCE = [
+    "2026-10-01",
+    "2026-10-01T00:00",
+    "2026-10-01T00:00:00",
+    "2026-10-01T00:00:00.1",
+    "2026-10-01T00:00:00.123456",
+    "2026-10-01T00:00Z",
+    "2026-10-01T00:00+15:59",
+    "2026-10-01T00:00-15:59",
+    "2026-10-01T23:59:59+00:00",
+    "2024-02-29T12:00",
+    "0001-01-01T00:00Z",
+    "9999-12-31T23:59:59Z",
+]
+
+_UTC_PLUS = lambda **kw: datetime.timezone(datetime.timedelta(**kw))  # noqa: E731
+
+ACCEPTED_SINCE_OBJECTS = [
+    datetime.date(1, 1, 1),
+    datetime.datetime(2010, 1, 13, 12),
+    datetime.datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=datetime.timezone.utc),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=15, minutes=59, seconds=59)),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=-15, minutes=-59, seconds=-59)),
+]
+
+
+@pytest.mark.parametrize("since", ACCEPTED_SINCE + ACCEPTED_SINCE_OBJECTS, ids=repr)
+def test_every_accepted_since_runs_on_postgres(conn, since):
+    """Accepted by the check => Postgres parses it: no DataError, no 500.
+
+    A run at the far past makes the comparison really evaluate a row.
+    """
+    _insert_run(conn, "old", "0001-01-02T00:00:00Z", [{"source_code": "us"}])
+    assert isinstance(vq.runs_status(conn, since=since), list)
+    assert isinstance(vq.recent_runs(conn, since=since), list)
+
+
+@pytest.mark.parametrize("since", [
+    "2026-W40-1T00:00", "2026-W40-1", "2026-10-01T00:00+16:00", "2026-10-01T00:00-16:00",
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=16)),
+    datetime.datetime(2010, 1, 13, tzinfo=_UTC_PLUS(hours=1, microseconds=5)),
+], ids=repr)
+def test_refusals_python_would_pass_are_postgres_errors(conn, since):
+    """Why the check is stricter than fromisoformat: these reach Postgres as a DataError.
+
+    If Postgres ever starts accepting one of them, this fails and the refusal
+    can be reconsidered; until then the check turns it into InvalidQuery.
+    """
+    with pytest.raises(psycopg2.DataError):
+        with conn.cursor() as cur:
+            cur.execute("SELECT %s::timestamptz", (since,))
+    with pytest.raises(vq.InvalidQuery):
+        vq.recent_runs(conn, since=since)
+
+
+def test_since_offset_is_read_by_postgres_at_the_boundary(conn):
+    """The offset in an accepted string is applied by Postgres, to the minute.
+
+    The run finished at 15:59Z; +08:01 on the next day is the same instant
+    (>= keeps it), +08:00 is one minute later (drops it).
+    """
+    _insert_run(conn, "edge", "2026-10-01T15:59:00Z", [{"source_code": "us"}])
+    assert [r["run_id"] for r in vq.recent_runs(conn, since="2026-10-02T00:00+08:01")] == ["edge"]
+    assert vq.recent_runs(conn, since="2026-10-02T00:00+08:00") == []
+    assert [r["run_id"] for r in vq.runs_status(conn, since="2026-10-01T00:00-15:59")] == ["edge"]
+    assert vq.runs_status(conn, since="2026-10-01T00:01-15:59") == []
