@@ -98,9 +98,11 @@ def _shape_error(obj):
 
 
 # Run telemetry table, owned and populated by this module. Included here too
-# (verbatim, index included) so ingest_runs.run() stays usable standalone,
-# mirroring ingest.py's DDL train — the duplication between the two is
-# deliberate, not drift (see ingest_cadence.py for the same pattern).
+# (same table, column and indexes) so ingest_runs.run() stays usable
+# standalone, mirroring ingest.py's DDL train — the duplication between the two
+# is deliberate, not drift (see ingest_cadence.py for the same pattern). Unlike
+# the train, every ALTER and index here sits behind a catalog check (below).
+# Executed only when the runs file offers rows.
 CREATE_RUNS_SQL = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id      TEXT PRIMARY KEY,
@@ -116,13 +118,38 @@ CREATE TABLE IF NOT EXISTS runs (
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+-- Runs on EVERY pass, outside the gated DDL train (vault #4), next to readers
+-- AND writers of this table. CREATE TABLE IF NOT EXISTS on an existing table
+-- locks nothing, but CREATE INDEX IF NOT EXISTS takes SHARE on the table
+-- before it notices the index exists -- which waits behind any uncommitted
+-- INSERT (the orchestrator's) and then queues every later writer behind it. So each
+-- index is created only when to_regclass says it is missing; IF NOT EXISTS
+-- stays inside the guard as a race-proof no-op.
+DO $$
+BEGIN
+    IF to_regclass('idx_runs_tool_finished') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+    END IF;
+END $$;
 
 -- Corpus attribution (2026-09-04). Producers writing runs.jsonl into a
 -- corpus's data/ get the ingesting service's CORPUS; the data-orchestrator
 -- is corpus-agnostic and leaves it NULL. Rows ingested before the column
 -- existed carried `corpus` inside extra (unknown-field rule): backfilled.
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+-- This SQL runs on EVERY pass, outside the gated DDL train, next to readers
+-- of `runs` (the MCP's vault_runs_status): a bare ADD COLUMN IF NOT EXISTS
+-- takes ACCESS EXCLUSIVE even when it is a no-op (measured, vault #4), so the
+-- ALTER only runs when the catalog says the column is really missing.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'runs' AND column_name = 'corpus'
+    ) THEN
+        ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+    END IF;
+END $$;
 -- The type guard matters: `extra ->> 'corpus'` renders a JSON number or
 -- object as text, so an unguarded backfill would promote `{"corpus": 42}`
 -- into a corpus named '42'. The value is otherwise taken as-is -- this is a
@@ -130,7 +157,20 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
 -- run resolve_corpus's contradiction check against the service's CORPUS.
 UPDATE runs SET corpus = extra ->> 'corpus'
  WHERE corpus IS NULL AND jsonb_typeof(extra -> 'corpus') = 'string';
-CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
+DO $$
+BEGIN
+    IF to_regclass('idx_runs_corpus_finished') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
+    END IF;
+END $$;
+
+-- Producer rename (2026-09-02), same as in the DDL train: rows written under
+-- the old 'rag-orchestrator' identity are relabeled 'data-orchestrator'.
+-- Repeated here because the train no longer runs on every pass. It runs when
+-- the train runs and on every pass whose runs file offers rows (this SQL is
+-- skipped when there is no runs file or it yields no valid row); row locks
+-- only, and a no-op once applied.
+UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
 """
 
 INSERT_RUNS_SQL = """

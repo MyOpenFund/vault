@@ -62,3 +62,11 @@ def test_the_repo_never_carries_a_real_tailnet_address():
                          COMPOSE.replace("127.0.0.1", "")), "a literal IP in compose.yaml"
     assert not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
                          ENV_EXAMPLE.replace("127.0.0.1", "")), "a literal IP in .env.example"
+
+
+def test_ingestion_forwards_the_ddl_gate_settings_as_optional():
+    # ${VAR:-}: unset in .env means empty, and schema_gate reads empty as its
+    # default — the defaults live in one place, the code.
+    for var in ("VAULT_DDL_LOCK_TIMEOUT", "VAULT_DDL_RETRY_DELAYS", "VAULT_DDL_FORCE"):
+        assert f"{var}: ${{{var}:-}}" in COMPOSE
+        assert f"#{var}=" in ENV_EXAMPLE

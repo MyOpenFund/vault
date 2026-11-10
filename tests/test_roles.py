@@ -1,5 +1,6 @@
 import logging
 
+import psycopg2.errors
 import pytest
 
 import roles
@@ -215,3 +216,29 @@ def test_an_unconfigured_train_touches_nothing_at_all():
     cur = FakeCursor()
     assert roles.ensure_roles(cur, {}) == []
     assert cur.statements() == []
+
+
+class _LockedCursor(FakeCursor):
+    """Fails the ALTER ROLE with the driver's lock-timeout error, carrying the
+    rendered statement (password included) the way psycopg2's would."""
+
+    def execute(self, statement, params=None):
+        self.count += 1
+        if isinstance(statement, str):
+            self._probe = statement
+        if not isinstance(statement, str) and "ALTER ROLE" in repr(statement):
+            err = psycopg2.errors.LockNotAvailable(
+                "canceling statement due to lock timeout: ALTER ROLE ... PASSWORD 's3cr3t'")
+            raise err
+
+
+def test_a_lock_timeout_on_a_role_statement_stays_a_lock_timeout():
+    # The schema/roles retry wrapper only retries (and diagnoses) a
+    # LockNotAvailable: wrapping it into RuntimeError would turn a passing
+    # contention into a hard failure with no blocker listed.
+    with pytest.raises(psycopg2.errors.LockNotAvailable) as exc:
+        roles.ensure_roles(_LockedCursor(), {"vault_orchestrator": "s3cr3t"})
+    assert "s3cr3t" not in str(exc.value)
+    assert "vault_orchestrator" in str(exc.value)
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    assert exc.value.__suppress_context__ is True

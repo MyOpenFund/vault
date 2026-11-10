@@ -31,9 +31,18 @@ then a per-corpus one for the rest of the pass. An overlapping run of the
 same corpus waits (it never skips); a run of a different corpus is never
 blocked. See DDL_LOCK_KEY / corpus_lock_key below.
 
-The train also owns the two least-privilege login roles and their grants
-(roles.py): they are re-issued on every run because the views the grants sit on
-are dropped and recreated by this very train.
+The DDL train is gated (vault #4, schema_gate.py): it drops and recreates
+views and issues ALTER TABLEs, i.e. ACCESS EXCLUSIVE locks that queue behind
+any open reader and make every new reader queue behind them. It runs only
+when its text changed since it was last applied (sha256 recorded in
+`vault_schema`), when a relation it owns is missing, or when VAULT_DDL_FORCE
+is set; and when it runs, it does so under a bounded lock_timeout with
+retries (VAULT_DDL_LOCK_TIMEOUT, VAULT_DDL_RETRY_DELAYS), failing the run
+loudly -- nothing ingested -- if it never gets its locks.
+
+The two least-privilege login roles and their grants (roles.py) are re-issued
+on every run, train skipped or not (measured non-blocking): that keeps
+password rotation "change the variable, run once".
 
 After the documents pass, the run also ingests DATA_DIR/cadence.jsonl into
 the `cadence` table as a full replace (see ingest_cadence.py for the
@@ -55,6 +64,7 @@ import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
 import roles
+import schema_gate
 from common import resolve_corpus
 
 logging.basicConfig(
@@ -73,6 +83,11 @@ KNOWN_FIELDS = {
 }
 
 CREATE_TABLE_SQL = """
+-- Gated: this whole text only runs when its sha256 differs from the one
+-- recorded in vault_schema, when one of its relations is missing, or when
+-- VAULT_DDL_FORCE is set (schema_gate.py, vault #4). Editing ANY character of
+-- it, comments included, re-runs it once on the next pass.
+--
 -- Views first. They are dropped at the HEAD of the train and recreated at its
 -- tail, in dependency order, so every ALTER below is view-safe (an
 -- ALTER COLUMN ... TYPE on a column a view reads would otherwise fail) and so
@@ -116,14 +131,33 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 -- Generalization migration: bank_code -> source_code + corpus backfill.
 -- Idempotent; no-ops on fresh databases and on already-migrated ones.
+-- The rename only happens when source_code is absent. When BOTH columns exist
+-- (a half-applied migration, a column added by hand), renaming would fail and
+-- dropping would lose data: source_code is filled from bank_code where it is
+-- NULL, bank_code is KEPT for a human to inspect and drop (made nullable: the
+-- upsert writes source_code only, so a NOT NULL bank_code would reject every
+-- new document), and a WARNING says so. ingest.py also detects this state
+-- from the catalog and logs it on every pass until bank_code is dropped.
 DO $$
+DECLARE
+    has_bank   boolean;
+    has_source boolean;
+    filled     bigint;
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'documents' AND column_name = 'bank_code'
-    ) THEN
+    SELECT coalesce(bool_or(column_name = 'bank_code'), false),
+           coalesce(bool_or(column_name = 'source_code'), false)
+      INTO has_bank, has_source
+      FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'documents'
+       AND column_name IN ('bank_code', 'source_code');
+    IF has_bank AND NOT has_source THEN
         ALTER TABLE documents RENAME COLUMN bank_code TO source_code;
+    ELSIF has_bank AND has_source THEN
+        ALTER TABLE documents ALTER COLUMN bank_code DROP NOT NULL;
+        UPDATE documents SET source_code = bank_code
+         WHERE source_code IS NULL AND bank_code IS NOT NULL;
+        GET DIAGNOSTICS filled = ROW_COUNT;
+        RAISE WARNING 'documents has both bank_code and source_code: source_code filled from bank_code on % row(s) where it was NULL; bank_code kept (drop it by hand once checked)', filled;
     END IF;
 END $$;
 
@@ -133,18 +167,25 @@ ALTER TABLE documents ALTER COLUMN corpus SET NOT NULL;
 
 -- One-time upgrade of pre-existing naive TIMESTAMP columns to TIMESTAMPTZ
 -- (values were written as UTC); no-op once migrated or on fresh databases.
+-- Each column is checked on its own: a database where created_at/updated_at
+-- were already migrated but last_seen_at/deleted_at were added naive (or the
+-- reverse) must converge too, not hinge on updated_at alone.
 DO $$
+DECLARE
+    col text;
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'documents' AND column_name = 'updated_at'
-          AND data_type = 'timestamp without time zone'
-    ) THEN
-        ALTER TABLE documents
-            ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC',
-            ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING updated_at AT TIME ZONE 'UTC';
-    END IF;
+    FOREACH col IN ARRAY ARRAY['created_at', 'updated_at', 'last_seen_at', 'deleted_at'] LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'documents' AND column_name = col
+              AND data_type = 'timestamp without time zone'
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE documents ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE ''UTC''',
+                col, col);
+        END IF;
+    END LOOP;
 END $$;
 
 DROP INDEX IF EXISTS idx_documents_bank_code;
@@ -459,6 +500,24 @@ LEFT JOIN obs_7d     o  ON o.corpus  = c.corpus AND o.source_code  = c.source_co
 LEFT JOIN base_90d   b  ON b.corpus  = c.corpus AND b.source_code  = c.source_code
 LEFT JOIN last_run   lr ON lr.corpus = c.corpus AND lr.source_code = c.source_code
 LEFT JOIN open_errors e ON e.corpus  = c.corpus AND e.source_code  = c.source_code;
+
+-- The gate's record (schema_gate.py): one row, the sha256 of this text as it
+-- was last applied. Last statement of the train; main() upserts the row in the
+-- same transaction, so a train that fails half-way records nothing.
+CREATE TABLE IF NOT EXISTS vault_schema (
+    singleton   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    fingerprint TEXT NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+TRAIN_FINGERPRINT = schema_gate.fingerprint(CREATE_TABLE_SQL)
+EXPECTED_RELATIONS = schema_gate.expected_relations(CREATE_TABLE_SQL)
+
+RECORD_FINGERPRINT_SQL = """
+INSERT INTO vault_schema (singleton, fingerprint) VALUES (TRUE, %s)
+ON CONFLICT (singleton) DO UPDATE
+    SET fingerprint = EXCLUDED.fingerprint, applied_at = now();
 """
 
 UPSERT_SQL = """
@@ -630,6 +689,73 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
     )
 
 
+# Shared catalog the roles' ALTER ROLE / CREATE ROLE write to: a session
+# altering a vault role holds a lock on it, so the blocker listing includes it
+# whenever roles are provisioned.
+ROLES_CATALOG = "pg_authid"
+
+BOTH_CODE_COLUMNS_SQL = """
+SELECT count(*) = 2 FROM information_schema.columns
+ WHERE table_schema = current_schema() AND table_name = 'documents'
+   AND column_name IN ('bank_code', 'source_code')
+"""
+
+
+def warn_if_both_code_columns(conn):
+    """F8 leftover: a catalog read (no table lock), logged on every pass.
+
+    Not taken from the train's RAISE WARNING (a server notice the driver may
+    drop, and emitted only on the night the train runs): the state is checked
+    directly, so the WARNING repeats until a human drops bank_code.
+    """
+    with conn.cursor() as cur:
+        cur.execute(BOTH_CODE_COLUMNS_SQL)
+        (both,) = cur.fetchone()
+    conn.commit()
+    if both:
+        log.warning(
+            "documents has both bank_code and source_code: source_code was filled "
+            "from bank_code where NULL and bank_code was kept (nullable). Check it, "
+            "then drop it by hand: ALTER TABLE documents DROP COLUMN bank_code"
+        )
+
+
+def apply_schema(conn, gate, passwords):
+    """Gate check, then (train if stale) + roles, under a bounded lock wait.
+
+    Must run under the `vault-ddl` advisory lock. The train, the fingerprint
+    record and the roles share one transaction: the grants must land after
+    the views a train just recreated (#5), and a train that fails half-way
+    must not record its fingerprint. The roles run on every pass, train or
+    not, inside the same retry wrapper: their statements were measured not to
+    wait behind readers, and should anything else ever hold them up, a
+    bounded wait beats an open-ended queue.
+    """
+    stored, missing = schema_gate.read_state(conn, EXPECTED_RELATIONS)
+    reason = schema_gate.stale_reason(stored, TRAIN_FINGERPRINT, missing, gate.force)
+    if reason is None:
+        log.info(f"schema current (fingerprint {TRAIN_FINGERPRINT[:12]}) — DDL train skipped")
+    else:
+        # Forced is WARNING: left set, it brings back the nightly convoy.
+        level = logging.WARNING if gate.force else logging.INFO
+        log.log(level, f"DDL train running: {reason} "
+                       f"(lock_timeout {gate.lock_timeout}, up to {gate.attempts} attempt(s))")
+
+    def apply(cur):
+        if reason is not None:
+            cur.execute(CREATE_TABLE_SQL)
+            cur.execute(RECORD_FINGERPRINT_SQL, (TRAIN_FINGERPRINT,))
+        roles.ensure_roles(cur, passwords)
+
+    label = (f"{schema_gate.DEFAULT_LABEL} (DDL train + roles)" if reason is not None
+             else f"{schema_gate.DEFAULT_LABEL} (roles only, DDL train skipped)")
+    relations = EXPECTED_RELATIONS + ((ROLES_CATALOG,) if passwords else ())
+    schema_gate.run_with_lock_retries(conn, apply, gate, relations, label=label)
+    if reason is not None:
+        log.info(f"DDL train applied; fingerprint {TRAIN_FINGERPRINT[:12]} recorded")
+    warn_if_both_code_columns(conn)
+
+
 def main(*, corpus=None, data_dir=None):
     """Run one ingestion pass.
 
@@ -646,6 +772,11 @@ def main(*, corpus=None, data_dir=None):
 
     if not database_url:
         log.error("DATABASE_URL is not set")
+        sys.exit(1)
+    try:
+        gate = schema_gate.load_settings(os.environ)
+    except schema_gate.SettingsError as exc:
+        log.error(str(exc))
         sys.exit(1)
 
     jsonl_files = find_jsonl_files(data_dir)
@@ -675,12 +806,7 @@ def main(*, corpus=None, data_dir=None):
         # corpus never blocks another corpus's DDL.
         acquire_lock(conn, DDL_LOCK_KEY)
         held.append(DDL_LOCK_KEY)
-        with conn.cursor() as cur:
-            cur.execute(CREATE_TABLE_SQL)
-            # Same cursor, same transaction, still under `vault-ddl`: the grants
-            # must land after the views this train just recreated (#5).
-            roles.ensure_roles(cur, roles.roles_from_env(os.environ))
-        conn.commit()
+        apply_schema(conn, gate, roles.roles_from_env(os.environ))
         release_lock(conn, DDL_LOCK_KEY)
         held.remove(DDL_LOCK_KEY)
 
