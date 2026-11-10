@@ -318,3 +318,15 @@ def test_error_text_is_printed_literally(api):
     result = invoke("stats")
     assert result.exit_code == 1
     assert "[/] [errno 111] refused" in result.output
+
+
+@pytest.mark.parametrize("dirname", ["[bold]out", "x[/]y", "[/red]"])
+def test_download_path_is_printed_literally(api, tmp_path, dirname):
+    # The output directory is the user's own text, but still not markup: a
+    # "[/]" in it used to crash the success line after the file was written.
+    api(_file({"content-disposition": 'attachment; filename="r.pdf"'}))
+    out = tmp_path / dirname
+    result = invoke("download", "ss99", "-o", str(out))
+    assert result.exit_code == 0, result.output
+    assert (out / "r.pdf").read_bytes() == PDF
+    assert str(out / "r.pdf") in result.output.replace("\n", "")

@@ -73,6 +73,39 @@ def test_root_layout_ignores_every_producer_file_and_unknown_root_files(repo_lay
     assert "foo.jsonl" not in names and "stray.jsonl" not in names
 
 
+def test_root_layout_never_reads_producer_files_under_manifest(tmp_path):
+    # Parity with the pre-W5 scan: a producer file that lands inside
+    # manifest/ (at any depth) is still not a manifest.
+    _touch(tmp_path / "manifest" / "us.jsonl")
+    for name in PRODUCER_ROOT_FILES:
+        _touch(tmp_path / "manifest" / name)
+        _touch(tmp_path / "manifest" / "deep" / name)
+    assert _rel(find_manifest_files(str(tmp_path), {}), tmp_path) == [
+        os.path.join("manifest", "us.jsonl")]
+
+
+def test_root_layout_warns_about_unknown_root_jsonl_files(repo_layout, caplog):
+    # foo.jsonl sits at the data/ root: not read, but named in a WARNING so a
+    # producer that writes a manifest to the wrong place is noticed. Known
+    # producer files and the legacy manifest.jsonl are not mentioned.
+    _touch(repo_layout / "bar.jsonl")
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        find_manifest_files(str(repo_layout), {})
+    (msg,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "not read" in msg and "2 .jsonl file(s)" in msg
+    assert msg.rsplit(": ", 1)[1] == "bar.jsonl, foo.jsonl"  # the named list, nothing else
+
+
+def test_root_layout_without_unknown_root_files_is_quiet(tmp_path, caplog):
+    _touch(tmp_path / "manifest" / "us.jsonl")
+    _touch(tmp_path / "manifest.jsonl")
+    for name in PRODUCER_ROOT_FILES:
+        _touch(tmp_path / name)
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        find_manifest_files(str(tmp_path), {})
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_root_layout_without_legacy_manifest(tmp_path):
     _touch(tmp_path / "manifest" / "us.jsonl")
     _touch(tmp_path / "cadence.jsonl")
@@ -215,4 +248,28 @@ def test_manifest_dir_layout_parity_with_the_pre_w5_scan(nas_layout):
                 "runs.jsonl", "deep/cadence.jsonl", "notes.txt", "x.jsonl.bak",
                 ".hidden.jsonl", ".git/objects.jsonl", "UPPER.JSONL"):
         _touch(nas_layout / rel)
+    # A file that cannot be read must stay IN the list: open() then fails
+    # the run before the sweep, instead of its rows being soft-deleted.
+    (nas_layout / "dangling.jsonl").symlink_to(nas_layout / "vanished.jsonl")
     assert find_manifest_files(str(nas_layout), {}) == _pre_w5_scan(str(nas_layout))
+    assert str(nas_layout / "dangling.jsonl") in find_manifest_files(str(nas_layout), {})
+
+
+@pytest.mark.parametrize("layout", ["nas_layout", "repo_layout"])
+def test_a_dangling_symlink_stays_in_the_list(layout, request):
+    root = request.getfixturevalue(layout)
+    where = root if layout == "nas_layout" else root / "manifest"
+    (where / "gone.jsonl").symlink_to(root / "nowhere.jsonl")
+    assert str(where / "gone.jsonl") in find_manifest_files(str(root), {})
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file anyway")
+def test_an_unreadable_file_stays_in_the_list(nas_layout):
+    locked = _touch(nas_layout / "locked.jsonl")
+    locked.chmod(0)
+    try:
+        found = find_manifest_files(str(nas_layout), {})
+        assert str(locked) in found
+        assert found == _pre_w5_scan(str(nas_layout))
+    finally:
+        locked.chmod(0o644)

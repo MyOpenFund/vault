@@ -193,7 +193,7 @@ def download_document(
     # NOTE: the whole response body is buffered in memory before the write.
     # Known, and out of scope for #5 — streaming the download is its own issue.
     dest.write_bytes(resp.content)
-    console.print(f"[green]Downloaded:[/green] {dest}")
+    console.print(f"[green]Downloaded:[/green] {escape(str(dest))}")
 
 
 @app.command("stats")

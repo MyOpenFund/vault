@@ -41,3 +41,49 @@ def test_manifest_globs_override(clean_db, tmp_path, monkeypatch):
     monkeypatch.setenv("MANIFEST_GLOBS", "manifest/fr.jsonl")
     run_ingest(monkeypatch, clean_db, tmp_path)
     assert _doc_ids(clean_db) == ["f1"]
+
+
+def _live(pg_url):
+    conn = psycopg2.connect(pg_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT doc_id FROM documents WHERE deleted_at IS NULL ORDER BY doc_id")
+            return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _seed_then_break(clean_db, tmp_path, monkeypatch, break_file):
+    # Run 1: two manifests, four live rows. Run 2: fr.jsonl cannot be read.
+    write_manifest(tmp_path, "us.jsonl", [make_doc("u1"), make_doc("u2")])
+    fr = write_manifest(tmp_path, "fr.jsonl", [make_doc("f1"), make_doc("f2")])
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    assert _live(clean_db) == ["f1", "f2", "u1", "u2"]
+    break_file(fr)
+    # sweep="1.0": the fraction guard is off, so only the failed run stands
+    # between an unreadable manifest and the soft-deletion of its rows.
+    with pytest.raises(OSError):
+        run_ingest(monkeypatch, clean_db, tmp_path, sweep="1.0")
+    assert _live(clean_db) == ["f1", "f2", "u1", "u2"]
+
+
+def test_a_dangling_manifest_symlink_fails_the_run_and_sweeps_nothing(
+        clean_db, tmp_path, monkeypatch):
+    def dangle(path):
+        path.unlink()
+        path.symlink_to(tmp_path / "vanished-on-the-share.jsonl")
+
+    _seed_then_break(clean_db, tmp_path, monkeypatch, dangle)
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0,
+                    reason="root reads a chmod 000 file anyway")
+def test_an_unreadable_manifest_fails_the_run_and_sweeps_nothing(
+        clean_db, tmp_path, monkeypatch):
+    def lock(path):
+        path.chmod(0)
+
+    try:
+        _seed_then_break(clean_db, tmp_path, monkeypatch, lock)
+    finally:
+        (tmp_path / "fr.jsonl").chmod(0o644)

@@ -114,8 +114,8 @@ def test_find_manifest_files_excludes_cadence_files(tmp_path):
 
 def test_find_manifest_files_skips_every_producer_root_file(tmp_path):
     # U2 — the seven root-level .jsonl files the producer writes beside
-    # manifest/ must never be read as document manifests, at the root AND
-    # nested (the glob is recursive).
+    # manifest/ must never be read as document manifests: at the data/ root,
+    # directly under manifest/ AND nested inside it (the glob is recursive).
     from ingest import EXCLUDED_BASENAMES, find_manifest_files
     expected = {
         "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
@@ -123,11 +123,11 @@ def test_find_manifest_files_skips_every_producer_root_file(tmp_path):
         "download_quarantine.jsonl", "wp_dates_index.jsonl",
     }
     assert EXCLUDED_BASENAMES == frozenset(expected)
-    (tmp_path / "nested").mkdir()
+    (tmp_path / "manifest" / "nested").mkdir(parents=True)
     for name in expected:
         (tmp_path / name).write_text("{}\n")
-        (tmp_path / "nested" / name).write_text("{}\n")
-    (tmp_path / "manifest").mkdir()
+        (tmp_path / "manifest" / name).write_text("{}\n")
+        (tmp_path / "manifest" / "nested" / name).write_text("{}\n")
     (tmp_path / "manifest" / "us.jsonl").write_text("{}\n")
     found = [p.rsplit("/", 1)[1] for p in find_manifest_files(str(tmp_path), {})]
     assert found == ["us.jsonl"]
@@ -164,3 +164,50 @@ def test_lock_keys_are_distinct_per_corpus_and_from_the_ddl_lock():
     assert corpus_lock_key("central-bank") == "vault-ingest-central-bank"
     assert corpus_lock_key("central-bank") != corpus_lock_key("company")
     assert DDL_LOCK_KEY not in {corpus_lock_key("central-bank"), corpus_lock_key("company")}
+
+
+# --- doc_id must be a non-empty string (vault #6 follow-up) -----------------
+#
+# dedupe_rows compares Python values while Postgres compares TEXT: 5 and "5"
+# are distinct to Python but the same key once adapted, so they still
+# crashed the upsert; 1 and true are equal in Python; [1] is unhashable. A
+# doc_id that is not a non-empty string is therefore rejected at parse time.
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("bad", [5, 0, 1.5, True, False, [1], {"a": 1}, "", "a\x00b"])
+def test_non_string_or_empty_doc_id_is_rejected_and_counted(bad, caplog):
+    import logging
+    counters = {}
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        row = parse_line(make_line(doc_id=bad), "f.jsonl", 7, RUN_TS, CORPUS, counters)
+    assert row is None
+    assert counters == {"invalid_doc_id": 1}
+    (record,) = caplog.records
+    assert "f.jsonl:7" in record.getMessage() and "doc_id" in record.getMessage()
+
+
+@pytest.mark.parametrize("missing", ["absent", None])
+def test_missing_doc_id_is_counted_too(missing):
+    obj = json.loads(make_line())
+    if missing == "absent":
+        del obj["doc_id"]
+    else:
+        obj["doc_id"] = None
+    counters = {}
+    assert parse_line(json.dumps(obj), "f.jsonl", 1, RUN_TS, CORPUS, counters) is None
+    assert counters == {"invalid_doc_id": 1}
+
+
+@pytest.mark.parametrize("ok", ["5", " padded ", "ünïcode-ид", "a" * 500])
+def test_any_non_empty_string_doc_id_is_kept_verbatim(ok):
+    assert parse_line(make_line(doc_id=ok), "f.jsonl", 1, RUN_TS, CORPUS)[0] == ok
+
+
+@pytest.mark.parametrize("line", ['"just a string"', "[1, 2]", "5", "null", "true"])
+def test_valid_json_that_is_not_an_object_is_skipped(line, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        assert parse_line(line, "f.jsonl", 2, RUN_TS, CORPUS) is None
+    assert "f.jsonl:2" in caplog.records[0].getMessage()

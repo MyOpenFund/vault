@@ -70,30 +70,75 @@ def test_invalid_fractions_name_the_variable_and_the_value(value):
     assert repr(value) in str(exc.value)
 
 
-@pytest.mark.parametrize("value", ["", "-0.5", "nan", "banana"])
-def test_main_exits_before_connecting_on_a_bad_fraction(monkeypatch, tmp_path, value):
-    # Empty must NOT crash any more (it used to raise ValueError); the bad
-    # ones exit 1 before any connection is attempted.
-    def no_connect(*_a, **_k):
-        raise AssertionError("connected despite an invalid setting")
+class _Connected(Exception):
+    """Raised by the patched connect(): proves the run got past the settings."""
+
+
+def _forbid_connect(monkeypatch):
+    def connect(*_a, **_k):
+        raise _Connected()
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    monkeypatch.setattr(ingest.psycopg2, "connect", connect)
+
+
+@pytest.mark.parametrize("value", ["-0.5", "nan", "banana", "0_1"])
+def test_main_exits_before_connecting_on_a_bad_fraction(monkeypatch, tmp_path, caplog, value):
+    _forbid_connect(monkeypatch)
     monkeypatch.setenv("SWEEP_MAX_DELETE_FRACTION", value)
-    monkeypatch.setattr(ingest.psycopg2, "connect", no_connect)
-    if value == "":
-        with pytest.raises(AssertionError, match="connected"):
-            ingest.main(corpus="central-bank", data_dir=str(tmp_path))
-        return
-    with pytest.raises(SystemExit) as exc:
+    with caplog.at_level(logging.ERROR, logger="ingest"), pytest.raises(SystemExit) as exc:
         ingest.main(corpus="central-bank", data_dir=str(tmp_path))
     assert exc.value.code == 1
+    (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert f"SWEEP_MAX_DELETE_FRACTION={value!r}" in record.getMessage()
+
+
+def test_main_with_an_empty_fraction_uses_the_default_and_proceeds(monkeypatch, tmp_path, caplog):
+    # `SWEEP_MAX_DELETE_FRACTION=` in .env used to crash with ValueError
+    # before anything ran; now the settings pass and the run goes on to
+    # connect (where this test stops it).
+    _forbid_connect(monkeypatch)
+    monkeypatch.setenv("SWEEP_MAX_DELETE_FRACTION", "")
+    with caplog.at_level(logging.INFO, logger="ingest"), pytest.raises(_Connected):
+        ingest.main(corpus="central-bank", data_dir=str(tmp_path))
+    assert any(r.levelno == logging.INFO and "using the default 0.05" in r.getMessage()
+               for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 def test_main_exits_before_connecting_on_bad_manifest_globs(monkeypatch, tmp_path):
-    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    _forbid_connect(monkeypatch)
     monkeypatch.setenv("MANIFEST_GLOBS", "../escape/*.jsonl")
-    monkeypatch.setattr(ingest.psycopg2, "connect",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("connected")))
     with pytest.raises(SystemExit) as exc:
         ingest.main(corpus="central-bank", data_dir=str(tmp_path))
     assert exc.value.code == 1
+
+
+# --- strict ASCII grammar (review M3) ---------------------------------------
+# Python's float() also takes "0_1", non-ASCII digits, "infinity" and lets
+# "1e-400" underflow to 0.0 (= "never sweep") without a word. The variable's
+# grammar is plain ASCII decimal, optionally with an exponent.
+
+@pytest.mark.parametrize("value, expected", [
+    ("1e-1", 0.1), ("+1", 1.0), ("+0.5", 0.5), (".5", 0.5), ("1.", 1.0),
+    ("0e5", 0.0), ("0.000", 0.0), ("5E-2", 0.05), ("\t0.3\n", 0.3),
+])
+def test_ascii_grammar_accepts(value, expected):
+    assert parse_sweep_fraction({"SWEEP_MAX_DELETE_FRACTION": value}) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "0_1", "0.0_5", "٠.٥", "０.５", "-0", "-0.0", "1e-400", "0.1e-400", "1e400",
+    "e5", ".", "+", "1e", "0x1", "infinity", " 0.2", "0.2 0.3", "1/2",
+])
+def test_ascii_grammar_refuses(value):
+    with pytest.raises(IngestSettingsError) as exc:
+        parse_sweep_fraction({"SWEEP_MAX_DELETE_FRACTION": value})
+    assert repr(value) in str(exc.value)
+
+
+def test_blocked_message_keeps_small_fractions_readable():
+    from ingest import sweep_blocked_message
+    msg = sweep_blocked_message(candidates=3, live=1000, max_fraction=0.002)
+    assert "3/1000" in msg and "0.30%" in msg
+    assert "SWEEP_MAX_DELETE_FRACTION=0.002" in msg  # was rendered as "0%"

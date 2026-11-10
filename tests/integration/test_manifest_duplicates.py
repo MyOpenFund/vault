@@ -47,8 +47,9 @@ def test_duplicate_in_one_page_no_longer_aborts_the_run(clean_db, tmp_path, monk
     assert len(titles) == 11
     assert titles["dup"] == "second"
     assert _rows(clean_db, "SELECT count(*) FROM cadence") == [(1,)]
-    warning = [r.getMessage() for r in caplog.records if "duplicate" in r.getMessage()]
-    assert warning and "1 " in warning[0] and "'dup'" in warning[0]
+    (warning,) = [r.getMessage() for r in caplog.records if "duplicate" in r.getMessage()]
+    assert "us.jsonl: dropped 1 duplicate line(s) for 1 doc_id(s)" in warning
+    assert warning.endswith("(e.g. 'dup')")
 
 
 def test_duplicates_across_pages_last_wins(clean_db, tmp_path, monkeypatch):
@@ -92,3 +93,18 @@ def test_same_doc_id_in_two_files_still_fine(clean_db, tmp_path, monkeypatch):
     write_manifest(tmp_path / "manifest", "b.jsonl", [make_doc("x", title="from-b")])
     run_ingest(monkeypatch, clean_db, tmp_path)
     assert _titles(clean_db) == {"x": "from-b"}
+
+
+def test_mixed_type_doc_ids_no_longer_crash(clean_db, tmp_path, monkeypatch, caplog):
+    # 5 and "5" are one TEXT key in Postgres: the int one is rejected at
+    # parse time, so the page holds a single "5" and the run completes.
+    path = tmp_path / "manifest" / "us.jsonl"
+    path.parent.mkdir(parents=True)
+    lines = [make_doc("5", title="text"), make_doc(5, title="int"), make_doc(True),
+             make_doc(1), make_doc([1]), make_doc(""), make_doc("ok")]
+    path.write_text("".join(json.dumps(d) + "\n" for d in lines), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert _titles(clean_db) == {"5": "text", "ok": "doc ok"}
+    assert any("Rejected 5 line(s)" in r.getMessage() and "doc_id" in r.getMessage()
+               for r in caplog.records)

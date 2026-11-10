@@ -58,6 +58,7 @@ as a fingerprint-keyed snapshot upsert (ingest_discovery_errors.py).
 import json
 import math
 import os
+import re
 import sys
 import glob
 import logging
@@ -634,6 +635,26 @@ class ManifestGlobsError(IngestSettingsError):
 SWEEP_MAX_DELETE_FRACTION_DEFAULT = 0.05
 
 
+# The variable's grammar: plain ASCII decimal, optional "+" and exponent.
+# Narrower than float(), which also takes "0_1", non-ASCII digits, "nan",
+# "infinity" and a leading "-" (so "-0" is refused here, not read as 0).
+_FRACTION_RE = re.compile(
+    r"\+?(?P<mantissa>[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", re.ASCII)
+_ASCII_SPACE = " \t\r\n"
+
+
+def sweep_blocked_message(candidates, live, max_fraction):
+    """The SWEEP BLOCKED warning. The threshold is printed as configured
+    (a 0.002 setting used to read as "0%")."""
+    return (
+        f"SWEEP BLOCKED: {candidates}/{live} live rows "
+        f"({candidates / live:.2%}) would be soft-deleted, above "
+        f"SWEEP_MAX_DELETE_FRACTION={max_fraction!r} "
+        "— possible torn/partial share sync. If this deletion "
+        "wave is legitimate, re-run with a higher fraction."
+    )
+
+
 def parse_sweep_fraction(env):
     """Read SWEEP_MAX_DELETE_FRACTION from `env` (vault #6, F12).
 
@@ -645,15 +666,18 @@ def parse_sweep_fraction(env):
     1.0 = the guard is off (operator override).
     """
     raw = env.get("SWEEP_MAX_DELETE_FRACTION")
-    if raw is None or not raw.strip():
+    if raw is None or not raw.strip(_ASCII_SPACE):
         log.info(
             f"SWEEP_MAX_DELETE_FRACTION unset or empty — using the default "
             f"{SWEEP_MAX_DELETE_FRACTION_DEFAULT}"
         )
         return SWEEP_MAX_DELETE_FRACTION_DEFAULT
-    try:
-        value = float(raw)
-    except ValueError:
+    text = raw.strip(_ASCII_SPACE)
+    match = _FRACTION_RE.fullmatch(text)
+    value = float(text) if match else None
+    # A non-zero mantissa that underflows to 0.0 ("1e-400") would silently
+    # mean "never sweep"; refused like any other unrepresentable value.
+    if value == 0.0 and any(c in "123456789" for c in match.group("mantissa")):
         value = None
     if value is None or not math.isfinite(value) or not 0.0 <= value <= 1.0:
         raise IngestSettingsError(
@@ -677,9 +701,10 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
     kill the run; in different pages they went through silently. Last wins is
     what two upserts issued in line order would have stored. The kept rows are
     returned in the order of their (last) occurrence. doc_ids are compared
-    exactly, as the UNIQUE constraint does. A WARNING gives the number of
-    dropped lines, the number of doc_ids concerned and up to `sample_size` of
-    them (first-seen order).
+    exactly, as the UNIQUE constraint does (parse_line only lets non-empty
+    strings through, so Python and Postgres equality agree). A WARNING gives
+    the number of dropped lines, the number of doc_ids concerned and up to
+    `sample_size` of them (first-seen order).
     """
     last = {}
     for i, row in enumerate(rows):
@@ -717,6 +742,8 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
 #   another mount). Everything under it, recursively -- with the producer
 #   basenames below still skipped, so this mode finds exactly what the scan
 #   found before the allowlist existed.
+# In both, a match that cannot be read is kept (and fails the run, see
+# _glob_files); only directories are dropped.
 #
 # MANIFEST_GLOBS (comma-separated glob patterns relative to DATA_DIR, `**`
 # recursive) overrides both and is taken literally (no basename filter).
@@ -725,8 +752,9 @@ MANIFEST_SUBDIR = "manifest"
 ROOT_LAYOUT_GLOBS = ("manifest/**/*.jsonl", "manifest.jsonl")
 MANIFEST_DIR_LAYOUT_GLOBS = ("**/*.jsonl",)
 
-# Producer files that are not manifests, skipped by basename in the
-# manifest-dir layout only (the root layout's allowlist never reaches them):
+# Producer files that are not manifests, skipped by basename in both detected
+# layouts (in the root layout, for one that lands inside manifest/ -- parity
+# with the pre-allowlist scan); MANIFEST_GLOBS is taken literally:
 # the cadence snapshot and the watchdog's private state (ingest_cadence.py),
 # the runs telemetry (ingest_runs.py), the discovery-error trail
 # (ingest_discovery_errors.py), and three producer audit files.
@@ -767,11 +795,37 @@ def _glob_files(data_dir, patterns, excluded=frozenset()):
         for path in glob.glob(os.path.join(data_dir, pattern), recursive=True):
             if os.path.basename(path) in excluded:
                 continue
-            if not os.path.isfile(path):
-                log.warning(f"manifest scan: {path} matches but is not a file — skipped")
+            # Only a directory is skipped. Anything else that matches stays in
+            # the list even if it cannot be read (a dangling symlink, a file
+            # the SMB mount denies or fails on): open() then raises and the
+            # run aborts BEFORE the sweep. Skipping it here would make its
+            # rows look deleted and the sweep would soft-delete them.
+            if os.path.isdir(path):
+                log.warning(f"manifest scan: {path} matches but is a directory — skipped")
                 continue
             found.add(path)
     return sorted(found)
+
+
+def _warn_unread_root_files(data_dir):
+    """Root layout: name the *.jsonl files at the data/ root that are not read.
+
+    The known producer files and the legacy manifest.jsonl are expected there;
+    anything else may be a manifest written to the wrong place, so it is
+    named rather than silently ignored.
+    """
+    expected = EXCLUDED_BASENAMES | {"manifest.jsonl"}
+    unread = sorted(
+        os.path.basename(p)
+        for p in glob.glob(os.path.join(data_dir, "*.jsonl"))
+        if os.path.basename(p) not in expected
+    )
+    if unread:
+        log.warning(
+            f"manifest scan: {len(unread)} .jsonl file(s) at the root of {data_dir} "
+            f"are not read in the root layout (only manifest/**/*.jsonl and "
+            f"manifest.jsonl are manifests): {', '.join(unread)}"
+        )
 
 
 def find_manifest_files(data_dir, env):
@@ -784,6 +838,8 @@ def find_manifest_files(data_dir, env):
     elif os.path.isdir(subdir):
         mode = f"root layout ({subdir}/ is a directory)"
         patterns = ROOT_LAYOUT_GLOBS
+        excluded = EXCLUDED_BASENAMES
+        _warn_unread_root_files(data_dir)
     else:
         if os.path.lexists(subdir):
             log.warning(
@@ -810,10 +866,26 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
     except json.JSONDecodeError as e:
         log.warning(f"Skipping invalid line ({source_file}:{line_num}): {e}")
         return None
+    if not isinstance(obj, dict):
+        log.warning(
+            f"Skipping line ({source_file}:{line_num}): a JSON "
+            f"{type(obj).__name__}, not an object"
+        )
+        return None
 
+    # doc_id is the TEXT upsert key: only a non-empty string free of NUL
+    # (which Postgres TEXT cannot hold) is one. Anything else is rejected, not
+    # coerced: 5 and "5" would be one key to Postgres but two to dedupe_rows
+    # (vault #6 crash again), 1 and true one to Python, [1] unhashable.
     doc_id = obj.get("doc_id")
-    if not doc_id:
-        log.warning(f"Skipping line without doc_id ({source_file}:{line_num})")
+    if not isinstance(doc_id, str) or not doc_id or "\x00" in doc_id:
+        reason = "without doc_id" if doc_id is None else f"with invalid doc_id {doc_id!r}"
+        log.warning(
+            f"Skipping line {reason} ({source_file}:{line_num}): "
+            "doc_id must be a non-empty string"
+        )
+        if counters is not None:
+            counters["invalid_doc_id"] = counters.get("invalid_doc_id", 0) + 1
         return None
 
     corpus = resolve_corpus(obj.get("corpus"), default_corpus)
@@ -954,7 +1026,7 @@ def main(*, corpus=None, data_dir=None):
         log.warning(f"No .jsonl manifest files found under {data_dir} — skipping the documents pass")
 
     run_ts = datetime.now(timezone.utc)
-    counters = {"corpus_conflict": 0}
+    counters = {"corpus_conflict": 0, "invalid_doc_id": 0}
 
     conn = psycopg2.connect(database_url)
     conn.autocommit = False
@@ -995,6 +1067,11 @@ def main(*, corpus=None, data_dir=None):
             total_rows += len(rows)
             log.info(f"{filepath}: upserted {len(rows)} rows")
 
+        if counters["invalid_doc_id"]:
+            log.warning(
+                f"Rejected {counters['invalid_doc_id']} line(s) whose doc_id is "
+                "missing or not a non-empty string"
+            )
         if counters["corpus_conflict"]:
             log.warning(
                 f"Rejected {counters['corpus_conflict']} line(s) with a "
@@ -1014,13 +1091,7 @@ def main(*, corpus=None, data_dir=None):
             if candidates == 0:
                 log.info("No rows to soft-delete")
             elif not should_sweep(candidates, live, sweep_max_fraction):
-                log.warning(
-                    f"SWEEP BLOCKED: {candidates}/{live} live rows "
-                    f"({candidates / live:.1%}) would be soft-deleted, above "
-                    f"SWEEP_MAX_DELETE_FRACTION={sweep_max_fraction:.0%} "
-                    "— possible torn/partial share sync. If this deletion "
-                    "wave is legitimate, re-run with a higher fraction."
-                )
+                log.warning(sweep_blocked_message(candidates, live, sweep_max_fraction))
             else:
                 with conn.cursor() as cur:
                     cur.execute(SWEEP_SQL, (run_ts, run_ts, run_ts, default_corpus))
