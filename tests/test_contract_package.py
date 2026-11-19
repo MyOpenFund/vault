@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 import venv
 from pathlib import Path
@@ -93,6 +94,31 @@ def test_readme_documents_every_column_refusal_and_notice():
                if f"| `{n}` |" not in readme]
     assert missing == []
     assert "must put `corpus` in its point ids" in readme
+
+
+def test_a_vendored_copy_works_from_pythonpath(tmp_path):
+    """The ingestion image (and the NAS bind mount) use a plain copy of
+    src/vault_contract, not an install: the copy alone, golden data included,
+    must import and check a row."""
+    vendor = tmp_path / "vendor"
+    shutil.copytree(CONTRACT / "src" / "vault_contract", vendor / "vault_contract",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    probe = (
+        "import vault_contract as c\n"
+        "from vault_contract import golden\n"
+        "case = golden.accepted()['sec_10k']\n"
+        "voc = c.load_vocabulary(golden.vocabulary('company'))\n"
+        "checked = c.check_row(case['row'], voc, expected_corpus='company')\n"
+        "print(c.__file__)\n"
+        "print(checked.accepted, len(checked.columns))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PYTHONPATH"] = str(vendor)
+    out = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env,
+                         check=True, capture_output=True, text=True, timeout=60)
+    file_line, result = out.stdout.splitlines()
+    assert Path(file_line).is_relative_to(vendor), file_line
+    assert result == "True 18"
 
 
 # --- the ingestion image ships the package (no pip at run time) -------------
