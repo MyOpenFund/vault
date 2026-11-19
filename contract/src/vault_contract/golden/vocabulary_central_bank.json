@@ -18,6 +18,10 @@
     {
       "code": "tr",
       "label": "Central Bank of the Republic of Turkiye"
+    },
+    {
+      "code": "jp",
+      "label": "Bank of Japan"
     }
   ],
   "doc_types": [

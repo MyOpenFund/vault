@@ -124,31 +124,45 @@ Both reason lists, in check order, are part of the contract: run reports count r
 | Reason | When |
 |---|---|
 | `missing_doc_id` | `doc_id` absent or `""` |
-| `invalid_doc_id` | `doc_id` not a string, or holding a NUL |
+| `missing_corpus` | `corpus` absent or `""`, once the transition is over (`transition=False`) |
+| `missing_source_code` | `source_code` absent or `""` (checked with or without a vocabulary) |
+| `missing_doc_type` | `doc_type` absent or `""` |
+| `missing_language` | `language` absent or `""` |
+| `missing_provenance` | `provenance` absent or `""` |
+| `bad_text` | a text column set to something else than a non-blank string without NUL: a number (a CIK `320193` has lost its zeros), a list, an object, `"  "`, a NUL; `field` names the column |
 | `corpus_conflict` | `corpus` present and not the ingesting service's corpus |
-| `bad_title` | `title` present but not a string |
-| `unknown_source_code` | `source_code` not declared in the vocabulary (absent included) |
+| `unknown_source_code` | `source_code` not declared in the vocabulary |
 | `unknown_doc_type` | `doc_type` not declared in the vocabulary (a raw form such as `10-K` included) |
 | `unknown_provenance` | `provenance` not declared in the vocabulary |
-| `bad_language` | `language` not two lowercase letters (`english`, `EN`, absent) |
+| `bad_language` | `language` not two lowercase letters (`english`, `EN`) |
 | `bad_date` | `date` not an existing ISO `YYYY-MM-DD` day |
 | `year_mismatch` | `year` not the integer year of `date`, or a `year` without `date` |
-| `bad_date_precision` | `date_precision` set on a dated row and not `day`, `month` or `year` (`Day` included) |
-| `bad_date_kind` | `date_kind` not `publication`, `meeting` or `period` |
-| `absolute_local_path` | `local_path` absolute, with a drive letter, a backslash or a `..` segment |
+| `bad_date_precision` | `date_precision` of a dated row not `day`, `month` or `year` (`Day` included) |
+| `bad_date_kind` | `date_kind` of a dated row not `publication`, `meeting` or `period` |
+| `bad_local_path` | `local_path` not a plain relative POSIX path: absolute, a `scheme:` or drive prefix (`file:///…`, `C:`), a backslash, an empty, `.` or `..` segment (`raw//a.pdf`, `./a`, trailing `/`), leading or trailing whitespace, a control character, a first segment starting with `~` |
 | `bad_sha256` | `sha256` not 64 lowercase hexadecimal characters |
 | `entity_half` | one of `entity_scheme` / `entity_value` without the other |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
 
+A field refused for presence or type is not judged further (a numeric `source_code` is
+`bad_text`, not also `unknown_source_code`).
+
 ### Notice reasons
 
-`quality_notices` returns one `Notice(reason, field, value)` per finding.
+`quality_notices` returns one `Notice(reason, field, value)` per finding; `value` is the
+value as the producer wrote it.
 
 | Reason | When |
 |---|---|
+| `corpus_missing` | transition: no `corpus`; the ingesting service's `CORPUS` applies |
+| `legacy_alias` | transition: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
+| `legacy_data_prefix` | transition: `local_path` started with `data/`, stripped |
 | `empty_title` | `title` absent, null or blank |
 | `precision_not_stated` | `date` set, `date_precision` absent or null |
-| `precision_without_date` | `date_precision` set on an undated row (dropped by `split_row`; `value` is the dropped one) |
+| `date_not_period_start` | `date_precision` `month` and the day is not 1, or `year` and the date is not 1 January |
+| `precision_without_date` | `date_precision` set on an undated row (dropped by `split_row`) |
+| `kind_without_date` | `date_kind` set on an undated row (dropped by `split_row`) |
+| `mime_type_missing` | `local_path` set, `mime_type` absent |
 
 `contract/scripts/check_manifests.py` counts both over a directory of manifests.
 

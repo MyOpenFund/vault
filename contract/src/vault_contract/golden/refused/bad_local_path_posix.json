@@ -1,5 +1,5 @@
 {
-  "description": "No language: the field is mandatory.",
+  "description": "An absolute path on the producer's machine instead of a path relative to the corpus data root.",
   "expected_corpus": "company",
   "row": {
     "doc_id": "cf0e49e6e176a851",
@@ -11,12 +11,13 @@
     "year": 2024,
     "date_precision": "day",
     "date_kind": "publication",
+    "language": "en",
     "provenance": "edgar_index",
     "document_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm",
     "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm",
     "mime_type": "application/pdf",
     "sha256": "6df8d721f2acedac8c2613f16924dd39e4e04cb6b276e66e590fa499d51535a5",
-    "local_path": "raw/0000320193/A1/2024/cf0e49e6e176a851.pdf",
+    "local_path": "/Users/x/raw/a.pdf",
     "entity_scheme": "cik",
     "entity_value": "0000320193",
     "cik": "0000320193",
@@ -38,6 +39,6 @@
     "frequency": ""
   },
   "expected_reasons": [
-    "bad_language"
+    "bad_local_path"
   ]
 }

@@ -2,14 +2,18 @@
 
 Producers and consumers test against the same rows the vault tests against:
 
-- accepted(): realistic rows every implementation must accept unchanged
-  (`{"description", "row"}`), one file per case in this directory;
+- accepted(): realistic rows every implementation must accept, one file per
+  case in this directory: `{"description", "expected_corpus", "row",
+  "expected_columns"}` (the 18 columns after split_row) and, when the row
+  carries any, `"expected_notices"` (reasons, one entry per notice);
 - refused(): rows that must be refused with exactly `expected_reasons`
-  (`{"description", "expected_corpus", "row", "expected_reasons"}`), in refused/;
+  (`{"description", "expected_corpus", "row", "expected_reasons"}`, plus
+  `"transition": false` for a case judged as after the cleanup), in refused/;
 - vocabulary(corpus): the vocabulary excerpt the cases are checked against,
   `vocabulary_<corpus with - as _>.json`.
 
-An accepted case's expected corpus is its row's `corpus`.
+Every case is checked with the vocabulary of its `expected_corpus` and, unless
+it says otherwise, with transition=True.
 """
 import json
 from importlib.resources import files

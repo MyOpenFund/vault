@@ -1,0 +1,29 @@
+{
+  "description": "A title that is not a string: refused (an absent or blank title is only a notice).",
+  "expected_corpus": "central-bank",
+  "row": {
+    "doc_id": "e1e6a63950c50d3f",
+    "corpus": "central-bank",
+    "source_code": "ecb",
+    "doc_type": "C1",
+    "title": 42,
+    "date": "2023-06-27",
+    "year": 2023,
+    "date_precision": "day",
+    "date_kind": "publication",
+    "language": "en",
+    "provenance": "bank_site",
+    "document_url": "https://www.ecb.europa.eu/press/key/date/2023/html/ecb.sp230627~0b03cde2c2.en.html",
+    "source_url": "https://www.ecb.europa.eu/press/key/html/index.en.html",
+    "mime_type": "application/pdf",
+    "sha256": "fdd3a53b21b5fd7b7fe7ef6f4209327854b0383ba3cd93a9f720c7fee8456983",
+    "local_path": "raw/ecb/C1/2023/e1e6a63950c50d3f.pdf",
+    "html_path": "raw/ecb/C1/2023/e1e6a63950c50d3f.html",
+    "date_source": "bank_site",
+    "repec_handle": "",
+    "alt_urls": []
+  },
+  "expected_reasons": [
+    "bad_text"
+  ]
+}

@@ -1,9 +1,8 @@
 {
-  "description": "An absolute path on the producer's machine instead of a path relative to the corpus data root.",
+  "description": "No corpus once the transition is over (transition=False): refused. During the transition the same row is accepted with a corpus_missing notice.",
   "expected_corpus": "company",
   "row": {
     "doc_id": "cf0e49e6e176a851",
-    "corpus": "company",
     "source_code": "sec",
     "doc_type": "A1",
     "title": "Apple Inc. 10-K (2024)",
@@ -17,7 +16,7 @@
     "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm",
     "mime_type": "application/pdf",
     "sha256": "6df8d721f2acedac8c2613f16924dd39e4e04cb6b276e66e590fa499d51535a5",
-    "local_path": "/Users/x/raw/a.pdf",
+    "local_path": "raw/0000320193/A1/2024/cf0e49e6e176a851.pdf",
     "entity_scheme": "cik",
     "entity_value": "0000320193",
     "cik": "0000320193",
@@ -39,6 +38,7 @@
     "frequency": ""
   },
   "expected_reasons": [
-    "absolute_local_path"
-  ]
+    "missing_corpus"
+  ],
+  "transition": false
 }

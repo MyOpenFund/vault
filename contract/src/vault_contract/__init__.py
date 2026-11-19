@@ -12,15 +12,17 @@ from .fields import (
     COLUMNS, DATE_KINDS, DATE_PRECISIONS, EXPECTED, REFUSED_WHEN_ABSENT, TRANSITION_ALIASES,
     split_row,
 )
-from .validate import NOTICES, REASONS, Notice, Refusal, quality_notices, validate_row
+from .validate import (
+    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, quality_notices, validate_row,
+)
 from .vocabulary import Vocabulary, is_supported_version, load_vocabulary, validate_vocabulary
 
 CONTRACT_NAME = "documents"
 CONTRACT_VERSION = "1.0.0"
 
 __all__ = [
-    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "NOTICES",
-    "Notice", "REASONS", "EXPECTED", "REFUSED_WHEN_ABSENT", "Refusal", "TRANSITION_ALIASES", "Vocabulary",
-    "is_supported_version", "load_vocabulary", "quality_notices", "split_row", "validate_row",
-    "validate_vocabulary",
+    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "EXPECTED",
+    "NOTICES", "REASONS", "REFUSED_WHEN_ABSENT", "TRANSITION_ALIASES", "CheckedRow", "Notice",
+    "Refusal", "Vocabulary", "check_row", "is_supported_version", "load_vocabulary",
+    "quality_notices", "split_row", "validate_row", "validate_vocabulary",
 ]

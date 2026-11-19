@@ -81,7 +81,7 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     assert Path(file_line).is_relative_to(env_dir), file_line
     assert name_line == "documents 1.0.0"
     assert accepted.split() == sorted(vault_contract.golden.accepted())
-    assert len(accepted.split()) == 8
+    assert len(accepted.split()) == 10
     assert refused.split() == sorted(vault_contract.golden.refused())
     assert vocabularies == "company central-bank"
 

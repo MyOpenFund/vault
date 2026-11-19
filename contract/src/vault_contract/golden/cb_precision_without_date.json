@@ -1,7 +1,9 @@
 {
-  "description": "Working paper discovered through RePEc with a month precision but no date: split_row drops the precision (no date, no precision) and the row is written with a precision_without_date notice.",
+  "description": "Working paper discovered through RePEc with a month precision and a date_kind but no date: split_row drops both (no date, no precision, no kind) and the row is written with a precision_without_date and a kind_without_date notice.",
+  "expected_corpus": "central-bank",
   "expected_notices": [
-    "precision_without_date"
+    "precision_without_date",
+    "kind_without_date"
   ],
   "row": {
     "doc_id": "34578afa2cca7273",
@@ -22,6 +24,27 @@
     "html_path": "raw/ca/D1/0/34578afa2cca7273.html",
     "date_source": "repec",
     "repec_handle": "",
-    "alt_urls": []
+    "alt_urls": [],
+    "date_kind": "publication"
+  },
+  "expected_columns": {
+    "doc_id": "34578afa2cca7273",
+    "corpus": "central-bank",
+    "source_code": "ca",
+    "doc_type": "D1",
+    "title": "Exchange Rate Volatility and Trade: A Survey",
+    "date": null,
+    "year": null,
+    "date_precision": null,
+    "date_kind": null,
+    "language": "en",
+    "provenance": "repec_discovery",
+    "document_url": "https://doi.org/10.34989/swp-1994-5",
+    "source_url": "https://ideas.repec.org/p/bca/bocawp/94-5.html",
+    "mime_type": "application/pdf",
+    "sha256": "e2ef4651c7304d03d583008b6fae423781d5668489b4ab5828bede08d5f7b6d6",
+    "local_path": "raw/ca/D1/0/34578afa2cca7273.pdf",
+    "entity_scheme": null,
+    "entity_value": null
   }
 }

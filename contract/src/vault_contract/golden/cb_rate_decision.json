@@ -1,5 +1,6 @@
 {
   "description": "ECB rate decision of 21 July 2022, dated by its meeting (date_kind meeting). Discovered but not downloaded yet: no file, so no local_path, no sha256, and the blank mime_type the producer writes before a download is read as absent.",
+  "expected_corpus": "central-bank",
   "row": {
     "doc_id": "ceb04c0aa89ed888",
     "corpus": "central-bank",
@@ -21,5 +22,25 @@
     "date_source": "bank_site",
     "repec_handle": "",
     "alt_urls": []
+  },
+  "expected_columns": {
+    "doc_id": "ceb04c0aa89ed888",
+    "corpus": "central-bank",
+    "source_code": "ecb",
+    "doc_type": "A1",
+    "title": "Monetary policy decisions",
+    "date": "2022-07-21",
+    "year": 2022,
+    "date_precision": "day",
+    "date_kind": "meeting",
+    "language": "en",
+    "provenance": "bank_site",
+    "document_url": "https://www.ecb.europa.eu/press/pr/date/2022/html/ecb.mp220721~53e5bdd317.en.html",
+    "source_url": "https://www.ecb.europa.eu/press/pr/html/index.en.html",
+    "mime_type": null,
+    "sha256": null,
+    "local_path": null,
+    "entity_scheme": null,
+    "entity_value": null
   }
 }

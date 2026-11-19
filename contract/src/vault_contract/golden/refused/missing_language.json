@@ -1,8 +1,8 @@
 {
-  "description": "A doc_id holding a NUL character, which a Postgres TEXT column cannot store.",
+  "description": "No language: the field is mandatory.",
   "expected_corpus": "company",
   "row": {
-    "doc_id": "cf0e49e6\u0000e176a851",
+    "doc_id": "cf0e49e6e176a851",
     "corpus": "company",
     "source_code": "sec",
     "doc_type": "A1",
@@ -11,7 +11,6 @@
     "year": 2024,
     "date_precision": "day",
     "date_kind": "publication",
-    "language": "en",
     "provenance": "edgar_index",
     "document_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm",
     "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm",
@@ -39,6 +38,6 @@
     "frequency": ""
   },
   "expected_reasons": [
-    "invalid_doc_id"
+    "missing_language"
   ]
 }

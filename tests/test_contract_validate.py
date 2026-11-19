@@ -4,9 +4,10 @@ Two levels. A refused row is never written and makes the vault skip its
 soft-delete sweep (spec §4.3), so refusals are kept for structure and identity
 and must be exact in both directions: every golden row a producer writes today
 is accepted, and every malformed value names the one reason a run report will
-count. Quality notices (an empty title, a date whose precision is not stated)
-are counted but the row is written: on the real central-bank manifests
-(39,663 rows) refusing them would have blocked 25,121 rows and every sweep.
+count. Quality notices (an empty title, a date whose precision is not stated,
+a transition key read) are counted but the row is written: on the real
+central-bank manifests (39,663 rows) refusing them would have blocked 25,121
+rows and every sweep.
 The golden files ship with the package, so producers' CI checks the same cases.
 """
 import dataclasses
@@ -16,7 +17,7 @@ import pytest
 from vault_contract import golden
 from vault_contract.fields import split_row
 from vault_contract.validate import (
-    NOTICES, REASONS, Notice, Refusal, quality_notices, validate_row,
+    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, quality_notices, validate_row,
 )
 from vault_contract.vocabulary import (
     Vocabulary, is_supported_version, load_vocabulary, validate_vocabulary,
@@ -25,17 +26,17 @@ from vault_contract.vocabulary import (
 VOCABULARIES = {c: load_vocabulary(golden.vocabulary(c)) for c in ("company", "central-bank")}
 
 
-def _reasons(row, *, expected_corpus, vocabulary="from corpus"):
+def _reasons(row, *, expected_corpus, vocabulary="from corpus", transition=True):
     if vocabulary == "from corpus":
         vocabulary = VOCABULARIES[expected_corpus]
-    columns, _ = split_row(row)
-    return sorted(r.reason for r in validate_row(columns, vocabulary,
+    columns, _ = split_row(row, transition=transition)
+    return sorted(r.reason for r in validate_row(columns, vocabulary, transition=transition,
                                                  expected_corpus=expected_corpus))
 
 
-def _notices(row):
-    columns, _ = split_row(row)
-    return sorted(n.reason for n in quality_notices(columns, row=row))
+def _notices(row, *, transition=True):
+    columns, _ = split_row(row, transition=transition)
+    return sorted(n.reason for n in quality_notices(columns, row=row, transition=transition))
 
 
 def _golden(name):
@@ -140,21 +141,33 @@ def test_supported_versions_are_this_major_up_to_this_minor(version, ok):
     assert is_supported_version(version) is ok
 
 
-# --- validate_row: golden ---------------------------------------------------
+# --- golden ------------------------------------------------------------------
+
+REFERENCE_ROWS = ("cb_rate_decision", "cb_rendered_html", "cb_undated", "sec_10k", "sec_form4")
+
 
 def test_golden_has_the_reference_rows_and_the_notice_rows():
-    assert sorted(golden.accepted()) == [
-        "cb_empty_title", "cb_precision_not_stated", "cb_precision_without_date",
-        "cb_rate_decision", "cb_rendered_html", "cb_undated", "sec_10k", "sec_form4"]
+    assert sorted(golden.accepted()) == sorted([
+        *REFERENCE_ROWS, "cb_empty_title", "cb_legacy_form", "cb_precision_not_stated",
+        "cb_precision_without_date", "sec_text_without_mime"])
 
 
 @pytest.mark.parametrize("name", sorted(golden.accepted()))
-def test_every_golden_row_is_accepted_with_exactly_its_notices(name):
+def test_every_golden_row_is_accepted_with_exactly_its_columns_and_notices(name):
     case = golden.accepted()[name]
-    assert set(case) <= {"description", "row", "expected_notices"}
-    row = case["row"]
-    assert _reasons(row, expected_corpus=row["corpus"]) == []
-    assert _notices(row) == sorted(case.get("expected_notices", []))
+    assert set(case) - {"expected_notices"} == {
+        "description", "expected_corpus", "row", "expected_columns"}
+    corpus = case["expected_corpus"]
+    checked = check_row(case["row"], VOCABULARIES[corpus], expected_corpus=corpus)
+    assert checked.refusals == ()
+    assert checked.columns == case["expected_columns"]
+    assert sorted(n.reason for n in checked.notices) == sorted(case.get("expected_notices", []))
+
+
+@pytest.mark.parametrize("name", sorted(golden.accepted()))
+def test_every_golden_row_is_accepted_without_a_vocabulary(name):
+    case = golden.accepted()[name]
+    assert _reasons(case["row"], expected_corpus=case["expected_corpus"], vocabulary=None) == []
 
 
 def test_every_notice_reason_has_an_accepted_golden_row():
@@ -162,23 +175,18 @@ def test_every_notice_reason_has_an_accepted_golden_row():
     assert covered == set(NOTICES)
 
 
-def test_the_five_reference_rows_carry_no_notice():
-    for name in ("cb_rate_decision", "cb_rendered_html", "cb_undated", "sec_10k", "sec_form4"):
+def test_the_reference_rows_carry_no_notice():
+    for name in REFERENCE_ROWS:
         assert "expected_notices" not in golden.accepted()[name]
-
-
-@pytest.mark.parametrize("name", sorted(golden.accepted()))
-def test_every_golden_row_is_accepted_without_a_vocabulary(name):
-    row = golden.accepted()[name]["row"]
-    assert _reasons(row, expected_corpus=row["corpus"], vocabulary=None) == []
 
 
 @pytest.mark.parametrize("name", sorted(golden.refused()))
 def test_every_refused_golden_row_gets_exactly_its_reasons(name):
     case = golden.refused()[name]
-    assert set(case) == {"description", "expected_corpus", "row", "expected_reasons"}
-    assert _reasons(case["row"], expected_corpus=case["expected_corpus"]) == \
-        sorted(case["expected_reasons"])
+    assert set(case) - {"transition"} == {
+        "description", "expected_corpus", "row", "expected_reasons"}
+    assert _reasons(case["row"], expected_corpus=case["expected_corpus"],
+                    transition=case.get("transition", True)) == sorted(case["expected_reasons"])
 
 
 def test_every_refusal_reason_has_a_refused_golden_row():
@@ -186,35 +194,94 @@ def test_every_refusal_reason_has_a_refused_golden_row():
     assert covered == set(REASONS)
 
 
-def test_reasons_are_the_planned_list():
+def test_reasons_are_the_decided_list():
     assert REASONS == (
-        "missing_doc_id", "invalid_doc_id", "corpus_conflict", "bad_title",
+        "missing_doc_id", "missing_corpus", "missing_source_code", "missing_doc_type",
+        "missing_language", "missing_provenance", "bad_text", "corpus_conflict",
         "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
-        "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind",
-        "absolute_local_path", "bad_sha256", "entity_half", "unknown_entity_scheme",
+        "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
+        "bad_sha256", "entity_half", "unknown_entity_scheme",
     )
 
 
 def test_notices_are_the_decided_list():
-    assert NOTICES == ("empty_title", "precision_not_stated", "precision_without_date")
+    assert NOTICES == (
+        "corpus_missing", "legacy_alias", "legacy_data_prefix", "empty_title",
+        "precision_not_stated", "date_not_period_start", "precision_without_date",
+        "kind_without_date", "mime_type_missing",
+    )
 
 
-# --- validate_row: adversarial ----------------------------------------------
+# --- check_row ---------------------------------------------------------------
 
-@pytest.mark.parametrize("base, change, reason", [
-    ("cb_rate_decision", {"date_precision": "Day"}, "bad_date_precision"),
-    ("sec_10k", {"doc_type": "10-K"}, "unknown_doc_type"),
-    ("cb_rendered_html", {"language": "english"}, "bad_language"),
-    ("sec_10k", {"local_path": "/Users/x/raw/a.pdf"}, "absolute_local_path"),
-    ("sec_10k", {"local_path": "raw/../../etc"}, "absolute_local_path"),
-    ("sec_10k", {"year": 2023}, "year_mismatch"),
-    ("sec_form4", {"entity_value": None}, "entity_half"),
-    ("sec_form4", {"entity_scheme": None}, "entity_half"),
+def test_check_row_is_split_validate_and_notice_in_one_call():
+    row = _golden("sec_10k")
+    checked = check_row(row, VOCABULARIES["company"], expected_corpus="company")
+    assert isinstance(checked, CheckedRow)
+    assert (checked.columns, checked.extra) == split_row(row)
+    assert checked.accepted and checked.refusals == () and checked.notices == ()
+
+
+def test_check_row_reports_refusals_and_notices_together():
+    row = _golden("cb_rate_decision")
+    row.update(title="", date_kind="Meeting")
+    checked = check_row(row, VOCABULARIES["central-bank"], expected_corpus="central-bank")
+    assert not checked.accepted
+    assert [r.reason for r in checked.refusals] == ["bad_date_kind"]
+    assert [n.reason for n in checked.notices] == ["empty_title"]
+
+
+def test_a_vocabulary_of_another_corpus_is_a_caller_error():
+    columns, _ = split_row(_golden("sec_10k"))
+    with pytest.raises(ValueError, match="central-bank"):
+        validate_row(columns, VOCABULARIES["central-bank"], expected_corpus="company")
+    with pytest.raises(ValueError):
+        check_row(_golden("sec_10k"), VOCABULARIES["company"], expected_corpus="central-bank")
+
+
+# --- refusals: presence and text ---------------------------------------------
+
+@pytest.mark.parametrize("field", ["source_code", "doc_type", "provenance", "language", "doc_id"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_an_absent_code_is_refused_even_without_a_vocabulary(field, value):
+    row = _golden("cb_rendered_html")
+    row[field] = value
+    assert _reasons(row, expected_corpus="central-bank", vocabulary=None) == [f"missing_{field}"]
+
+
+@pytest.mark.parametrize("field", ["source_code", "doc_type", "provenance", "doc_id"])
+@pytest.mark.parametrize("value", ["  ", 5, ["ecb"], {"a": 1}, True, "ec\x00b"])
+def test_a_code_that_is_not_text_is_bad_text_even_without_a_vocabulary(field, value):
+    row = _golden("cb_rendered_html")
+    row[field] = value
+    assert _reasons(row, expected_corpus="central-bank", vocabulary=None) == ["bad_text"]
+    assert _reasons(row, expected_corpus="central-bank") == ["bad_text"]   # not also unknown_
+
+
+@pytest.mark.parametrize("field", [
+    "title", "document_url", "source_url", "mime_type", "local_path", "entity_value",
+    "date_precision", "date_kind", "language",
 ])
-def test_adversarial_values_are_refused_for_one_named_reason(base, change, reason):
-    row = _golden(base)
-    row.update(change)
-    assert _reasons(row, expected_corpus=row["corpus"]) == [reason]
+@pytest.mark.parametrize("value", [5, ["x"], {"x": 1}, "a\x00b"])
+def test_every_set_text_column_must_be_text(field, value):
+    row = _golden("sec_10k")
+    row[field] = value
+    columns, _ = split_row(row)
+    refusals = validate_row(columns, VOCABULARIES["company"], expected_corpus="company")
+    assert refusals == [Refusal("bad_text", field, value)]
+
+
+def test_a_numeric_cik_is_refused():
+    """320193 is not how the scheme spells 0000320193."""
+    row = _golden("sec_10k")
+    row["entity_value"] = 320193
+    assert _reasons(row, expected_corpus="company") == ["bad_text"]
+
+
+def test_a_non_text_entity_scheme_is_refused_without_a_vocabulary():
+    row = _golden("sec_10k")
+    row["entity_scheme"] = 7
+    assert _reasons(row, expected_corpus="company", vocabulary=None) == ["bad_text"]
 
 
 def test_a_refusal_names_the_field_and_the_offending_value():
@@ -225,36 +292,50 @@ def test_a_refusal_names_the_field_and_the_offending_value():
         Refusal(reason="bad_date_precision", field="date_precision", value="Day")]
 
 
+# --- refusals: values ----------------------------------------------------------
+
+@pytest.mark.parametrize("base, change, reason", [
+    ("cb_rate_decision", {"date_precision": "Day"}, "bad_date_precision"),
+    ("sec_10k", {"doc_type": "10-K"}, "unknown_doc_type"),
+    ("cb_rendered_html", {"language": "english"}, "bad_language"),
+    ("sec_10k", {"local_path": "/Users/x/raw/a.pdf"}, "bad_local_path"),
+    ("sec_10k", {"local_path": "raw/../../etc"}, "bad_local_path"),
+    ("sec_10k", {"year": 2023}, "year_mismatch"),
+    ("sec_form4", {"entity_value": None}, "entity_half"),
+    ("sec_form4", {"entity_scheme": None}, "entity_half"),
+])
+def test_adversarial_values_are_refused_for_one_named_reason(base, change, reason):
+    row = _golden(base)
+    row.update(change)
+    assert _reasons(row, expected_corpus=row["corpus"]) == [reason]
+
+
 @pytest.mark.parametrize("path", [
     "/raw/a.pdf", "raw/../a.pdf", "..", "../raw/a.pdf", "raw/..", "raw\\a.pdf",
-    "C:/raw/a.pdf", "c:raw/a.pdf", "//server/share/a.pdf", 5, ["raw/a.pdf"],
+    "C:/raw/a.pdf", "c:raw/a.pdf", "//server/share/a.pdf", "raw//a.pdf", "./a.pdf",
+    "raw/./a.pdf", "raw/", "raw/a.pdf ", " raw/a.pdf", "raw/a\tb.pdf", "raw/a\nb.pdf",
+    "raw/a\x7f.pdf", "~/raw/a.pdf", "~marc/raw/a.pdf", "file:///raw/a.pdf",
+    "https://example.org/a.pdf", "s3:bucket/a.pdf",
 ])
-def test_local_path_must_stay_under_the_corpus_data_root(path):
+def test_local_path_must_be_a_plain_path_under_the_data_root(path):
     row = _golden("sec_10k")
     row["local_path"] = path
-    assert _reasons(row, expected_corpus="company") == ["absolute_local_path"]
+    assert _reasons(row, expected_corpus="company") == ["bad_local_path"]
 
 
-@pytest.mark.parametrize("path", ["raw/a.pdf", "raw/..a.pdf", "raw/a..pdf", "raw/./a.pdf", "a.pdf"])
-def test_relative_local_paths_are_accepted(path):
+@pytest.mark.parametrize("path", ["raw/a.pdf", "raw/..a.pdf", "raw/a..pdf", "a.pdf",
+                                  "raw/a~b.pdf", "raw/a:b.pdf", "raw/é.pdf"])
+def test_plain_relative_local_paths_are_accepted(path):
     row = _golden("sec_10k")
     row["local_path"] = path
     assert _reasons(row, expected_corpus="company") == []
 
 
-def test_a_legacy_data_prefixed_path_is_accepted_after_split():
-    """Transition: split_row strips `data/`, so the row passes."""
-    row = _golden("cb_rendered_html")
-    row["local_path"] = "data/" + row["local_path"]
-    assert _reasons(row, expected_corpus="central-bank") == []
-
-
-@pytest.mark.parametrize("sha", ["a" * 63, "a" * 65, "g" * 64, 12345, ""])
+@pytest.mark.parametrize("sha", ["a" * 63, "a" * 65, "g" * 64, 12345])
 def test_sha256_must_be_64_lowercase_hex(sha):
     row = _golden("sec_10k")
     row["sha256"] = sha
-    # "" is read as absent by split_row: no hash is not a bad hash.
-    assert _reasons(row, expected_corpus="company") == ([] if sha == "" else ["bad_sha256"])
+    assert _reasons(row, expected_corpus="company") == ["bad_sha256"]
 
 
 @pytest.mark.parametrize("year", [None, "2024", 2024.0, True])
@@ -271,52 +352,29 @@ def test_date_must_be_an_iso_day(date):
     assert _reasons(row, expected_corpus="company") == ["bad_date"]
 
 
-@pytest.mark.parametrize("precision", ["day", "month", "year"])
-def test_every_precision_is_accepted_on_a_first_day_date(precision):
-    row = _golden("cb_rate_decision")
-    row.update(date="2022-07-01", date_precision=precision)
-    assert _reasons(row, expected_corpus="central-bank") == []
-
-
-@pytest.mark.parametrize("doc_id", ["", None])
-def test_an_empty_doc_id_is_missing(doc_id):
-    row = _golden("sec_10k")
-    row["doc_id"] = doc_id
-    assert _reasons(row, expected_corpus="company") == ["missing_doc_id"]
-
-
-@pytest.mark.parametrize("doc_id", [5, True, ["a"], {"a": 1}, "a\x00b"])
-def test_a_non_string_doc_id_is_invalid(doc_id):
-    row = _golden("sec_10k")
-    row["doc_id"] = doc_id
-    assert _reasons(row, expected_corpus="company") == ["invalid_doc_id"]
-
-
-def test_a_row_without_corpus_is_accepted_during_the_transition():
-    """Spec §4.3: the ingesting service's CORPUS applies (counted as
-    corpus_missing by the ingestion, not refused here)."""
+def test_a_row_without_corpus_is_accepted_and_noticed_during_the_transition():
     row = _golden("cb_rendered_html")
     del row["corpus"]
     assert _reasons(row, expected_corpus="central-bank") == []
+    assert _notices(row) == ["corpus_missing"]
 
 
-@pytest.mark.parametrize("corpus", ["", "Central-Bank", "company"])
+@pytest.mark.parametrize("corpus", [None, ""])
+def test_a_row_without_corpus_is_refused_after_the_transition(corpus):
+    row = _golden("cb_rendered_html")
+    row["corpus"] = corpus
+    assert _reasons(row, expected_corpus="central-bank", transition=False) == ["missing_corpus"]
+    assert _notices(row, transition=False) == []
+
+
+@pytest.mark.parametrize("corpus", ["Central-Bank", "company"])
 def test_any_other_corpus_conflicts(corpus):
     row = _golden("cb_rendered_html")
     row["corpus"] = corpus
     assert _reasons(row, expected_corpus="central-bank") == ["corpus_conflict"]
 
 
-@pytest.mark.parametrize("field, value", [
-    ("source_code", ["ecb"]), ("doc_type", {"A1": 1}), ("provenance", None), ("source_code", None),
-])
-def test_unhashable_or_missing_codes_are_unknown_not_a_crash(field, value):
-    row = _golden("cb_rendered_html")
-    row[field] = value
-    assert _reasons(row, expected_corpus="central-bank") == [f"unknown_{field}"]
-
-
-def test_without_a_vocabulary_codes_are_not_checked_but_shapes_are():
+def test_without_a_vocabulary_membership_is_not_checked_but_shapes_are():
     """Transition (spec §4.3): a corpus with no vocabulary.json yet."""
     row = _golden("sec_10k")
     row.update(source_code="SEC", doc_type="10-K", provenance="edgar", entity_scheme="isin",
@@ -325,10 +383,9 @@ def test_without_a_vocabulary_codes_are_not_checked_but_shapes_are():
 
 
 def test_a_doc_type_is_judged_by_its_own_corpus_vocabulary():
-    """Spec Q11: A1 exists in both corpora with different meanings; E3 likewise.
-    A company code the central-bank vocabulary lacks is unknown there."""
+    """Spec Q11: a company code the central-bank vocabulary lacks is unknown there."""
     row = _golden("cb_rendered_html")
-    row["doc_type"] = "B1"           # company: 8-K; central-bank excerpt: absent
+    row["doc_type"] = "B1"
     assert _reasons(row, expected_corpus="central-bank") == ["unknown_doc_type"]
 
 
@@ -336,7 +393,7 @@ def test_several_defects_are_all_reported():
     row = _golden("sec_10k")
     row.update(title=42, language="EN", sha256="x", date_kind="filing")
     assert _reasons(row, expected_corpus="company") == sorted(
-        ["bad_title", "bad_language", "bad_sha256", "bad_date_kind"])
+        ["bad_text", "bad_language", "bad_sha256", "bad_date_kind"])
 
 
 def test_validate_row_does_not_modify_the_columns():
@@ -346,7 +403,7 @@ def test_validate_row_does_not_modify_the_columns():
     assert columns == before
 
 
-# --- quality notices: the row is written, the notice counted ------------------
+# --- notices: the row is written, the notice counted --------------------------
 
 @pytest.mark.parametrize("title", [None, "", "   "])
 def test_an_empty_title_is_a_notice_not_a_refusal(title):
@@ -360,54 +417,64 @@ def test_an_empty_title_is_a_notice_not_a_refusal(title):
 def test_an_absent_title_is_a_notice_too():
     row = _golden("cb_rendered_html")
     del row["title"]
-    assert _reasons(row, expected_corpus="central-bank") == []
     assert _notices(row) == ["empty_title"]
-
-
-@pytest.mark.parametrize("title", [42, ["a"], {"t": "x"}, True])
-def test_a_title_that_is_not_a_string_is_refused_without_a_notice(title):
-    row = _golden("cb_rendered_html")
-    row["title"] = title
-    assert _reasons(row, expected_corpus="central-bank") == ["bad_title"]
-    assert _notices(row) == []
 
 
 @pytest.mark.parametrize("precision", [None, ""])
 def test_a_dated_row_without_precision_is_a_notice(precision):
-    """central-bank doctrine since #37: a producer that says nothing does not
-    claim a day; null means "not stated" (25,004 real rows)."""
+    """central-bank doctrine since #37: null means "not stated" (25,004 real rows)."""
     row = _golden("cb_rate_decision")
     row["date_precision"] = precision
     assert _reasons(row, expected_corpus="central-bank") == []
     assert _notices(row) == ["precision_not_stated"]
 
 
-def test_an_absent_precision_on_a_dated_row_is_a_notice():
+@pytest.mark.parametrize("date, precision", [
+    ("2022-07-21", "month"), ("2022-07-01", "year"), ("2022-02-01", "year"),
+])
+def test_a_month_or_year_date_off_its_period_start_is_a_notice(date, precision):
+    """26 real RePEc month rows carry a day: kept, noticed."""
     row = _golden("cb_rate_decision")
-    del row["date_precision"]
-    assert _notices(row) == ["precision_not_stated"]
+    row.update(date=date, year=2022, date_precision=precision)
+    assert _reasons(row, expected_corpus="central-bank") == []
+    assert _notices(row) == ["date_not_period_start"]
+
+
+@pytest.mark.parametrize("date, precision", [
+    ("2022-07-21", "day"), ("2022-07-01", "month"), ("2022-01-01", "year"),
+])
+def test_a_date_on_its_period_start_gets_no_notice(date, precision):
+    row = _golden("cb_rate_decision")
+    row.update(date=date, year=2022, date_precision=precision)
+    assert _notices(row) == []
 
 
 @pytest.mark.parametrize("date", [None, ""])
-def test_a_precision_on_an_undated_row_is_dropped_and_noticed(date):
+def test_precision_and_kind_on_an_undated_row_are_dropped_and_noticed(date):
     row = _golden("cb_undated")
-    row.update(date=date, date_precision="month")
+    row.update(date=date, date_precision="month", date_kind="publication")
     columns, extra = split_row(row)
-    assert columns["date_precision"] is None
-    assert "date_precision" not in extra
+    assert (columns["date_precision"], columns["date_kind"]) == (None, None)
+    assert "date_precision" not in extra and "date_kind" not in extra
     assert _reasons(row, expected_corpus="central-bank") == []
-    assert _notices(row) == ["precision_without_date"]
+    assert _notices(row) == ["kind_without_date", "precision_without_date"]
 
 
-def test_a_bad_precision_value_on_an_undated_row_is_dropped_not_refused():
-    """Dropped before any check: an undated row has no precision to judge."""
+def test_bad_values_on_an_undated_row_are_dropped_not_refused():
     row = _golden("cb_undated")
-    row["date_precision"] = "Day"
+    row.update(date_precision="Day", date_kind="Meeting")
     assert _reasons(row, expected_corpus="central-bank") == []
-    assert _notices(row) == ["precision_without_date"]
+    assert _notices(row) == ["kind_without_date", "precision_without_date"]
 
 
-def test_a_mime_type_without_local_path_is_accepted():
+def test_a_file_without_mime_type_is_a_notice():
+    row = _golden("sec_10k")
+    row["mime_type"] = ""
+    assert _reasons(row, expected_corpus="company") == []
+    assert _notices(row) == ["mime_type_missing"]
+
+
+def test_a_mime_type_without_local_path_is_accepted_silently():
     """Not a spec rule; real rows can know the type before a download."""
     row = _golden("cb_rate_decision")
     row["mime_type"] = "application/pdf"
@@ -415,7 +482,38 @@ def test_a_mime_type_without_local_path_is_accepted():
     assert _notices(row) == []
 
 
-def test_a_notice_names_the_field_and_the_value():
+def test_transition_mappings_are_noticed_with_the_old_key_and_value():
+    row = _golden("cb_rendered_html")
+    row["bank_code"] = row.pop("source_code")
+    row["pdf_url"] = row.pop("document_url")
+    row["local_path"] = "data/" + row["local_path"]
+    columns, _ = split_row(row)
+    notices = quality_notices(columns, row=row)
+    assert notices == [
+        Notice("legacy_alias", "bank_code", "ecb"),
+        Notice("legacy_alias", "pdf_url", row["pdf_url"]),
+        Notice("legacy_data_prefix", "local_path", row["local_path"]),
+    ]
+    assert _reasons(row, expected_corpus="central-bank") == []
+
+
+def test_an_alias_shadowed_by_its_contract_key_is_not_noticed():
+    row = _golden("cb_rendered_html")
+    row["bank_code"] = "us"
+    assert _notices(row) == []
+
+
+def test_after_the_transition_old_keys_are_neither_mapped_nor_noticed():
+    """transition=False: bank_code is an extra, so source_code is missing."""
+    row = _golden("cb_rendered_html")
+    row["bank_code"] = row.pop("source_code")
+    row["local_path"] = "data/" + row["local_path"]
+    assert _reasons(row, expected_corpus="central-bank", transition=False) == [
+        "missing_source_code"]
+    assert _notices(row, transition=False) == []
+
+
+def test_a_notice_names_the_field_and_the_value_as_written():
     row = _golden("cb_undated")
     row["date_precision"] = "year"
     columns, _ = split_row(row)
@@ -425,13 +523,7 @@ def test_a_notice_names_the_field_and_the_value():
     row["title"] = " "
     columns, _ = split_row(row)
     assert quality_notices(columns, row=row) == [
-        Notice(reason="empty_title", field="title", value=None)]
-
-
-def test_several_notices_on_one_row():
-    row = _golden("cb_rate_decision")
-    row.update(title="", date_precision=None)
-    assert _notices(row) == ["empty_title", "precision_not_stated"]
+        Notice(reason="empty_title", field="title", value=" ")]
 
 
 def test_quality_notices_does_not_modify_its_arguments():

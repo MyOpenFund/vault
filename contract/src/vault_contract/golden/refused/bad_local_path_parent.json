@@ -24,6 +24,6 @@
     "alt_urls": []
   },
   "expected_reasons": [
-    "absolute_local_path"
+    "bad_local_path"
   ]
 }

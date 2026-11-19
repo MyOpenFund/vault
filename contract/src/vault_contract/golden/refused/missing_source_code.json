@@ -1,10 +1,9 @@
 {
-  "description": "A numeric doc_id: 5 and \"5\" would be one key to Postgres and two to Python.",
+  "description": "No source_code (nor bank_code): refused even without a vocabulary.",
   "expected_corpus": "central-bank",
   "row": {
-    "doc_id": 5,
+    "doc_id": "ceb04c0aa89ed888",
     "corpus": "central-bank",
-    "source_code": "ecb",
     "doc_type": "A1",
     "title": "Monetary policy decisions",
     "date": "2022-07-21",
@@ -24,6 +23,6 @@
     "alt_urls": []
   },
   "expected_reasons": [
-    "invalid_doc_id"
+    "missing_source_code"
   ]
 }

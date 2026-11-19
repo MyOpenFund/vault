@@ -1,5 +1,6 @@
 {
   "description": "Bank of Canada Monetary Policy Report index page, undated: no date, so no year, no date_precision and no date_kind (the producer writes a null precision and omits the kind).",
+  "expected_corpus": "central-bank",
   "row": {
     "doc_id": "57d62f059376ad8e",
     "corpus": "central-bank",
@@ -20,5 +21,25 @@
     "date_source": null,
     "repec_handle": "",
     "alt_urls": []
+  },
+  "expected_columns": {
+    "doc_id": "57d62f059376ad8e",
+    "corpus": "central-bank",
+    "source_code": "ca",
+    "doc_type": "E1",
+    "title": "Monetary Policy Report",
+    "date": null,
+    "year": null,
+    "date_precision": null,
+    "date_kind": null,
+    "language": "en",
+    "provenance": "bank_site",
+    "document_url": "https://www.bankofcanada.ca/publications/mpr/",
+    "source_url": "https://www.bankofcanada.ca/publications/",
+    "mime_type": "application/pdf",
+    "sha256": "3c493107d41c30480eb35b91dc1f61af3291509d748b5560aa8110344feb7a9c",
+    "local_path": "raw/ca/E1/0/57d62f059376ad8e.pdf",
+    "entity_scheme": null,
+    "entity_value": null
   }
 }

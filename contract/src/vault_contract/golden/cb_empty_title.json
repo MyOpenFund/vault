@@ -1,5 +1,6 @@
 {
   "description": "Bank of Canada Monetary Policy Report found through the bank's sitemap, which gives no title: accepted and written, with an empty_title notice.",
+  "expected_corpus": "central-bank",
   "expected_notices": [
     "empty_title"
   ],
@@ -24,5 +25,25 @@
     "date_source": "bank_site",
     "repec_handle": "",
     "alt_urls": []
+  },
+  "expected_columns": {
+    "doc_id": "02c3fcf48b90a1e0",
+    "corpus": "central-bank",
+    "source_code": "ca",
+    "doc_type": "E1",
+    "title": null,
+    "date": "2024-10-23",
+    "year": 2024,
+    "date_precision": "day",
+    "date_kind": "publication",
+    "language": "en",
+    "provenance": "bank_site",
+    "document_url": "https://www.bankofcanada.ca/publications/mpr/mpr-2024-10-23/",
+    "source_url": "https://www.bankofcanada.ca/wp-sitemap.xml",
+    "mime_type": "application/pdf",
+    "sha256": "2371120c7fb19145a3f69f271d6020d8b5a528d51d0bc64964d548d4fd4da236",
+    "local_path": "raw/ca/E1/2024/02c3fcf48b90a1e0.pdf",
+    "entity_scheme": null,
+    "entity_value": null
   }
 }
