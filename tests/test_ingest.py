@@ -98,6 +98,13 @@ def test_null_document_url_falls_back_to_legacy_pdf_url():
     assert row[DOCUMENT_URL] == "https://x.invalid/old.pdf"
 
 
+def test_an_empty_url_under_either_key_is_null():
+    # A manifest's "" under the legacy key must not change meaning when it migrates.
+    for line in (make_line(pdf_url=""), make_line(document_url=""),
+                 make_line(document_url="", pdf_url="")):
+        assert parse_line(line, "f.jsonl", 1, RUN_TS, CORPUS)[DOCUMENT_URL] is None
+
+
 def test_no_url_at_all_leaves_document_url_null():
     row = parse_line(make_line(), "f.jsonl", 1, RUN_TS, CORPUS)
     assert row[DOCUMENT_URL] is None

@@ -205,9 +205,14 @@ applies it:
   `ingestion/ingest.py` (`KNOWN_FIELDS`, `parse_line`) is removed once every producer writes
   `document_url`.
 - Readers that name the column must move with it: the API's `Document` model and `vault-query`
-  0.3.0 (this commit) return `document_url`; a consumer pinned to an older `vault-query` (the
+  0.3.0 (this release) return `document_url`; a consumer pinned to an older `vault-query` (the
   MCP) selects a column that no longer exists and fails until its pin is bumped. Re-apply the
-  Metabase cards (`python metabase/apply.py`): card C4's SQL reads `d.document_url`.
+  Metabase cards (`python metabase/apply.py`): card C4's SQL reads `d.document_url`. Questions
+  built by hand in the Metabase UI are not in `cards.json`: fix any that name `pdf_url` there.
+- **Deploy this before the producers migrate their manifests.** The previous ingestion code does
+  not know `document_url`: run on a migrated manifest, it would put the URL in `extra` and set
+  the column to NULL on every row until the new code runs. This version accepts both keys, so
+  the order is: vault, then the MCP pin bump, then the producers' manifest migration.
 
 ### Migration (2026-09 substrate)
 

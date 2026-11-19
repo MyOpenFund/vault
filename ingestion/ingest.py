@@ -953,7 +953,7 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
         obj.get("title"),
         # document_url wins; the legacy pdf_url fills it when it is absent
         # (transition: drop the fallback once producers write document_url).
-        obj.get("document_url") or obj.get("pdf_url"),
+        (obj.get("document_url") or obj.get("pdf_url")) or None,
         obj.get("source_url"),
         obj.get("date") or None,
         obj.get("year"),
