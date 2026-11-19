@@ -1,0 +1,66 @@
+{
+  "contract": "documents",
+  "contract_version": "1.0.0",
+  "corpus": "company",
+  "source_codes": [
+    {
+      "code": "sec",
+      "label": "SEC EDGAR"
+    },
+    {
+      "code": "amf",
+      "label": "AMF (info-financiere.gouv.fr)"
+    },
+    {
+      "code": "banz",
+      "label": "Bundesanzeiger"
+    }
+  ],
+  "doc_types": [
+    {
+      "code": "A1",
+      "label": "Annual report (10-K)",
+      "family": "A"
+    },
+    {
+      "code": "A2",
+      "label": "Quarterly report (10-Q)",
+      "family": "A"
+    },
+    {
+      "code": "B1",
+      "label": "Current report (8-K)",
+      "family": "B"
+    },
+    {
+      "code": "C1",
+      "label": "Definitive proxy statement (DEF 14A)",
+      "family": "C"
+    },
+    {
+      "code": "D1",
+      "label": "Registration statement (S-1)",
+      "family": "D"
+    },
+    {
+      "code": "E1",
+      "label": "Insider transactions (Forms 3/4/5)",
+      "family": "E"
+    },
+    {
+      "code": "E3",
+      "label": "Beneficial ownership (SC 13D/G)",
+      "family": "E"
+    }
+  ],
+  "provenances": [
+    "edgar_index",
+    "edgar_fts",
+    "edgar_submissions",
+    "wayback"
+  ],
+  "entity_schemes": [
+    "cik",
+    "lei"
+  ]
+}

@@ -65,14 +65,19 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
         "print(c.__file__)\n"
         "print(c.CONTRACT_NAME, c.CONTRACT_VERSION)\n"
         "print(' '.join(sorted(golden.accepted())))\n"
+        "print(' '.join(sorted(golden.refused())))\n"
+        "print(c.load_vocabulary(golden.vocabulary('company')).corpus,"
+        " c.load_vocabulary(golden.vocabulary('central-bank')).corpus)\n"
     )
     out = subprocess.run([str(python), "-c", probe], cwd=tmp_path,
                          check=True, capture_output=True, text=True, timeout=60)
-    file_line, name_line, accepted = out.stdout.splitlines()
+    file_line, name_line, accepted, refused, vocabularies = out.stdout.splitlines()
     assert Path(file_line).is_relative_to(env_dir), file_line
     assert name_line == "documents 1.0.0"
     assert accepted.split() == sorted(vault_contract.golden.accepted())
     assert len(accepted.split()) == 5
+    assert refused.split() == sorted(vault_contract.golden.refused())
+    assert vocabularies == "company central-bank"
 
 
 # --- the ingestion image ships the package (no pip at run time) -------------

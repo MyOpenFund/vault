@@ -1,0 +1,29 @@
+{
+  "description": "A dated row that does not say how precise its date is.",
+  "expected_corpus": "central-bank",
+  "row": {
+    "doc_id": "ceb04c0aa89ed888",
+    "corpus": "central-bank",
+    "source_code": "ecb",
+    "doc_type": "A1",
+    "title": "Monetary policy decisions",
+    "date": "2022-07-21",
+    "year": 2022,
+    "date_precision": null,
+    "date_kind": "meeting",
+    "language": "en",
+    "provenance": "bank_site",
+    "document_url": "https://www.ecb.europa.eu/press/pr/date/2022/html/ecb.mp220721~53e5bdd317.en.html",
+    "source_url": "https://www.ecb.europa.eu/press/pr/html/index.en.html",
+    "mime_type": "",
+    "sha256": null,
+    "local_path": null,
+    "html_path": null,
+    "date_source": "bank_site",
+    "repec_handle": "",
+    "alt_urls": []
+  },
+  "expected_reasons": [
+    "missing_date_precision"
+  ]
+}
