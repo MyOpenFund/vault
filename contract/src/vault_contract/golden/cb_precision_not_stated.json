@@ -1,0 +1,23 @@
+{
+  "description": "Speech indexed by the BIS with a date but no stated precision (central-bank doctrine since #37: a producer that says nothing does not claim a day): accepted, precision left null, with a precision_not_stated notice.",
+  "expected_notices": [
+    "precision_not_stated"
+  ],
+  "row": {
+    "doc_id": "cf9ba3d1a6bf3015",
+    "corpus": "central-bank",
+    "source_code": "tr",
+    "doc_type": "C1",
+    "title": "Mr. Erçel considers the European financial markets and their implications for Turkish institutions",
+    "date": "1997-11-19",
+    "year": 1997,
+    "date_precision": null,
+    "language": "en",
+    "provenance": "bis_index",
+    "document_url": "https://www.bis.org/review/r971119e.pdf",
+    "source_url": "https://www.bis.org/review/r971119e.htm",
+    "mime_type": "application/pdf",
+    "sha256": "85341f48d3ae6ac49644797004a118d3d694b47b251435bdc2e98b7a1c4c9793",
+    "local_path": "raw/tr/C1/1997/cf9ba3d1a6bf3015.pdf"
+  }
+}

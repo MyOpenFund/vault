@@ -26,19 +26,25 @@ ingestion image does not pip-install it: it copies `src/vault_contract` next to 
 ```python
 import json
 
-from vault_contract import load_vocabulary, split_row, validate_row
+from vault_contract import load_vocabulary, quality_notices, split_row, validate_row
 
 vocabulary = load_vocabulary(json.load(open("vocabulary.json")))   # ValueError if invalid
-columns, extra = split_row(json.loads(manifest_line))
+row = json.loads(manifest_line)
+columns, extra = split_row(row)
 refusals = validate_row(columns, vocabulary, expected_corpus="company")
 # [] = accepted; else [Refusal(reason="bad_date_precision", field="date_precision", value="Day"), ...]
+notices = quality_notices(columns, row=row)
+# written either way; e.g. [Notice(reason="empty_title", field="title", value="")]
 ```
 
 - `split_row(row) -> (columns, extra)`: `columns` holds the 18 common fields in DDL order
   (`None` when absent), `extra` every other key, values untouched. It never refuses.
-- `validate_row(columns, vocabulary, *, expected_corpus) -> list[Refusal]`: every defect of
-  the row. With `vocabulary=None` (a corpus with no vocabulary file yet) the code checks are
-  skipped and the shape checks kept.
+- `validate_row(columns, vocabulary, *, expected_corpus) -> list[Refusal]`: every structural
+  defect of the row. With `vocabulary=None` (a corpus with no vocabulary file yet) the code
+  checks are skipped and the shape checks kept.
+- `quality_notices(columns, *, row) -> list[Notice]`: what is worth counting but not
+  refusing. It takes the original `row` too, because `split_row` drops the precision of an
+  undated row and only the row still shows it.
 - `validate_vocabulary(doc) -> list[str]` and `load_vocabulary(doc) -> Vocabulary`.
 - `vault_contract.golden`: the reference rows below, shipped with the package.
 
@@ -52,16 +58,16 @@ A manifest line is one JSON object. These 18 keys are the common fields:
 | `corpus` | text | yes | Must equal the ingesting service's `CORPUS` | `central-bank` | `company` |
 | `source_code` | text | yes | The authority that publishes; declared in the corpus vocabulary | `ecb` | `sec` |
 | `doc_type` | text | yes | Declared in the corpus vocabulary; meaningful only with `corpus` | `A1` (rate decision) | `A1` (10-K) |
-| `title` | text | yes | Not blank | `Monetary policy decisions` | `Apple Inc. 10-K (2024)` |
+| `title` | text | expected | A string, expected non-empty (absent or blank: notice `empty_title`) | `Monetary policy decisions` | `Apple Inc. 10-K (2024)` |
 | `date` | date | no | ISO `YYYY-MM-DD`; a month or year date is the first day of the period | `2022-07-21` | `2024-11-01` (filing date) |
 | `year` | integer | when `date` is set | The year of `date`; absent when `date` is | `2022` | `2024` |
-| `date_precision` | text | when `date` is set | `day` \| `month` \| `year`; absent when `date` is | `day` | `day` |
+| `date_precision` | text | no | `day` \| `month` \| `year`; null = not stated (notice `precision_not_stated` on a dated row); dropped on an undated row (notice `precision_without_date`) | `day` | `day` |
 | `date_kind` | text | no | `publication` \| `meeting` \| `period` | `meeting` | `publication` |
 | `language` | text | yes | ISO 639-1, two lowercase letters | `en` | `en` |
 | `provenance` | text | yes | How the document was obtained; declared in the corpus vocabulary | `bank_site` | `edgar_index` |
 | `document_url` | text | no | Address of the document itself (any type) | `https://www.ecb.europa.eu/press/pr/date/2022/html/ecb.mp220721~53e5bdd317.en.html` | `https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm` |
 | `source_url` | text | no | Landing or index page it was found on | `https://www.ecb.europa.eu/press/pr/html/index.en.html` | `https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm` |
-| `mime_type` | text | when `local_path` is set | Type of the file at `local_path`; never without `local_path` | `application/pdf` | `application/pdf` or `text/plain` |
+| `mime_type` | text | when `local_path` is set | Type of the file at `local_path` (a type known before any download is not refused) | `application/pdf` | `application/pdf` or `text/plain` |
 | `sha256` | text | when a file was fetched | 64 lowercase hex: the hash of the document **as the authority served it**, not of a converted file | hash of the fetched PDF, or of the fetched HTML for a rendered row | hash of the primary document `aapl-20240928.htm` |
 | `local_path` | text | no | POSIX path **relative to the corpus data root** (the directory holding `manifest/`): never absolute, no drive letter, no backslash, no `..` segment | `raw/ecb/C1/2023/e1e6a63950c50d3f.pdf` | `raw/0000320193/A1/2024/cf0e49e6e176a851.pdf` |
 | `entity_scheme` | text | when the document concerns one company | `cik`, `lei`, or a register scheme declared in the corpus vocabulary | (absent) | `cik` |
@@ -81,7 +87,10 @@ Rules around the table:
   rendered from. A producer that has the hash of the file at `local_path` puts it in the
   `local_sha256` extra.
 - **Blank means absent.** In an optional field, `""` is read as absent (`None`). A blank
-  required field is refused by name (`missing_title`, `bad_language`, ...).
+  required field is kept for the checks to judge (`bad_language`, `missing_doc_id`, ...;
+  a blank title is only the notice `empty_title`).
+- **No date, no precision.** `split_row` drops `date_precision` from an undated row;
+  `date_kind` is kept.
 - **Identity in the vault is (`corpus`, `doc_id`)**: two corpora may both have a document `1`.
 - **`doc_type` belongs to its corpus.** central-bank `A1` (rate-decision press release) and
   company `A1` (10-K) share a code, not a meaning; a `doc_type` is always read with `corpus`.
@@ -97,32 +106,51 @@ Until every manifest is migrated, `split_row` also reads:
 The vault also accepts a row without `corpus` (the ingesting service's `CORPUS` applies) and a
 corpus without a vocabulary file (code checks off).
 
-## Refusal reasons
+## Two levels: refusals and notices
 
-`validate_row` returns one `Refusal(reason, field, value)` per defect. The reasons, in check
-order, are part of the contract (run reports count refused rows by reason):
+- A **refusal** is about structure or identity: the row is **not written**, and the vault
+  skips its soft-delete sweep for that run. Example: `date_precision: "Day"` is refused
+  (`bad_date_precision`); a closed value is spelled exactly.
+- A **notice** is about quality: the row **is written** and the notice is counted. Example:
+  a dated row with `date_precision: null` gets `precision_not_stated`; a producer that says
+  nothing does not claim a day, so null means "not stated", never "day".
+
+Both reason lists, in check order, are part of the contract: run reports count rows by reason.
+
+### Refusal reasons
+
+`validate_row` returns one `Refusal(reason, field, value)` per defect.
 
 | Reason | When |
 |---|---|
 | `missing_doc_id` | `doc_id` absent or `""` |
 | `invalid_doc_id` | `doc_id` not a string, or holding a NUL |
 | `corpus_conflict` | `corpus` present and not the ingesting service's corpus |
-| `missing_title` | `title` absent, not a string, or blank |
+| `bad_title` | `title` present but not a string |
 | `unknown_source_code` | `source_code` not declared in the vocabulary (absent included) |
 | `unknown_doc_type` | `doc_type` not declared in the vocabulary (a raw form such as `10-K` included) |
 | `unknown_provenance` | `provenance` not declared in the vocabulary |
 | `bad_language` | `language` not two lowercase letters (`english`, `EN`, absent) |
 | `bad_date` | `date` not an existing ISO `YYYY-MM-DD` day |
 | `year_mismatch` | `year` not the integer year of `date`, or a `year` without `date` |
-| `missing_date_precision` | `date` set, `date_precision` absent |
-| `bad_date_precision` | `date_precision` not `day`, `month` or `year` (`Day` included) |
-| `precision_without_date` | `date_precision` set on an undated row |
+| `bad_date_precision` | `date_precision` set on a dated row and not `day`, `month` or `year` (`Day` included) |
 | `bad_date_kind` | `date_kind` not `publication`, `meeting` or `period` |
 | `absolute_local_path` | `local_path` absolute, with a drive letter, a backslash or a `..` segment |
-| `mime_without_local_path` | `mime_type` set without `local_path` |
 | `bad_sha256` | `sha256` not 64 lowercase hexadecimal characters |
 | `entity_half` | one of `entity_scheme` / `entity_value` without the other |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
+
+### Notice reasons
+
+`quality_notices` returns one `Notice(reason, field, value)` per finding.
+
+| Reason | When |
+|---|---|
+| `empty_title` | `title` absent, null or blank |
+| `precision_not_stated` | `date` set, `date_precision` absent or null |
+| `precision_without_date` | `date_precision` set on an undated row (dropped by `split_row`; `value` is the dropped one) |
+
+`contract/scripts/check_manifests.py` counts both over a directory of manifests.
 
 ## Vocabulary file
 
@@ -161,10 +189,12 @@ vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know wha
 
 `vault_contract.golden` ships the reference cases every implementation is tested against:
 
-- `accepted()`: `sec_10k` (Apple 10-K FY2024, rendered PDF), `sec_form4` (a Form 4 about
-  Apple, insider as `filer_*` extras, text artefact), `cb_rate_decision` (ECB, `date_kind:
-  meeting`, not downloaded yet), `cb_undated` (no date, no precision), `cb_rendered_html` (ECB
-  speech rendered from HTML: `application/pdf`, `html_path` extra, `sha256` of the HTML);
+- `accepted()`: five reference rows without notice, `sec_10k` (Apple 10-K FY2024, rendered
+  PDF), `sec_form4` (a Form 4 about Apple, insider as `filer_*` extras, text artefact),
+  `cb_rate_decision` (ECB, `date_kind: meeting`, not downloaded yet), `cb_undated` (no date,
+  no precision), `cb_rendered_html` (ECB speech rendered from HTML: `application/pdf`,
+  `html_path` extra, `sha256` of the HTML); and one row per notice, each with its
+  `expected_notices`: `cb_empty_title`, `cb_precision_not_stated`, `cb_precision_without_date`;
 - `refused()`: one case per refusal reason at least, each with its `expected_corpus` and
   exact `expected_reasons`;
 - `vocabulary("company")`, `vocabulary("central-bank")`: the vocabulary excerpts they are

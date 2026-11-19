@@ -1,8 +1,13 @@
-"""`validate_row`: is a split manifest row a valid `documents` row (contract 1.0.0)?
+"""Two levels of checks on a split manifest row (contract 1.0.0).
 
-Takes the columns of split_row (blank optional values already None, transition
-aliases and the `data/` prefix already applied) and returns every refusal, in
-a fixed check order. An empty list means the row is accepted; extras are never
+- validate_row -> refusals: structure and identity. A refused row is not
+  written (and the vault skips its soft-delete sweep for that run).
+- quality_notices -> notices: the row is written, the notice is counted
+  (an empty title, a date whose precision is not stated).
+
+Both take the columns of split_row (blank optional values already None,
+transition aliases, the `data/` prefix and an undated row's precision already
+handled) and return their findings in a fixed check order. Extras are never
 judged.
 """
 import datetime
@@ -16,12 +21,15 @@ from .vocabulary import Vocabulary
 # Every reason validate_row can give, in check order. A run report counts
 # refused rows per reason, so these strings are part of the contract.
 REASONS: tuple[str, ...] = (
-    "missing_doc_id", "invalid_doc_id", "corpus_conflict", "missing_title",
+    "missing_doc_id", "invalid_doc_id", "corpus_conflict", "bad_title",
     "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
-    "bad_date", "year_mismatch", "missing_date_precision", "bad_date_precision",
-    "precision_without_date", "bad_date_kind", "absolute_local_path",
-    "mime_without_local_path", "bad_sha256", "entity_half", "unknown_entity_scheme",
+    "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind",
+    "absolute_local_path", "bad_sha256", "entity_half", "unknown_entity_scheme",
 )
+
+# Every reason quality_notices can give, in check order. Also counted by the
+# run report; the row is written all the same.
+NOTICES: tuple[str, ...] = ("empty_title", "precision_not_stated", "precision_without_date")
 
 _LANGUAGE = re.compile(r"[a-z]{2}")                     # ISO 639-1
 _ISO_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -34,6 +42,13 @@ class Refusal:
     reason: str      # one of REASONS
     field: str       # the column at fault
     value: object    # its value, as split_row gave it
+
+
+@dataclass(frozen=True)
+class Notice:
+    reason: str      # one of NOTICES
+    field: str       # the column concerned
+    value: object    # its value (for precision_without_date: the dropped one)
 
 
 def _parse_day(value: object) -> datetime.date | None:
@@ -83,8 +98,8 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
         refuse("corpus_conflict", "corpus")
 
     title = columns.get("title")
-    if not isinstance(title, str) or not title.strip():
-        refuse("missing_title", "title")
+    if title is not None and not isinstance(title, str):
+        refuse("bad_title", "title")
 
     if vocabulary is not None:
         if not _known(columns.get("source_code"), vocabulary.source_codes):
@@ -110,13 +125,8 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
         refuse("year_mismatch", "year")
 
     precision = columns.get("date_precision")
-    if raw_date is not None:
-        if precision is None:
-            refuse("missing_date_precision", "date_precision")
-        elif precision not in DATE_PRECISIONS:
-            refuse("bad_date_precision", "date_precision")
-    elif precision is not None:
-        refuse("precision_without_date", "date_precision")
+    if precision is not None and precision not in DATE_PRECISIONS:
+        refuse("bad_date_precision", "date_precision")
 
     kind = columns.get("date_kind")
     if kind is not None and kind not in DATE_KINDS:
@@ -125,8 +135,6 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
     local_path = columns.get("local_path")
     if local_path is not None and _escapes_root(local_path):
         refuse("absolute_local_path", "local_path")
-    if columns.get("mime_type") is not None and local_path is None:
-        refuse("mime_without_local_path", "mime_type")
 
     sha = columns.get("sha256")
     if sha is not None and not (isinstance(sha, str) and _SHA256.fullmatch(sha)):
@@ -140,3 +148,27 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
         refuse("unknown_entity_scheme", "entity_scheme")
 
     return refusals
+
+
+def quality_notices(columns: Mapping, *, row: Mapping) -> list[Notice]:
+    """Every quality notice of one row ([] = nothing to note); never a refusal.
+
+    `row` is the original manifest row `columns` was split from: split_row
+    drops the precision of an undated row, so only the row still shows it.
+    It is a required keyword on purpose, so that no caller misses that notice
+    silently.
+    """
+    notices: list[Notice] = []
+
+    title = columns.get("title")
+    if title is None or (isinstance(title, str) and not title.strip()):
+        notices.append(Notice("empty_title", "title", title))
+
+    if columns.get("date") is not None and columns.get("date_precision") is None:
+        notices.append(Notice("precision_not_stated", "date_precision", None))
+
+    dropped = row.get("date_precision")
+    if columns.get("date") is None and dropped not in (None, ""):
+        notices.append(Notice("precision_without_date", "date_precision", dropped))
+
+    return notices

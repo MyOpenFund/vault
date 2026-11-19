@@ -11,14 +11,15 @@ See contract/README.md for the field table and the versioning rule.
 from .fields import (
     COLUMNS, DATE_KINDS, DATE_PRECISIONS, REQUIRED, TRANSITION_ALIASES, split_row,
 )
-from .validate import REASONS, Refusal, validate_row
+from .validate import NOTICES, REASONS, Notice, Refusal, quality_notices, validate_row
 from .vocabulary import Vocabulary, is_supported_version, load_vocabulary, validate_vocabulary
 
 CONTRACT_NAME = "documents"
 CONTRACT_VERSION = "1.0.0"
 
 __all__ = [
-    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "REASONS",
-    "REQUIRED", "Refusal", "TRANSITION_ALIASES", "Vocabulary", "is_supported_version",
-    "load_vocabulary", "split_row", "validate_row", "validate_vocabulary",
+    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "NOTICES",
+    "Notice", "REASONS", "REQUIRED", "Refusal", "TRANSITION_ALIASES", "Vocabulary",
+    "is_supported_version", "load_vocabulary", "quality_notices", "split_row", "validate_row",
+    "validate_vocabulary",
 ]

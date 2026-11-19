@@ -42,7 +42,8 @@ def split_row(row: Mapping) -> tuple[dict, dict]:
 
     `columns` has every name of COLUMNS, in order (None when absent); `extra`
     holds every other key of the row except the transition aliases, values
-    untouched. See validate_row for what is accepted.
+    untouched. A `date_precision` on an undated row is dropped (pass the row
+    to quality_notices to count it). See validate_row for what is accepted.
     """
     if not isinstance(row, Mapping):
         raise TypeError(f"a manifest row is a JSON object, not {type(row).__name__}")
@@ -54,6 +55,12 @@ def split_row(row: Mapping) -> tuple[dict, dict]:
     for name in _BLANK_IS_ABSENT:
         if columns[name] == "":
             columns[name] = None
+
+    # No date, no precision: a precision on an undated row describes nothing,
+    # so it is dropped here (never refused) and quality_notices reports it.
+    # date_kind is kept.
+    if columns["date"] is None:
+        columns["date_precision"] = None
 
     path = columns["local_path"]
     if isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):

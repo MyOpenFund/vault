@@ -64,7 +64,9 @@ def test_every_golden_row_splits_without_losing_or_moving_a_key(name):
     assert set(extra).isdisjoint(COLUMNS)
     assert set(extra) == set(row) - set(COLUMNS)
     for key in set(row) & set(COLUMNS):
-        expected = None if row[key] == "" else row[key]
+        expected = None if row[key] == "" and key not in REQUIRED else row[key]
+        if key == "date_precision" and row.get("date") in (None, ""):
+            expected = None                    # dropped from an undated row
         assert columns[key] == expected, key
 
 
@@ -127,6 +129,20 @@ def test_unknown_key_goes_to_extra_untouched():
     assert "foo" not in columns
 
 
+def test_date_precision_is_dropped_from_an_undated_row():
+    """No date, no precision (quality_notices reports the drop); the
+    date_kind of an undated row is kept."""
+    columns, extra = split_row({"date": None, "date_precision": "month", "date_kind": "period"})
+    assert columns["date_precision"] is None
+    assert columns["date_kind"] == "period"
+    assert extra == {}
+
+
+def test_date_precision_is_kept_on_a_dated_row():
+    columns, _ = split_row({"date": "2024-11-01", "date_precision": "day"})
+    assert columns["date_precision"] == "day"
+
+
 @pytest.mark.parametrize("field", [
     "date", "year", "date_precision", "date_kind", "document_url", "source_url",
     "mime_type", "sha256", "local_path", "entity_scheme", "entity_value",
@@ -141,7 +157,7 @@ def test_a_blank_optional_column_is_absent(field):
 
 
 @pytest.mark.parametrize("field", REQUIRED)
-def test_a_blank_required_column_is_kept_for_validation_to_refuse(field):
+def test_a_blank_required_column_is_kept_for_validation_to_judge(field):
     columns, _ = split_row({field: ""})
     assert columns[field] == ""
 

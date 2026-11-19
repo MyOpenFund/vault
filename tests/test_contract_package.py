@@ -9,6 +9,7 @@ package next to ingest.py, which the last tests pin.
 """
 import os
 import re
+import shutil
 import subprocess
 import tomllib
 import venv
@@ -52,11 +53,16 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     be satisfied by the installed copy; it reads the golden rows through
     importlib.resources, which fails if package data was not declared.
     """
+    # Install from a copy without build leftovers: setuptools builds in-tree
+    # and reuses contract/build/, which keeps files deleted since.
+    source = tmp_path / "contract"
+    shutil.copytree(CONTRACT, source,
+                    ignore=shutil.ignore_patterns("build", "*.egg-info", "__pycache__"))
     env_dir = tmp_path / "venv"
     venv.create(env_dir, with_pip=True)
     python = env_dir / ("Scripts" if os.name == "nt" else "bin") / "python"
     subprocess.run(
-        [str(python), "-m", "pip", "install", "-q", "--disable-pip-version-check", str(CONTRACT)],
+        [str(python), "-m", "pip", "install", "-q", "--disable-pip-version-check", str(source)],
         check=True, capture_output=True, text=True, timeout=300,
     )
     probe = (
@@ -75,15 +81,15 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     assert Path(file_line).is_relative_to(env_dir), file_line
     assert name_line == "documents 1.0.0"
     assert accepted.split() == sorted(vault_contract.golden.accepted())
-    assert len(accepted.split()) == 5
+    assert len(accepted.split()) == 8
     assert refused.split() == sorted(vault_contract.golden.refused())
     assert vocabularies == "company central-bank"
 
 
-def test_readme_documents_every_column_and_every_refusal_reason():
+def test_readme_documents_every_column_refusal_and_notice():
     """contract/README.md is the contract's user documentation (spec §3)."""
     readme = (CONTRACT / "README.md").read_text()
-    missing = [n for n in (*vault_contract.COLUMNS, *vault_contract.REASONS)
+    missing = [n for n in (*vault_contract.COLUMNS, *vault_contract.REASONS, *vault_contract.NOTICES)
                if f"| `{n}` |" not in readme]
     assert missing == []
     assert "must put `corpus` in its point ids" in readme
