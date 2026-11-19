@@ -49,3 +49,13 @@ def test_fields_are_optional_and_typed():
     assert Document(**ROW).page_count is None
     with pytest.raises(ValueError):
         Document(**ROW, page_count="many")
+
+
+def test_get_document_returns_document_url(client, monkeypatch):
+    # 2026-11 rename: the field is document_url; pydantic would silently drop
+    # a key the model does not declare.
+    monkeypatch.setattr(main, "vq_get_document",
+                        lambda _c, _id: {**ROW, "document_url": "https://x.invalid/d1.pdf"})
+    body = client.get("/documents/d1").json()
+    assert body["document_url"] == "https://x.invalid/d1.pdf"
+    assert "pdf_url" not in body

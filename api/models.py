@@ -13,7 +13,7 @@ class Document(BaseModel):
     source_code: Optional[str] = None
     doc_type: Optional[str] = None
     title: Optional[str] = None
-    pdf_url: Optional[str] = None
+    document_url: Optional[str] = None
     source_url: Optional[str] = None
     date: Optional[dt.date] = None
     year: Optional[int] = None

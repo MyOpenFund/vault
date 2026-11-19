@@ -9,7 +9,7 @@ from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_in
 # caller-chosen projection is checked against it: column names are
 # interpolated into the SELECT, so this set is the injection guard.
 ALL_COLUMNS = frozenset({
-    "id", "doc_id", "corpus", "source_code", "doc_type", "title", "pdf_url", "source_url",
+    "id", "doc_id", "corpus", "source_code", "doc_type", "title", "document_url", "source_url",
     "date", "year", "language", "provenance", "mime_type", "sha256", "local_path",
     "created_at", "updated_at", "last_seen_at", "deleted_at", "extra",
     "has_text_layer", "page_count",
@@ -23,7 +23,7 @@ SNAPSHOT_BEGIN = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 # `extra` (free-form, can be large) and host-layout columns stay in get_document.
 SEARCH_COLUMNS = (
     "doc_id", "corpus", "source_code", "doc_type", "title", "date", "year", "language",
-    "provenance", "mime_type", "pdf_url", "source_url", "has_text_layer", "page_count",
+    "provenance", "mime_type", "document_url", "source_url", "has_text_layer", "page_count",
     "deleted_at",
 )
 
