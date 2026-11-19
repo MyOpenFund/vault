@@ -164,7 +164,7 @@ value as the producer wrote it.
 | `kind_without_date` | `date_kind` set on an undated row (dropped by `split_row`) |
 | `mime_type_missing` | `local_path` set, `mime_type` absent |
 
-`contract/scripts/check_manifests.py` counts both over a directory of manifests.
+`python -m vault_contract.check` counts both over a directory of manifests (see below).
 
 ## Vocabulary file
 
