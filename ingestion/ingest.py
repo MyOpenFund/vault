@@ -412,17 +412,17 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
 -- bad_content (central-bank-corpus, 2026-11-19) is a sub-count of docs_failed:
 -- documents whose every URL served the wrong bytes (an HTML page for a PDF, a
 -- stub, a truncated PDF). NULL when the producer did not report it, never 0.
--- At most 9 digits, so a value past the int range is NULL rather than an
--- "integer out of range" that would make every reader of the view raise.
+-- Every counter takes at most 9 digits, so a value past the int range is NULL
+-- rather than an "integer out of range" that would make every reader raise.
 -- Appended last so positional readers of the earlier columns are unaffected.
 CREATE VIEW runs_sources AS
 SELECT r.run_id, r.tool, r.command, r.corpus,
        r.started_at, r.finished_at, r.outcome, r.exit_code,
        s ->> 'source_code' AS source_code,
-       CASE WHEN s ->> 'docs_seen'    ~ '^-?[0-9]+$' THEN (s ->> 'docs_seen')::int    END AS docs_seen,
-       CASE WHEN s ->> 'docs_new'     ~ '^-?[0-9]+$' THEN (s ->> 'docs_new')::int     END AS docs_new,
-       CASE WHEN s ->> 'docs_failed'  ~ '^-?[0-9]+$' THEN (s ->> 'docs_failed')::int  END AS docs_failed,
-       CASE WHEN s ->> 'fetch_errors' ~ '^-?[0-9]+$' THEN (s ->> 'fetch_errors')::int END AS fetch_errors,
+       CASE WHEN s ->> 'docs_seen'    ~ '^-?[0-9]{1,9}$' THEN (s ->> 'docs_seen')::int    END AS docs_seen,
+       CASE WHEN s ->> 'docs_new'     ~ '^-?[0-9]{1,9}$' THEN (s ->> 'docs_new')::int     END AS docs_new,
+       CASE WHEN s ->> 'docs_failed'  ~ '^-?[0-9]{1,9}$' THEN (s ->> 'docs_failed')::int  END AS docs_failed,
+       CASE WHEN s ->> 'fetch_errors' ~ '^-?[0-9]{1,9}$' THEN (s ->> 'fetch_errors')::int END AS fetch_errors,
        CASE WHEN jsonb_typeof(s -> 'truncated') = 'boolean'
             THEN (s ->> 'truncated')::boolean ELSE FALSE END AS truncated,
        CASE WHEN jsonb_typeof(s -> 'error_samples') = 'array'

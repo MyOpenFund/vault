@@ -211,3 +211,19 @@ def test_bad_content_columns_come_last(clean_db, tmp_path, monkeypatch):
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'runs_sources' "
             "ORDER BY ordinal_position")]
     assert cols[-2:] == ["error_samples", "bad_content"]
+
+
+def test_out_of_range_counters_are_null_not_an_error(clean_db, tmp_path, monkeypatch):
+    # One malformed report must not make runs_sources (and every view and reader on it) raise
+    # "integer out of range": every counter is bounded to 9 digits, like bad_content.
+    _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
+    huge = 10000000000
+    _plant_runs(clean_db, [_run_row("r0", 0, "ok", [
+        {"source_code": "ecb", "docs_seen": huge, "docs_new": huge, "docs_failed": huge,
+         "fetch_errors": huge, "bad_content": huge},
+        _src("fed", 999999999, 999999999, failed=999999999, fetch=999999999)])])
+    rows = fetch_all(clean_db, "SELECT source_code, docs_seen, docs_new, docs_failed, fetch_errors, "
+                               "bad_content FROM runs_sources ORDER BY 1")
+    assert rows == [("ecb", None, None, None, None, None),
+                    ("fed", 999999999, 999999999, 999999999, 999999999, None)]
+    assert fetch_all(clean_db, "SELECT source_runs_7d FROM source_health")[0][0] == 1
