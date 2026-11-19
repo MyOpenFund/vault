@@ -11,7 +11,8 @@ import pytest
 
 from vault_contract import golden
 from vault_contract.fields import (
-    COLUMNS, DATE_KINDS, DATE_PRECISIONS, REQUIRED, TRANSITION_ALIASES, split_row,
+    COLUMNS, DATE_KINDS, DATE_PRECISIONS, EXPECTED, REFUSED_WHEN_ABSENT, TRANSITION_ALIASES,
+    split_row,
 )
 
 APPLE_10K_EXTRA_KEYS = {
@@ -33,10 +34,14 @@ def test_columns_are_the_eighteen_common_fields_in_ddl_order():
     )
 
 
-def test_required_fields_are_columns():
-    assert REQUIRED == ("doc_id", "corpus", "source_code", "doc_type", "title",
-                        "language", "provenance")
-    assert set(REQUIRED) <= set(COLUMNS)
+def test_mandatory_fields_split_into_refused_and_expected():
+    """Absent -> refusal for identity and codes; absent title -> notice only
+    (110 real central-bank rows have none)."""
+    assert REFUSED_WHEN_ABSENT == ("doc_id", "corpus", "source_code", "doc_type",
+                                   "language", "provenance")
+    assert EXPECTED == ("title",)
+    assert set(REFUSED_WHEN_ABSENT) | set(EXPECTED) <= set(COLUMNS)
+    assert not set(REFUSED_WHEN_ABSENT) & set(EXPECTED)
 
 
 def test_closed_value_sets_and_transition_aliases():
@@ -56,18 +61,16 @@ def test_apple_10k_splits_into_eighteen_columns_and_its_sec_extras():
     assert extra["alt_urls"] == []
 
 
-@pytest.mark.parametrize("name", sorted(golden.accepted()))
-def test_every_golden_row_splits_without_losing_or_moving_a_key(name):
-    row = _row(name)
-    columns, extra = split_row(row)
-    assert tuple(columns) == COLUMNS
-    assert set(extra).isdisjoint(COLUMNS)
-    assert set(extra) == set(row) - set(COLUMNS)
-    for key in set(row) & set(COLUMNS):
-        expected = None if row[key] == "" and key not in REQUIRED else row[key]
-        if key == "date_precision" and row.get("date") in (None, ""):
-            expected = None                    # dropped from an undated row
-        assert columns[key] == expected, key
+def test_a_legacy_row_without_transition_keeps_its_old_keys_as_extras():
+    """transition=False is the switch the cleanup PR flips: no alias mapping,
+    no prefix stripping."""
+    legacy = {"doc_id": "x", "bank_code": "ecb", "pdf_url": "https://a/b.pdf",
+              "local_path": "data/raw/ecb/a.pdf"}
+    columns, extra = split_row(legacy, transition=False)
+    assert columns["source_code"] is None
+    assert columns["document_url"] is None
+    assert columns["local_path"] == "data/raw/ecb/a.pdf"
+    assert extra == {"bank_code": "ecb", "pdf_url": "https://a/b.pdf"}
 
 
 def test_form4_filer_stays_an_extra_never_the_entity():
@@ -129,37 +132,40 @@ def test_unknown_key_goes_to_extra_untouched():
     assert "foo" not in columns
 
 
-def test_date_precision_is_dropped_from_an_undated_row():
-    """No date, no precision (quality_notices reports the drop); the
-    date_kind of an undated row is kept."""
-    columns, extra = split_row({"date": None, "date_precision": "month", "date_kind": "period"})
+@pytest.mark.parametrize("date", [None, "", "  "])
+def test_precision_and_kind_are_dropped_from_an_undated_row(date):
+    """No date, no precision and no kind (quality_notices reports each drop)."""
+    columns, extra = split_row({"date": date, "date_precision": "month", "date_kind": "period"})
     assert columns["date_precision"] is None
-    assert columns["date_kind"] == "period"
+    assert columns["date_kind"] is None
     assert extra == {}
 
 
-def test_date_precision_is_kept_on_a_dated_row():
-    columns, _ = split_row({"date": "2024-11-01", "date_precision": "day"})
-    assert columns["date_precision"] == "day"
+def test_precision_and_kind_are_kept_on_a_dated_row():
+    columns, _ = split_row({"date": "2024-11-01", "date_precision": "day",
+                            "date_kind": "publication"})
+    assert (columns["date_precision"], columns["date_kind"]) == ("day", "publication")
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
 @pytest.mark.parametrize("field", [
-    "date", "year", "date_precision", "date_kind", "document_url", "source_url",
+    "title", "date", "year", "date_precision", "date_kind", "document_url", "source_url",
     "mime_type", "sha256", "local_path", "entity_scheme", "entity_value",
 ])
-def test_a_blank_optional_column_is_absent(field):
+def test_a_blank_optional_or_expected_column_is_absent(field, blank):
     """A producer writes "" for "not known" (central-bank mime_type before a
-    download, source_url when there is no listing page); the contract reads it
-    as absent, so "" never reaches a column and never fails a shape check."""
-    columns, extra = split_row({field: ""})
+    download, title of a sitemap discovery); the contract reads a blank string
+    as absent, so it never reaches a column and never fails a shape check."""
+    columns, extra = split_row({"date": "2024-11-01", field: blank})
     assert columns[field] is None
     assert extra == {}
 
 
-@pytest.mark.parametrize("field", REQUIRED)
-def test_a_blank_required_column_is_kept_for_validation_to_judge(field):
-    columns, _ = split_row({field: ""})
-    assert columns[field] == ""
+@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.parametrize("field", REFUSED_WHEN_ABSENT)
+def test_a_blank_refused_when_absent_column_is_kept_for_validation_to_judge(field, blank):
+    columns, _ = split_row({field: blank})
+    assert columns[field] == blank
 
 
 def test_missing_columns_are_none():

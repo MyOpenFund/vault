@@ -407,15 +407,6 @@ def test_a_bad_precision_value_on_an_undated_row_is_dropped_not_refused():
     assert _notices(row) == ["precision_without_date"]
 
 
-def test_a_date_kind_on_an_undated_row_is_kept():
-    row = _golden("cb_undated")
-    row["date_kind"] = "publication"
-    columns, _ = split_row(row)
-    assert columns["date_kind"] == "publication"
-    assert _reasons(row, expected_corpus="central-bank") == []
-    assert _notices(row) == []
-
-
 def test_a_mime_type_without_local_path_is_accepted():
     """Not a spec rule; real rows can know the type before a download."""
     row = _golden("cb_rate_decision")
@@ -434,7 +425,7 @@ def test_a_notice_names_the_field_and_the_value():
     row["title"] = " "
     columns, _ = split_row(row)
     assert quality_notices(columns, row=row) == [
-        Notice(reason="empty_title", field="title", value=" ")]
+        Notice(reason="empty_title", field="title", value=None)]
 
 
 def test_several_notices_on_one_row():

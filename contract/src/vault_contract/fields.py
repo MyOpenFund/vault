@@ -13,58 +13,79 @@ COLUMNS: tuple[str, ...] = (
     "source_url", "mime_type", "sha256", "local_path", "entity_scheme", "entity_value",
 )
 
-# Mandatory on every row. `corpus` is listed because the contract requires it;
-# during the transition the vault still accepts a row without it (the
-# ingesting service's CORPUS applies), so validate_row does not refuse that.
-REQUIRED: tuple[str, ...] = (
-    "doc_id", "corpus", "source_code", "doc_type", "title", "language", "provenance",
+# Absent (None or "") -> the row is refused (missing_<field>). `corpus` is
+# listed because the contract requires it; during the transition its absence
+# is only a notice (corpus_missing) and the ingesting service's CORPUS applies.
+REFUSED_WHEN_ABSENT: tuple[str, ...] = (
+    "doc_id", "corpus", "source_code", "doc_type", "language", "provenance",
 )
+
+# Absent -> the row is written with a notice (empty_title).
+EXPECTED: tuple[str, ...] = ("title",)
 
 DATE_PRECISIONS: tuple[str, ...] = ("day", "month", "year")
 DATE_KINDS: tuple[str, ...] = ("publication", "meeting", "period")
 
-# Old key -> contract column. Transition only (removed by the cleanup PR once
-# every manifest is migrated): the old key fills the column when the contract
-# key is absent or blank, and never lands in `extra`.
+# Old key -> contract column. Transition only: with split_row(transition=True)
+# (the default until the cleanup PR flips it) the old key fills the column when
+# the contract key is absent or blank and never lands in `extra`; with
+# transition=False it is an ordinary extra.
 TRANSITION_ALIASES: dict[str, str] = {"bank_code": "source_code", "pdf_url": "document_url"}
 
 # Transition only: central-bank manifests stored local_path relative to the
 # repo (`data/raw/...`); the contract wants it relative to the data root.
 TRANSITION_LOCAL_PATH_PREFIX = "data/"
 
-# An optional column holding "" means "not known": it is read as absent.
-# Required columns keep "" so that validation refuses it by name.
-_BLANK_IS_ABSENT = frozenset(COLUMNS) - frozenset(REQUIRED)
+# Facts that only exist on an undated row's date: dropped with the date.
+DATE_DEPENDENT: tuple[str, ...] = ("date_precision", "date_kind")
+
+# A blank string ("" or whitespace) in these columns means "not known": it is
+# read as absent. Columns refused when absent keep it, so that validation
+# refuses it by name.
+_BLANK_IS_ABSENT = frozenset(COLUMNS) - frozenset(REFUSED_WHEN_ABSENT)
 
 
-def split_row(row: Mapping) -> tuple[dict, dict]:
+def is_blank(value: object) -> bool:
+    """None, or a string of whitespace only."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def alias_used(row: Mapping, alias: str) -> bool:
+    """Would split_row (transition=True) take this column from its old key?"""
+    return is_blank(row.get(TRANSITION_ALIASES[alias])) and not is_blank(row.get(alias))
+
+
+def split_row(row: Mapping, *, transition: bool = True) -> tuple[dict, dict]:
     """(columns, extra) for one manifest row; never refuses, never mutates `row`.
 
     `columns` has every name of COLUMNS, in order (None when absent); `extra`
-    holds every other key of the row except the transition aliases, values
-    untouched. A `date_precision` on an undated row is dropped (pass the row
-    to quality_notices to count it). See validate_row for what is accepted.
+    holds every other key of the row, values untouched. Blank optional values
+    are None; an undated row loses its date_precision and date_kind (pass the
+    row to quality_notices to count each drop). With `transition` (the
+    default until the cleanup PR) the old keys of TRANSITION_ALIASES fill their
+    columns and leave `extra`, and a leading `data/` is stripped from
+    local_path. See validate_row for what is accepted.
     """
     if not isinstance(row, Mapping):
         raise TypeError(f"a manifest row is a JSON object, not {type(row).__name__}")
 
     columns = {name: row.get(name) for name in COLUMNS}
-    for old, new in TRANSITION_ALIASES.items():
-        if columns[new] in (None, "") and row.get(old) not in (None, ""):
-            columns[new] = row[old]
+    if transition:
+        for old, new in TRANSITION_ALIASES.items():
+            if alias_used(row, old):
+                columns[new] = row[old]
     for name in _BLANK_IS_ABSENT:
-        if columns[name] == "":
+        if is_blank(columns[name]):
             columns[name] = None
 
-    # No date, no precision: a precision on an undated row describes nothing,
-    # so it is dropped here (never refused) and quality_notices reports it.
-    # date_kind is kept.
     if columns["date"] is None:
-        columns["date_precision"] = None
+        for name in DATE_DEPENDENT:
+            columns[name] = None
 
     path = columns["local_path"]
-    if isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
+    if transition and isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
         columns["local_path"] = path[len(TRANSITION_LOCAL_PATH_PREFIX):] or None
 
-    extra = {k: v for k, v in row.items() if k not in columns and k not in TRANSITION_ALIASES}
+    aliases = TRANSITION_ALIASES if transition else {}
+    extra = {k: v for k, v in row.items() if k not in columns and k not in aliases}
     return columns, extra
