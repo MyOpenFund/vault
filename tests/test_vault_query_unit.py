@@ -489,3 +489,15 @@ def test_a_lone_surrogate_is_refused_before_sql(call, value):
     InvalidQuery first."""
     with pytest.raises(InvalidQuery, match="UTF-8"):
         call(_NoConnection(), value)
+
+
+def test_run_columns_end_with_bad_content():
+    """0.4.0 is additive: `bad_content` is appended, the earlier columns keep their order."""
+    from vault_query.health import RUN_COLUMNS
+    assert RUN_COLUMNS[-1] == "bad_content"
+    assert RUN_COLUMNS[:-1] == (
+        "run_id", "tool", "command", "corpus", "source_code", "started_at", "finished_at",
+        "outcome", "exit_code", "docs_seen", "docs_new", "docs_failed", "fetch_errors",
+        "truncated", "error_samples",
+    )
+

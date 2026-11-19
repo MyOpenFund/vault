@@ -431,6 +431,36 @@
     }
   },
   {
+    "code": "Q6",
+    "name": "Q6 · Bad content per bank",
+    "description": "Banks whose runs failed on documents that downloaded but were not the document (an HTML page served for a PDF, a stub, a truncated PDF), over the lookback window, from `runs_sources.bad_content` (a sub-count of `docs_failed`, reported by central-bank-corpus since 2026-11-19). Only banks with bad content are listed: empty is healthy. `runs_reporting` counts the runs that reported the counter at all; `docs_failed` is summed over those runs only, so `bad_content` / `docs_failed` compares like with like.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Bad content per bank: failed documents whose URL served the wrong bytes\nSELECT rs.source_code                                         AS bank,\n       count(*)                                               AS runs,\n       count(rs.bad_content)                                  AS runs_reporting,\n       sum(rs.docs_failed) FILTER (WHERE rs.bad_content IS NOT NULL) AS docs_failed,\n       sum(rs.bad_content)                                    AS bad_content,\n       max(rs.finished_at) FILTER (WHERE rs.bad_content > 0)  AS last_bad_content_at,\n       (array_agg(rs.run_id ORDER BY rs.finished_at DESC, rs.run_id DESC)\n            FILTER (WHERE rs.bad_content > 0))[1]             AS last_bad_content_run_id\nFROM runs_sources rs\nWHERE rs.corpus = {{corpus}}\n  AND rs.finished_at >= now() - ({{lookback_days}} || ' days')::interval\n  [[AND rs.source_code = {{bank}}]]\nGROUP BY 1\nHAVING sum(rs.bad_content) > 0\nORDER BY bad_content DESC, last_bad_content_at DESC;\n",
+    "tags": {
+      "corpus": {
+        "type": "text",
+        "required": true,
+        "default": "central-bank",
+        "display_name": "Corpus"
+      },
+      "lookback_days": {
+        "type": "number",
+        "required": true,
+        "default": 90,
+        "display_name": "Lookback (days)"
+      },
+      "bank": {
+        "type": "text",
+        "required": false,
+        "default": null,
+        "display_name": "Bank"
+      }
+    }
+  },
+  {
     "code": "R1",
     "name": "R1 · Chunks by collection",
     "description": "Documents and chunks recorded as ingested per collection and embedding model (inventory #1). Accepted loss: this is the vault's belief, not live Qdrant state.",
@@ -481,12 +511,12 @@
   {
     "code": "R3",
     "name": "R3 · Last run per tool",
-    "description": "The most recent run of every producer with its totals and `age` — the silent-failure detector: a nightly tool whose last run is 3 days old is broken even when `outcome` says ok.",
+    "description": "The most recent run of every producer with its totals and `age` — the silent-failure detector: a nightly tool whose last run is 3 days old is broken even when `outcome` says ok. `bad_content` (failed documents whose URL served the wrong bytes) is empty when the producer does not report it.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false
     },
-    "sql": "-- Last run per tool\nSELECT DISTINCT ON (r.tool)\n       r.tool,\n       r.command,\n       r.outcome,\n       r.exit_code,\n       r.started_at,\n       r.finished_at,\n       round(extract(epoch FROM (r.finished_at - r.started_at))::numeric / 60.0, 1) AS minutes,\n       (r.totals ->> 'docs_seen')::int          AS docs_seen,\n       coalesce((r.totals ->> 'docs_ingested')::int,\n                (r.totals ->> 'docs_new')::int) AS docs_ingested,\n       (r.totals ->> 'docs_failed')::int        AS docs_failed,\n       (r.totals ->> 'docs_path_metadata')::int AS docs_path_metadata,\n       jsonb_array_length(coalesce(r.sources, '[]'::jsonb)) AS n_sources,\n       EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(r.sources, '[]'::jsonb)) s\n               WHERE (s ->> 'truncated')::boolean) AS any_truncated,\n       now() - r.finished_at                     AS age\nFROM runs r\nORDER BY r.tool, r.finished_at DESC NULLS LAST;\n",
+    "sql": "-- Last run per tool\nSELECT DISTINCT ON (r.tool)\n       r.tool,\n       r.command,\n       r.outcome,\n       r.exit_code,\n       r.started_at,\n       r.finished_at,\n       round(extract(epoch FROM (r.finished_at - r.started_at))::numeric / 60.0, 1) AS minutes,\n       (r.totals ->> 'docs_seen')::int          AS docs_seen,\n       coalesce((r.totals ->> 'docs_ingested')::int,\n                (r.totals ->> 'docs_new')::int) AS docs_ingested,\n       (r.totals ->> 'docs_failed')::int        AS docs_failed,\n       (r.totals ->> 'docs_path_metadata')::int AS docs_path_metadata,\n       jsonb_array_length(coalesce(r.sources, '[]'::jsonb)) AS n_sources,\n       EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(r.sources, '[]'::jsonb)) s\n               WHERE (s ->> 'truncated')::boolean) AS any_truncated,\n       now() - r.finished_at                     AS age,\n       CASE WHEN r.totals ->> 'bad_content' ~ '^-{0,1}[0-9]{1,9}$'\n            THEN (r.totals ->> 'bad_content')::int END AS bad_content\nFROM runs r\nORDER BY r.tool, r.finished_at DESC NULLS LAST;\n",
     "tags": {}
   },
   {

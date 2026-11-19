@@ -312,7 +312,7 @@ def test_plan_splits_creates_and_updates():
     result = mb.plan(CARDS, DASHBOARDS, existing_cards, existing_dashboards)
     assert [c["code"] for c in result.cards_to_update] == [CARDS[0]["code"]]
     assert result.card_ids_by_code[CARDS[0]["code"]] == 11
-    assert len(result.cards_to_create) == 17
+    assert len(result.cards_to_create) == 18
     assert [d["name"] for d in result.dashboards_to_update] == [DASHBOARDS[0]["name"]]
     assert len(result.dashboards_to_create) == 2
     assert result.dashboard_ids_by_name[DASHBOARDS[0]["name"]] == 21
@@ -346,13 +346,13 @@ def test_first_apply_creates_collection_cards_and_dashboards():
     summary = mb.apply(fake, CARDS, DASHBOARDS)
 
     assert fake.count("POST", path="/api/collection") == 1
-    assert fake.count("POST", path="/api/card") == 18
+    assert fake.count("POST", path="/api/card") == 19
     assert fake.count("POST", path="/api/dashboard") == 3
     assert fake.count("PUT", prefix="/api/dashboard/") == 3
     assert fake.count("PUT", prefix="/api/card/") == 0
     assert fake.count("PUT", prefix="/api/collection/") == 0
 
-    assert summary.cards_created == 18
+    assert summary.cards_created == 19
     assert summary.cards_updated == 0
     assert summary.dashboards_created == 3
     assert summary.dashboards_updated == 0
@@ -378,14 +378,14 @@ def test_second_apply_updates_and_creates_nothing():
     summary = mb.apply(fake, CARDS, DASHBOARDS)
 
     assert fake.count("POST") == 0
-    assert fake.count("PUT", prefix="/api/card/") == 18
+    assert fake.count("PUT", prefix="/api/card/") == 19
     assert fake.count("PUT", prefix="/api/dashboard/") == 3
     assert summary.cards_created == 0
-    assert summary.cards_updated == 18
+    assert summary.cards_updated == 19
     assert summary.dashboards_created == 0
     assert summary.dashboards_updated == 3
     assert summary.collection_created is False
-    assert len(fake.cards) == 18
+    assert len(fake.cards) == 19
     assert len(fake.dashboards) == 3
 
 
@@ -407,7 +407,7 @@ def test_apply_ignores_cards_of_other_collections():
     }
     mb.apply(fake, CARDS, DASHBOARDS)
     assert fake.count("PUT", path="/api/card/55") == 0
-    assert fake.count("POST", path="/api/card") == 18
+    assert fake.count("POST", path="/api/card") == 19
 
 
 def test_apply_reuses_an_existing_vault_collection():
@@ -480,7 +480,7 @@ def test_dry_run_issues_no_writes():
     assert fake.count("PUT") == 0
     assert {m for m, _, _ in fake.calls} == {"GET"}
     assert summary.dry_run is True
-    assert summary.cards_created == 18
+    assert summary.cards_created == 19
     assert summary.dashboards_created == 3
     assert summary.examples_archived is True  # "would archive", and it says so
     assert "would apply" in summary.as_line()
@@ -493,7 +493,7 @@ def test_dry_run_on_an_applied_instance_plans_updates_only():
     fake.calls.clear()
     summary = mb.apply(fake, CARDS, DASHBOARDS, dry_run=True)
     assert fake.count("POST") == 0 and fake.count("PUT") == 0
-    assert summary.cards_updated == 18
+    assert summary.cards_updated == 19
     assert summary.dashboards_updated == 3
 
 
@@ -700,7 +700,7 @@ def test_main_applies_for_real_without_dry_run(monkeypatch):
     monkeypatch.setenv("METABASE_URL", "https://metabase.example")
     monkeypatch.setenv("METABASE_API_KEY", "k")
     assert mb.main([]) == 0
-    assert fake.count("POST", path="/api/card") == 18
+    assert fake.count("POST", path="/api/card") == 19
     assert len(fake.dashboards) == 3
 
 

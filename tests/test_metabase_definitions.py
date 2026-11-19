@@ -12,9 +12,9 @@ ALLOWED_TYPES = {"text", "number", "date"}
 GRID_WIDTH = 24
 
 
-def test_eighteen_unique_cards():
+def test_nineteen_unique_cards():
     codes = [c["code"] for c in CARDS]
-    assert len(codes) == 18 and len(set(codes)) == 18
+    assert len(codes) == 19 and len(set(codes)) == 19
     assert all(c["name"].startswith(c["code"] + " · ") for c in CARDS)
 
 
@@ -177,3 +177,11 @@ def test_no_card_sql_contains_a_question_mark(card):
         f"{card['code']}: use jsonb_exists / jsonb_exists_any instead of ?/?|/?& "
         "— pgjdbc treats ? as a placeholder"
     )
+
+
+def test_q6_bad_content_sits_on_coverage_and_qc():
+    qc = next(d for d in DASHBOARDS if d["name"] == "Vault — Coverage & QC")
+    (q6,) = [dc for dc in qc["cards"] if dc["code"] == "Q6"]
+    assert q6["mappings"] == {"corpus": "corpus", "bank": "bank"}
+    card = next(c for c in CARDS if c["code"] == "Q6")
+    assert "FROM runs_sources" in card["sql"] and "bad_content" in card["sql"]

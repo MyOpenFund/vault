@@ -144,3 +144,70 @@ def test_source_health_counts_open_discovery_errors(clean_db, tmp_path, monkeypa
     rows = fetch_all(clean_db, "SELECT source_code, source_open_discovery_errors, source_open_discovery_attempts "
                                "FROM source_health ORDER BY 1")
     assert rows == [("ecb", 2, 5), ("fed", 0, 0)]
+
+
+# --- bad_content (central-bank-corpus, 2026-11-19): a sub-count of docs_failed --------------------
+# NULL means "not reported" (a producer, or a run, that does not check content), never 0.
+
+def _bad(code, bad, failed=0):
+    src = _src(code, 10, 1, failed=failed)
+    if bad is not ...:
+        src["bad_content"] = bad
+    return src
+
+
+def test_runs_sources_bad_content_is_cast_defensively(clean_db, tmp_path, monkeypatch):
+    _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
+    _plant_runs(clean_db, [_run_row("r0", 0, "ok", [_bad("ecb", 2, failed=3), _bad("fed", ...),
+                                                   _bad("fr", "garbage"), _bad("gb", None),
+                                                   _bad("it", 0), _bad("jp", 10000000000),
+                                                   _bad("nl", 999999999), _bad("se", 1.5)])])
+    rows = fetch_all(clean_db, "SELECT source_code, bad_content FROM runs_sources ORDER BY 1")
+    # Past the int range: NULL, never an "integer out of range" for every reader of the view.
+    assert rows == [("ecb", 2), ("fed", None), ("fr", None), ("gb", None), ("it", 0),
+                    ("jp", None), ("nl", 999999999), ("se", None)]
+    assert fetch_all(clean_db, "SELECT count(*) FROM source_health")[0][0] == 1
+
+
+def test_source_health_bad_content_sums_the_window_and_keeps_null_apart(clean_db, tmp_path, monkeypatch):
+    _setup(monkeypatch, clean_db, tmp_path,
+           [make_entry(bank_code=b, doc_type="A1") for b in ("ecb", "fed", "fr", "gb", "it")])
+    _plant_runs(clean_db, [
+        # ecb: 2 + 1 in the window (one run there did not report), 50 outside it.
+        _run_row("r-old", 30, "ok", [_bad("ecb", 50), _bad("fr", 4)]),
+        _run_row("r2", 2, "ok", [_bad("ecb", 2, failed=2), _bad("fed", ...), _bad("gb", 0)]),
+        _run_row("r1", 1, "ok", [_bad("ecb", ...), _bad("fed", ...), _bad("gb", 0)]),
+        _run_row("r0", 0, "ok", [_bad("ecb", 1, failed=1), _bad("fed", ...), _bad("it", 5)]),
+    ])
+    rows = fetch_all(clean_db, "SELECT source_code, source_bad_content_7d, last_run_bad_content "
+                               "FROM source_health ORDER BY 1")
+    assert rows == [
+        ("ecb", 3, 1),        # summed over the 7-day window, last run's own value
+        ("fed", None, None),  # runs, but never reported: unknown, not 0
+        ("fr", None, 4),      # reported only outside the window; its last run (30 d ago) said 4
+        ("gb", 0, 0),         # reported 0, which is not the same as NULL (not reported)
+        ("it", 5, 5),
+    ]
+
+
+def test_source_health_last_run_bad_content_follows_last_run(clean_db, tmp_path, monkeypatch):
+    _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
+    _plant_runs(clean_db, [_run_row("r1", 1, "ok", [_bad("ecb", 7)]),
+                           _run_row("r0", 0, "ok", [_bad("ecb", 0)])])
+    rows = fetch_all(clean_db, "SELECT last_run_id, last_run_bad_content, source_bad_content_7d "
+                               "FROM source_health")
+    assert rows == [("r0", 0, 7)]
+
+
+def test_bad_content_columns_come_last(clean_db, tmp_path, monkeypatch):
+    # Additive: existing positional readers of the views keep their columns in place.
+    _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
+    cols = [r[0] for r in fetch_all(clean_db,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'source_health' "
+            "ORDER BY ordinal_position")]
+    assert cols[-2:] == ["source_bad_content_7d", "last_run_bad_content"]
+    assert cols[:-2][-1] == "source_last_discovery_error_at"
+    cols = [r[0] for r in fetch_all(clean_db,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'runs_sources' "
+            "ORDER BY ordinal_position")]
+    assert cols[-2:] == ["error_samples", "bad_content"]
