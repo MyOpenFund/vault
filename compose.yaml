@@ -71,7 +71,10 @@ services:
       - ${METABASE_DATA_DIR:?set it in .env — see .env.example}:/metabase-data
     restart: unless-stopped
   ingestion:
-    build: ./ingestion
+    build:
+      # Repo root, not ./ingestion: the image copies contract/ (vault-contract) too.
+      context: .
+      dockerfile: ingestion/Dockerfile
     container_name: vault_ingestion
     environment:
       DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents

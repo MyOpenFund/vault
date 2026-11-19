@@ -12,3 +12,6 @@ click==8.1.8
 # Run `pip install -r requirements-dev.txt` from the repo root: pip resolves
 # this path from the current directory, not from this file.
 -e ./query
+# The vault-contract package (contract/): the `documents` contract (field table,
+# vocabulary, row validation) and its tests. Same rule: run pip from the repo root.
+-e ./contract

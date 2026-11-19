@@ -12,10 +12,13 @@ DOCKERFILE = (ROOT / "ingestion" / "Dockerfile").read_text()
 
 
 def _copied():
+    """Basenames of the ingestion/ sources copied (the build context is the
+    repo root, so the Dockerfile names them ingestion/<file>)."""
     files = set()
     for line in DOCKERFILE.splitlines():
         if line.startswith("COPY "):
-            files.update(line.split()[1:-1])
+            files.update(Path(src).name for src in line.split()[1:-1]
+                         if src.startswith("ingestion/"))
     return files
 
 

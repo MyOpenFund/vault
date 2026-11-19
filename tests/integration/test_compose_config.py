@@ -115,3 +115,11 @@ def test_the_api_image_builds_from_the_repo_root(as_committed):
     build = as_committed["services"]["api"]["build"]
     assert Path(build["context"]) == ROOT
     assert build["dockerfile"] == "api/Dockerfile"
+
+
+def test_the_ingestion_image_builds_from_the_repo_root(as_committed):
+    """The ingestion image copies contract/ (vault-contract) next to ingest.py,
+    so, as for the api, its build context is the repo root."""
+    build = as_committed["services"]["ingestion"]["build"]
+    assert Path(build["context"]) == ROOT
+    assert build["dockerfile"] == "ingestion/Dockerfile"
