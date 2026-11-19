@@ -1,7 +1,7 @@
 # Metabase over the vault, as code
 
 `cards.json` and `dashboards.json` are the truth for the vault's Metabase layer:
-18 native-SQL cards on three dashboards. They are **edited by hand** here and
+19 native-SQL cards on three dashboards. They are **edited by hand** here and
 **applied** to a Metabase instance by `apply.py` — never the other way round. A
 change made in the Metabase UI is overwritten on the next apply.
 
@@ -13,7 +13,8 @@ change made in the Metabase UI is overwritten on the next apply.
 ## Dashboards
 
 - **Vault — Corpus** (C0–C6) — what is in the corpus: volume, shape, coverage, document explorer.
-- **Vault — Coverage & QC** (Q1–Q5) — what is missing, late or wrong.
+- **Vault — Coverage & QC** (Q1–Q6) — what is missing, late or wrong. Q6 lists the banks
+  whose runs met bad content (wrong bytes served for a document); empty is healthy.
 - **Vault — RAG & Runs** (R1–R6) — is the machine healthy.
 
 Dashboard 1's `doc_type` filter drives **C1, C3 and C4 only**: C2, C5 and C6
@@ -42,7 +43,8 @@ card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
   disappears when the widget is empty, so the card falls back to *today* instead
   of to a frozen literal. `{{ref_date}}` (Q1, Q3) uses it.
 - Cards **read only**: no card creates or alters a schema object. The only view
-  they use (`rag_backlog`, read by Q4) belongs to `ingestion/ingest.py`'s DDL train.
+  they use (`rag_backlog`, read by Q4, and `runs_sources`, read by Q6) belong to
+  `ingestion/ingest.py`'s DDL train.
 - Dashboards are a 24-column grid; dashcards must not overlap.
 - **No `?` anywhere in a card's SQL.** Metabase reaches Postgres through pgjdbc,
   which reads a bare `?` in a native query as a positional placeholder, so the

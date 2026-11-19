@@ -196,6 +196,17 @@
           "corpus": "corpus",
           "bank": "bank"
         }
+      },
+      {
+        "code": "Q6",
+        "row": 24,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 8,
+        "mappings": {
+          "corpus": "corpus",
+          "bank": "bank"
+        }
       }
     ]
   },

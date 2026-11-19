@@ -409,6 +409,10 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
 -- agent detector build on; no time window, so consumers choose their own.
 -- Defensive casts: a producer writing a non-integer counter, an object where
 -- an array belongs, or a NULL must not make the view raise.
+-- bad_content (central-bank-corpus, 2026-11-19) is a sub-count of docs_failed:
+-- documents whose every URL served the wrong bytes (an HTML page for a PDF, a
+-- stub, a truncated PDF). NULL when the producer did not report it, never 0.
+-- Appended last so positional readers of the earlier columns are unaffected.
 CREATE VIEW runs_sources AS
 SELECT r.run_id, r.tool, r.command, r.corpus,
        r.started_at, r.finished_at, r.outcome, r.exit_code,
@@ -420,7 +424,8 @@ SELECT r.run_id, r.tool, r.command, r.corpus,
        CASE WHEN jsonb_typeof(s -> 'truncated') = 'boolean'
             THEN (s ->> 'truncated')::boolean ELSE FALSE END AS truncated,
        CASE WHEN jsonb_typeof(s -> 'error_samples') = 'array'
-            THEN s -> 'error_samples' ELSE '[]'::jsonb END AS error_samples
+            THEN s -> 'error_samples' ELSE '[]'::jsonb END AS error_samples,
+       CASE WHEN s ->> 'bad_content'  ~ '^-?[0-9]+$' THEN (s ->> 'bad_content')::int  END AS bad_content
 FROM runs r
 CROSS JOIN LATERAL jsonb_array_elements(
     CASE WHEN jsonb_typeof(r.sources) = 'array' THEN r.sources ELSE '[]'::jsonb END
@@ -473,6 +478,9 @@ GROUP BY 1, 2;
 -- Windows are fixed at 7d (recent) / 90d (baseline) and named in the
 -- columns; use runs_sources for any other window. No anomaly threshold here
 -- on purpose -- the detector owns it as a documented, testable config value.
+-- source_bad_content_7d and last_run_bad_content stay NULL when no run (resp.
+-- the last run) reported the key, unlike their coalesce(.., 0) siblings: a
+-- producer that does not check content must not read as "0 bad content".
 CREATE VIEW source_health AS
 WITH obs_7d AS (
     SELECT corpus, source_code,
@@ -482,7 +490,8 @@ WITH obs_7d AS (
            count(*) FILTER (WHERE coalesce(docs_seen, 0) = 0)         AS zero_yield_runs_7d,
            sum(coalesce(docs_new, 0))                                 AS docs_new_7d,
            sum(coalesce(docs_seen, 0))                                AS docs_seen_7d,
-           sum(coalesce(fetch_errors, 0))                             AS fetch_errors_7d
+           sum(coalesce(fetch_errors, 0))                             AS fetch_errors_7d,
+           sum(bad_content)                                           AS bad_content_7d
     FROM runs_sources
     WHERE finished_at >= now() - interval '7 days'
     GROUP BY 1, 2
@@ -497,7 +506,7 @@ base_90d AS (
 ),
 last_run AS (
     SELECT DISTINCT ON (corpus, source_code)
-           corpus, source_code, run_id, finished_at, outcome, truncated
+           corpus, source_code, run_id, finished_at, outcome, truncated, bad_content
     FROM runs_sources
     WHERE finished_at IS NOT NULL
     ORDER BY corpus, source_code, finished_at DESC, run_id DESC
@@ -536,7 +545,9 @@ SELECT c.corpus, c.source_code, c.doc_type,
        b.docs_new_median_per_run_90d                AS source_docs_new_median_per_run_90d,
        coalesce(e.open_discovery_errors, 0)         AS source_open_discovery_errors,
        coalesce(e.open_discovery_attempts, 0)       AS source_open_discovery_attempts,
-       e.last_discovery_error_at                    AS source_last_discovery_error_at
+       e.last_discovery_error_at                    AS source_last_discovery_error_at,
+       o.bad_content_7d                             AS source_bad_content_7d,
+       lr.bad_content                               AS last_run_bad_content
 FROM cadence c
 LEFT JOIN obs_7d     o  ON o.corpus  = c.corpus AND o.source_code  = c.source_code
 LEFT JOIN base_90d   b  ON b.corpus  = c.corpus AND b.source_code  = c.source_code

@@ -10,6 +10,9 @@ RUN_COLUMNS = (
     "run_id", "tool", "command", "corpus", "source_code", "started_at", "finished_at",
     "outcome", "exit_code", "docs_seen", "docs_new", "docs_failed", "fetch_errors",
     "truncated", "error_samples",
+    # 0.4.0: a sub-count of docs_failed (wrong bytes served, e.g. an HTML page for a PDF);
+    # NULL when the producer did not report it. Needs a vault whose runs_sources has it.
+    "bad_content",
 )
 ERROR_COLUMNS = (
     "fingerprint", "corpus", "source_code", "doc_type", "context", "url", "error_class",

@@ -266,6 +266,24 @@ def test_runs_status_is_per_source_newest_first_and_filters(conn):
     assert vq.runs_status(conn, corpus="company") == []
 
 
+def test_runs_status_carries_bad_content(conn):
+    """`bad_content` (a sub-count of docs_failed) is a column of every row; NULL when not reported."""
+    _insert_run(conn, "r1", "2026-10-01T02:00:00Z",
+                [{"source_code": "us", "docs_failed": 3, "bad_content": 2}, {"source_code": "fr"}])
+    rows = {r["source_code"]: r for r in vq.runs_status(conn)}
+    assert rows["us"]["bad_content"] == 2 and rows["us"]["docs_failed"] == 3
+    assert rows["fr"]["bad_content"] is None
+
+
+def test_source_health_carries_the_bad_content_columns(conn):
+    """`source_health` is the view as is: the two bad_content columns reach readers unchanged."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'source_health'")
+        cols = {r[0] for r in cur.fetchall()}
+    assert {"source_bad_content_7d", "last_run_bad_content"} <= cols
+
+
 def test_recent_runs_lists_runs_with_no_sources(conn):
     """A run whose `sources` is NULL or empty is invisible per source, visible per run.
 
