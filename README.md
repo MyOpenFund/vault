@@ -106,7 +106,7 @@ Dropped and recreated by the DDL train whenever it runs (see [Schema migrations]
 
 | view | grain | what it answers |
 |---|---|---|
-| `runs_sources` | one row per (run, source) | the base for every runs-shaped question; no time window; defensive casts (garbage counters → NULL, non-boolean `truncated` → FALSE, non-array `error_samples` → `[]`, non-array `sources` → no rows); `bad_content` is NULL when the producer did not report it |
+| `runs_sources` | one row per (run, source) | the base for every runs-shaped question; no time window; defensive casts (garbage or out-of-range counters — more than 9 digits — → NULL, non-boolean `truncated` → FALSE, non-array `error_samples` → `[]`, non-array `sources` → no rows); `bad_content` is NULL when the producer did not report it |
 | `rag_backlog` | (document, collection) | documents missing from each collection seen in `rag_ingestions` — the campaign resume query. **Empty when `rag_ingestions` has no rows** |
 | `rag_backlog_any` | document | live documents in no collection at all — correct on a fresh deployment |
 | `source_health` | (corpus, source_code, doc_type) | expected (cadence) × observed (runs) per series |
@@ -198,7 +198,9 @@ columns. No table, no `.env` change, nothing to backfill (older runs carry no ke
   recreated, no table is altered, grants re-issued, the new fingerprint is recorded in
   `vault_schema`. Readers holding the views (Metabase, the API, the MCP) delay it by at most
   `VAULT_DDL_LOCK_TIMEOUT` per attempt, as for any train (see
-  [Schema migrations](#schema-migrations)). The next runs skip it.
+  [Schema migrations](#schema-migrations)). The next runs skip it. The follow-up that bounds the
+  four older `runs_sources` counters to 9 digits changes the train again: shipped together with
+  this one, the train still re-runs only once; shipped later, once more (views only).
 
 Everything below needs the new columns, which exist only **once that first ingestion run has
 re-run the train** (the `DDL train running: train changed` line, or `vault_schema.applied_at`
