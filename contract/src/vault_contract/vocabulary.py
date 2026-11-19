@@ -50,8 +50,8 @@ def _is_code(value: object) -> bool:
 
 def _check_labelled(doc: Mapping, key: str, errors: list[str], *, with_family: bool) -> None:
     entries = doc.get(key)
-    if not isinstance(entries, list):
-        errors.append(f"{key}: must be a list of objects")
+    if not isinstance(entries, list) or not entries:
+        errors.append(f"{key}: must be a non-empty list of objects")
         return
     seen = set()
     for i, entry in enumerate(entries):
@@ -67,16 +67,16 @@ def _check_labelled(doc: Mapping, key: str, errors: list[str], *, with_family: b
         else:
             seen.add(code)
         label = entry.get("label")
-        if not isinstance(label, str) or not label.strip():
-            errors.append(f"{where}: label must be a non-empty string")
+        if not isinstance(label, str) or not label.strip() or "\x00" in label:
+            errors.append(f"{where}: label must be a non-empty string without NUL")
         if with_family and entry.get("family") is not None and not _is_code(entry["family"]):
             errors.append(f"{where}: family {entry['family']!r} must match {CODE_PATTERN.pattern}")
 
 
-def _check_codes(doc: Mapping, key: str, errors: list[str]) -> None:
+def _check_codes(doc: Mapping, key: str, errors: list[str], *, may_be_empty: bool) -> None:
     codes = doc.get(key)
-    if not isinstance(codes, list):
-        errors.append(f"{key}: must be a list of codes")
+    if not isinstance(codes, list) or not (codes or may_be_empty):
+        errors.append(f"{key}: must be a {'' if may_be_empty else 'non-empty '}list of codes")
         return
     seen = set()
     for i, code in enumerate(codes):
@@ -106,8 +106,8 @@ def validate_vocabulary(doc: object) -> list[str]:
         errors.append(f"corpus: {doc.get('corpus')!r} must match {CODE_PATTERN.pattern}")
     _check_labelled(doc, "source_codes", errors, with_family=False)
     _check_labelled(doc, "doc_types", errors, with_family=True)
-    _check_codes(doc, "provenances", errors)
-    _check_codes(doc, "entity_schemes", errors)
+    _check_codes(doc, "provenances", errors, may_be_empty=False)
+    _check_codes(doc, "entity_schemes", errors, may_be_empty=True)   # no single company
     return errors
 
 

@@ -111,6 +111,11 @@ def _broken(**changes):
     (_broken(provenances="edgar_index"), "provenances"),
     (_broken(entity_schemes=[None]), "entity_schemes"),
     (_broken(entity_schemes=...), "entity_schemes"),
+    (_broken(source_codes=[]), "source_codes"),
+    (_broken(doc_types=[]), "doc_types"),
+    (_broken(provenances=[]), "provenances"),
+    (_broken(source_codes=[{"code": "sec", "label": "SEC\x00EDGAR"}]), "label"),
+    (_broken(doc_types=[{"code": "A1", "label": "Annual\x00report"}]), "label"),
 ])
 def test_validate_vocabulary_reports_each_defect(doc, fragment):
     errors = validate_vocabulary(doc)
