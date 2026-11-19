@@ -82,10 +82,14 @@ log = logging.getLogger("ingest")
 # "Known" schema fields -> everything else goes into `extra` (JSONB).
 # bank_code stays listed: legacy manifests emit it (mapped to source_code),
 # and it must not fall into extra.
+# pdf_url likewise (2026-11 rename): manifests not yet migrated emit it, mapped
+# to document_url when document_url is absent (see parse_line). Transition
+# only: remove pdf_url here and in parse_line once producers write
+# document_url (central-bank-corpus migrate-document-url).
 KNOWN_FIELDS = {
     "doc_id", "corpus", "source_code", "bank_code", "doc_type", "title",
-    "pdf_url", "source_url", "date", "year", "language", "provenance",
-    "mime_type", "sha256", "local_path",
+    "document_url", "pdf_url", "source_url", "date", "year", "language",
+    "provenance", "mime_type", "sha256", "local_path",
 }
 
 CREATE_TABLE_SQL = """
@@ -115,7 +119,7 @@ CREATE TABLE IF NOT EXISTS documents (
     source_code TEXT,
     doc_type TEXT,
     title TEXT,
-    pdf_url TEXT,
+    document_url TEXT,
     source_url TEXT,
     date DATE,
     year INTEGER,
@@ -166,6 +170,38 @@ BEGIN
         RAISE WARNING 'documents has both bank_code and source_code: source_code filled from bank_code on % row(s) where it was NULL; bank_code kept (drop it by hand once checked)', filled;
     END IF;
 END $$;
+
+-- Rename (2026-11): pdf_url -> document_url (the URL is not always a PDF).
+-- Same shape as the bank_code migration above, idempotent: the rename only
+-- happens when document_url is absent (a database created before the rename);
+-- a fresh database already has document_url and no pdf_url, and an already
+-- renamed one has nothing to do. When BOTH exist (a column added by hand),
+-- document_url is filled from pdf_url where it is NULL, pdf_url is KEPT for a
+-- human to inspect and drop, and a WARNING says so (ingest.py repeats it on
+-- every pass from the catalog). The ADD COLUMN covers a table missing both.
+-- RENAME COLUMN is a catalog change: no table rewrite, no data touched.
+DO $$
+DECLARE
+    has_pdf boolean;
+    has_doc boolean;
+    filled  bigint;
+BEGIN
+    SELECT coalesce(bool_or(column_name = 'pdf_url'), false),
+           coalesce(bool_or(column_name = 'document_url'), false)
+      INTO has_pdf, has_doc
+      FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'documents'
+       AND column_name IN ('pdf_url', 'document_url');
+    IF has_pdf AND NOT has_doc THEN
+        ALTER TABLE documents RENAME COLUMN pdf_url TO document_url;
+    ELSIF has_pdf AND has_doc THEN
+        UPDATE documents SET document_url = pdf_url
+         WHERE document_url IS NULL AND pdf_url IS NOT NULL;
+        GET DIAGNOSTICS filled = ROW_COUNT;
+        RAISE WARNING 'documents has both pdf_url and document_url: document_url filled from pdf_url on % row(s) where it was NULL; pdf_url kept (drop it by hand once checked)', filled;
+    END IF;
+END $$;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_url TEXT;
 
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS corpus TEXT;
 UPDATE documents SET corpus = 'central-bank' WHERE corpus IS NULL;
@@ -398,7 +434,7 @@ CREATE VIEW rag_backlog AS
 WITH collections AS (SELECT DISTINCT collection FROM rag_ingestions)
 SELECT c.collection,
        d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
-       d.local_path, d.mime_type, d.pdf_url, d.source_url,
+       d.local_path, d.mime_type, d.document_url, d.source_url,
        d.page_count, d.has_text_layer,
        d.updated_at AS document_updated_at
 FROM documents d
@@ -411,7 +447,7 @@ WHERE d.deleted_at IS NULL AND r.doc_id IS NULL;
 -- backlog 0 with documents 0 means "no data", not "done".
 CREATE VIEW rag_backlog_any AS
 SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
-       d.local_path, d.mime_type, d.pdf_url, d.source_url,
+       d.local_path, d.mime_type, d.document_url, d.source_url,
        d.page_count, d.has_text_layer,
        d.updated_at AS document_updated_at
 FROM documents d
@@ -528,7 +564,7 @@ ON CONFLICT (singleton) DO UPDATE
 
 UPSERT_SQL = """
 INSERT INTO documents (
-    doc_id, corpus, source_code, doc_type, title, pdf_url, source_url,
+    doc_id, corpus, source_code, doc_type, title, document_url, source_url,
     date, year, language, provenance, mime_type, sha256, local_path,
     updated_at, last_seen_at, extra
 ) VALUES %s
@@ -537,7 +573,7 @@ ON CONFLICT (doc_id) DO UPDATE SET
     source_code = EXCLUDED.source_code,
     doc_type = EXCLUDED.doc_type,
     title = EXCLUDED.title,
-    pdf_url = EXCLUDED.pdf_url,
+    document_url = EXCLUDED.document_url,
     source_url = EXCLUDED.source_url,
     date = EXCLUDED.date,
     year = EXCLUDED.year,
@@ -915,7 +951,9 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
         obj.get("source_code") or obj.get("bank_code"),
         obj.get("doc_type"),
         obj.get("title"),
-        obj.get("pdf_url"),
+        # document_url wins; the legacy pdf_url fills it when it is absent
+        # (transition: drop the fallback once producers write document_url).
+        (obj.get("document_url") or obj.get("pdf_url")) or None,
         obj.get("source_url"),
         obj.get("date") or None,
         obj.get("year"),
@@ -935,30 +973,40 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=Non
 # whenever roles are provisioned.
 ROLES_CATALOG = "pg_authid"
 
-BOTH_CODE_COLUMNS_SQL = """
-SELECT count(*) = 2 FROM information_schema.columns
+# Legacy column kept beside its replacement when a migration found both (the
+# train never drops data): (legacy, replacement) pairs, each reported on every
+# pass until a human drops the legacy column.
+LEGACY_COLUMN_PAIRS = (
+    ("bank_code", "source_code"),    # generalization migration
+    ("pdf_url", "document_url"),     # 2026-11 rename
+)
+
+LEGACY_COLUMNS_PRESENT_SQL = """
+SELECT column_name FROM information_schema.columns
  WHERE table_schema = current_schema() AND table_name = 'documents'
-   AND column_name IN ('bank_code', 'source_code')
+   AND column_name = ANY (%s)
 """
 
 
-def warn_if_both_code_columns(conn):
+def warn_if_legacy_columns_kept(conn):
     """F8 leftover: a catalog read (no table lock), logged on every pass.
 
-    Not taken from the train's RAISE WARNING (a server notice the driver may
+    Not taken from the train's RAISE WARNINGs (server notices the driver may
     drop, and emitted only on the night the train runs): the state is checked
-    directly, so the WARNING repeats until a human drops bank_code.
+    directly, so the WARNING repeats until a human drops the legacy column.
     """
+    names = [c for pair in LEGACY_COLUMN_PAIRS for c in pair]
     with conn.cursor() as cur:
-        cur.execute(BOTH_CODE_COLUMNS_SQL)
-        (both,) = cur.fetchone()
+        cur.execute(LEGACY_COLUMNS_PRESENT_SQL, (names,))
+        present = {name for (name,) in cur.fetchall()}
     conn.commit()
-    if both:
-        log.warning(
-            "documents has both bank_code and source_code: source_code was filled "
-            "from bank_code where NULL and bank_code was kept (nullable). Check it, "
-            "then drop it by hand: ALTER TABLE documents DROP COLUMN bank_code"
-        )
+    for legacy, current in LEGACY_COLUMN_PAIRS:
+        if legacy in present and current in present:
+            log.warning(
+                f"documents has both {legacy} and {current}: {current} was filled "
+                f"from {legacy} where NULL and {legacy} was kept (nullable). Check it, "
+                f"then drop it by hand: ALTER TABLE documents DROP COLUMN {legacy}"
+            )
 
 
 def apply_schema(conn, gate, passwords):
@@ -994,7 +1042,7 @@ def apply_schema(conn, gate, passwords):
     schema_gate.run_with_lock_retries(conn, apply, gate, relations, label=label)
     if reason is not None:
         log.info(f"DDL train applied; fingerprint {TRAIN_FINGERPRINT[:12]} recorded")
-    warn_if_both_code_columns(conn)
+    warn_if_legacy_columns_kept(conn)
 
 
 def main(*, corpus=None, data_dir=None):

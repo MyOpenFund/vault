@@ -33,11 +33,11 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 ### Table `documents`
 
-Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); upsert key is `doc_id` (TEXT UNIQUE NOT NULL, the ON CONFLICT target). Columns: `id` (PK), `doc_id` (unique, upsert key), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `pdf_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB).
+Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); upsert key is `doc_id` (TEXT UNIQUE NOT NULL, the ON CONFLICT target). Columns: `id` (PK), `doc_id` (unique, upsert key), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `document_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB). `document_url` is the document's own URL (a PDF or any other format); it was named `pdf_url` before 2026-11 (see [Migration (2026-11 document_url rename)](#migration-2026-11-document_url-rename)).
 
 Write contract (the ingestion service is the only writer):
 
-Every manifest column (corpus, source_code, doc_type, title, pdf_url, source_url, date, year, language, provenance, mime_type, sha256, local_path) is overwritten from the manifest on upsert; deleted_at is cleared to NULL (row resurrection); id and created_at are never updated. The `extra` column (unknown manifest fields) is replaced from the manifest on every upsert, like every other manifest column: a key the producer stops emitting disappears from the vault on the next run, and a line with no unknown fields sets `extra` to NULL. The manifest is regenerated whole on every producer run, so this is convergence to the producer's current truth, not data loss — but it is a one-way door, decided 2026-09-04 (vault #8, #2).
+Every manifest column (corpus, source_code, doc_type, title, document_url, source_url, date, year, language, provenance, mime_type, sha256, local_path) is overwritten from the manifest on upsert; deleted_at is cleared to NULL (row resurrection); id and created_at are never updated. The `extra` column (unknown manifest fields) is replaced from the manifest on every upsert, like every other manifest column: a key the producer stops emitting disappears from the vault on the next run, and a line with no unknown fields sets `extra` to NULL. The manifest is regenerated whole on every producer run, so this is convergence to the producer's current truth, not data loss — but it is a one-way door, decided 2026-09-04 (vault #8, #2).
 
 Soft-delete semantics: rows absent from all manifests in a run are marked with `deleted_at`; rows that reappear are resurrected (`deleted_at` cleared). Hard deletes never happen. A sweep guard prevents mass-deletions from torn/partial share syncs. `last_seen_at` is monotone — it only ever advances (see Concurrency below) — so a slower concurrent run can never make a live row look stale to a newer run's sweep.
 
@@ -170,7 +170,10 @@ them (#4). So the train is **gated** (`ingestion/schema_gate.py`):
   `deleted_at` is upgraded from naive `TIMESTAMP` on its own (`AT TIME ZONE 'UTC'`);
   `bank_code` is renamed to `source_code` only when `source_code` is absent — when both exist,
   `source_code` is filled from `bank_code` where NULL, `bank_code` is **kept** (made nullable),
-  and a WARNING on every pass asks for it to be dropped by hand.
+  and a WARNING on every pass asks for it to be dropped by hand. `pdf_url` is renamed to
+  `document_url` the same way: only when `document_url` is absent; when both exist,
+  `document_url` is filled from `pdf_url` where NULL, `pdf_url` is kept, and the same per-pass
+  WARNING asks for it to be dropped by hand.
 
 First run after deploying the gate: `vault_schema` does not exist yet, so that run applies the
 train once (under the timeout) and records the fingerprint; later runs skip it.
@@ -182,6 +185,34 @@ with `VAULT_DDL_FORCE=1`. Two services on different code versions against the sa
 (e.g. two corpora deployed at different times) see different fingerprints and re-run the train
 alternately, each time the other one has recorded its own — the nightly lock convoy comes back
 until both run the same tree.
+
+### Migration (2026-11 document_url rename)
+
+`documents.pdf_url` is now `documents.document_url`, and so is the column of the `rag_backlog`
+and `rag_backlog_any` views. Nothing to set in `.env`; the first ingestion run after deploying
+applies it:
+
+- The train's text changed, so that run re-runs the DDL train once (`DDL train running: train
+  changed (recorded …)`), under the usual bounded lock wait: views dropped, `ALTER TABLE
+  documents RENAME COLUMN pdf_url TO document_url` (a catalog change — no table rewrite, no
+  value touched), views recreated on the new name, grants re-issued in the same transaction.
+  Readers holding the tables (Metabase, the API, the MCP) delay it by at most
+  `VAULT_DDL_LOCK_TIMEOUT` per attempt; if they never let go, the run fails and ingests nothing
+  (see [Schema migrations](#schema-migrations)). Later runs skip the train.
+- Manifests: a line carrying `document_url` fills the column; a line still carrying the legacy
+  `pdf_url` (a manifest not migrated yet) fills it too, `document_url` winning when both are
+  present. `pdf_url` never lands in `extra`. Transition only: the `pdf_url` fallback in
+  `ingestion/ingest.py` (`KNOWN_FIELDS`, `parse_line`) is removed once every producer writes
+  `document_url`.
+- Readers that name the column must move with it: the API's `Document` model and `vault-query`
+  0.3.0 (this release) return `document_url`; a consumer pinned to an older `vault-query` (the
+  MCP) selects a column that no longer exists and fails until its pin is bumped. Re-apply the
+  Metabase cards (`python metabase/apply.py`): card C4's SQL reads `d.document_url`. Questions
+  built by hand in the Metabase UI are not in `cards.json`: fix any that name `pdf_url` there.
+- **Deploy this before the producers migrate their manifests.** The previous ingestion code does
+  not know `document_url`: run on a migrated manifest, it would put the URL in `extra` and set
+  the column to NULL on every row until the new code runs. This version accepts both keys, so
+  the order is: vault, then the MCP pin bump, then the producers' manifest migration.
 
 ### Migration (2026-09 substrate)
 
@@ -321,6 +352,11 @@ Guarantees: read-only — no function writes or commits the caller's transaction
 takes an open psycopg2 connection that the caller owns (opens, closes, and chooses the role —
 `vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
 "idle in transaction" holds locks that block the ingester's DDL train.
+
+Changes in 0.3.0 (breaking — bump the pin together with the vault deploy that renames the
+column): `pdf_url` is now `document_url` everywhere — in `ALL_COLUMNS`, in `SEARCH_COLUMNS`, and
+so as a key of every row `search_documents` and `get_document` return. 0.2.x selects `pdf_url`
+and fails against a renamed vault; 0.3.0 fails against a vault that has not been renamed yet.
 
 Behaviour notes (0.2.0):
 

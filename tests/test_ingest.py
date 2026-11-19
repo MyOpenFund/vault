@@ -64,6 +64,52 @@ def test_corpus_and_source_code_do_not_leak_into_extra():
     assert row[-1] is None  # no extra
 
 
+DOCUMENT_URL = 5  # row position of document_url (after title)
+
+
+def test_document_url_fills_the_column():
+    row = parse_line(make_line(document_url="https://x.invalid/a.pdf"),
+                     "f.jsonl", 1, RUN_TS, CORPUS)
+    assert row[DOCUMENT_URL] == "https://x.invalid/a.pdf"
+    assert row[-1] is None  # no extra
+
+
+def test_legacy_pdf_url_fills_document_url_and_stays_out_of_extra():
+    # Transition (2026-11 rename): manifests not yet migrated still say pdf_url.
+    row = parse_line(make_line(pdf_url="https://x.invalid/old.pdf"),
+                     "f.jsonl", 1, RUN_TS, CORPUS)
+    assert row[DOCUMENT_URL] == "https://x.invalid/old.pdf"
+    assert row[-1] is None  # pdf_url never falls into extra
+
+
+def test_document_url_wins_over_legacy_pdf_url():
+    row = parse_line(
+        make_line(document_url="https://x.invalid/new.html", pdf_url="https://x.invalid/old.pdf"),
+        "f.jsonl", 1, RUN_TS, CORPUS,
+    )
+    assert row[DOCUMENT_URL] == "https://x.invalid/new.html"
+    assert row[-1] is None
+
+
+def test_null_document_url_falls_back_to_legacy_pdf_url():
+    # Same rule as source_code / bank_code: an absent or empty new key defers.
+    row = parse_line(make_line(document_url=None, pdf_url="https://x.invalid/old.pdf"),
+                     "f.jsonl", 1, RUN_TS, CORPUS)
+    assert row[DOCUMENT_URL] == "https://x.invalid/old.pdf"
+
+
+def test_an_empty_url_under_either_key_is_null():
+    # A manifest's "" under the legacy key must not change meaning when it migrates.
+    for line in (make_line(pdf_url=""), make_line(document_url=""),
+                 make_line(document_url="", pdf_url="")):
+        assert parse_line(line, "f.jsonl", 1, RUN_TS, CORPUS)[DOCUMENT_URL] is None
+
+
+def test_no_url_at_all_leaves_document_url_null():
+    row = parse_line(make_line(), "f.jsonl", 1, RUN_TS, CORPUS)
+    assert row[DOCUMENT_URL] is None
+
+
 def test_row_carries_run_timestamp_for_updated_and_last_seen():
     row = parse_line(make_line(), "f.jsonl", 1, RUN_TS, CORPUS)
     assert row[-3] == RUN_TS  # updated_at

@@ -124,15 +124,15 @@ def seeded_db(pg_url, tmp_path_factory):
     write_manifest(data, "us.jsonl", [
         make_doc("us-a1-2019", source="us", doc_type="A1",
                  date="2019-03-01", year=2019,
-                 pdf_url="https://example.invalid/us/2019.pdf"),
+                 document_url="https://example.invalid/us/2019.pdf"),
         make_doc("us-a1-2020", source="us", doc_type="A1",
                  date="2020-05-04", year=2020,
-                 pdf_url="https://example.invalid/us/2020.pdf"),
+                 document_url="https://example.invalid/us/2020.pdf"),
     ])
     # An undated document: C0 counts it, C1/C3 drop it, C4 must keep it.
     write_manifest(data, "ecb.jsonl", [
         make_doc("ecb-e4-undated", source="ecb", doc_type="E4",
-                 date=None, year=None, pdf_url=None,
+                 date=None, year=None, document_url=None,
                  source_url="https://example.invalid/ecb/report"),
     ])
     write_cadence(data, [make_entry(bank_code="us", doc_type="A1")])

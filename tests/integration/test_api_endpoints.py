@@ -20,7 +20,8 @@ pytestmark = pytest.mark.integration
 # doc_id -> (source_code, date, year); dated apart so sorting is unambiguous.
 SEED = [
     make_doc("us1", source="us", date="2010-01-13", year=2010),
-    make_doc("us2", source="us", date="2011-02-01", year=2011),
+    make_doc("us2", source="us", date="2011-02-01", year=2011,
+             document_url="https://example.invalid/us2.pdf"),
     make_doc("us3", source="us", date="2012-03-01", year=2012),
     make_doc("fr1", source="fr", date="2010-01-13", year=2010),
 ]
@@ -142,6 +143,8 @@ def test_get_document_returns_the_stored_row(api_db, client):
     assert body["doc_id"] == "us2"
     assert body["source_code"] == "us"
     assert body["year"] == 2011
+    assert body["document_url"] == "https://example.invalid/us2.pdf"
+    assert "pdf_url" not in body
 
 
 def test_the_probe_facts_reach_the_api(api_db, client):
