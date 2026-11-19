@@ -15,6 +15,7 @@ import venv
 from pathlib import Path
 
 import vault_contract
+import vault_contract.golden
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "contract"
@@ -48,7 +49,8 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     """`pip install ./contract` into a venv without this repo on its path.
 
     The probe runs from tmp_path, never from the repo, so the import can only
-    be satisfied by the installed copy.
+    be satisfied by the installed copy; it reads the golden rows through
+    importlib.resources, which fails if package data was not declared.
     """
     env_dir = tmp_path / "venv"
     venv.create(env_dir, with_pip=True)
@@ -59,14 +61,18 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     )
     probe = (
         "import vault_contract as c\n"
+        "from vault_contract import golden\n"
         "print(c.__file__)\n"
         "print(c.CONTRACT_NAME, c.CONTRACT_VERSION)\n"
+        "print(' '.join(sorted(golden.accepted())))\n"
     )
     out = subprocess.run([str(python), "-c", probe], cwd=tmp_path,
                          check=True, capture_output=True, text=True, timeout=60)
-    file_line, name_line = out.stdout.splitlines()
+    file_line, name_line, accepted = out.stdout.splitlines()
     assert Path(file_line).is_relative_to(env_dir), file_line
     assert name_line == "documents 1.0.0"
+    assert accepted.split() == sorted(vault_contract.golden.accepted())
+    assert len(accepted.split()) == 5
 
 
 # --- the ingestion image ships the package (no pip at run time) -------------

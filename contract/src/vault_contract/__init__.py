@@ -8,7 +8,14 @@ data-orchestrator splits rows with it. Standard library only.
 See contract/README.md for the field table and the versioning rule.
 """
 
+from .fields import (
+    COLUMNS, DATE_KINDS, DATE_PRECISIONS, REQUIRED, TRANSITION_ALIASES, split_row,
+)
+
 CONTRACT_NAME = "documents"
 CONTRACT_VERSION = "1.0.0"
 
-__all__ = ["CONTRACT_NAME", "CONTRACT_VERSION"]
+__all__ = [
+    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS",
+    "REQUIRED", "TRANSITION_ALIASES", "split_row",
+]
