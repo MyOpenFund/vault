@@ -80,6 +80,15 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     assert vocabularies == "company central-bank"
 
 
+def test_readme_documents_every_column_and_every_refusal_reason():
+    """contract/README.md is the contract's user documentation (spec §3)."""
+    readme = (CONTRACT / "README.md").read_text()
+    missing = [n for n in (*vault_contract.COLUMNS, *vault_contract.REASONS)
+               if f"| `{n}` |" not in readme]
+    assert missing == []
+    assert "must put `corpus` in its point ids" in readme
+
+
 # --- the ingestion image ships the package (no pip at run time) -------------
 
 DOCKERFILE = (ROOT / "ingestion" / "Dockerfile").read_text()
