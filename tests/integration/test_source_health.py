@@ -160,9 +160,13 @@ def test_runs_sources_bad_content_is_cast_defensively(clean_db, tmp_path, monkey
     _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
     _plant_runs(clean_db, [_run_row("r0", 0, "ok", [_bad("ecb", 2, failed=3), _bad("fed", ...),
                                                    _bad("fr", "garbage"), _bad("gb", None),
-                                                   _bad("it", 0)])])
+                                                   _bad("it", 0), _bad("jp", 10000000000),
+                                                   _bad("nl", 999999999), _bad("se", 1.5)])])
     rows = fetch_all(clean_db, "SELECT source_code, bad_content FROM runs_sources ORDER BY 1")
-    assert rows == [("ecb", 2), ("fed", None), ("fr", None), ("gb", None), ("it", 0)]
+    # Past the int range: NULL, never an "integer out of range" for every reader of the view.
+    assert rows == [("ecb", 2), ("fed", None), ("fr", None), ("gb", None), ("it", 0),
+                    ("jp", None), ("nl", 999999999), ("se", None)]
+    assert fetch_all(clean_db, "SELECT count(*) FROM source_health")[0][0] == 1
 
 
 def test_source_health_bad_content_sums_the_window_and_keeps_null_apart(clean_db, tmp_path, monkeypatch):
@@ -181,7 +185,7 @@ def test_source_health_bad_content_sums_the_window_and_keeps_null_apart(clean_db
         ("ecb", 3, 1),        # summed over the 7-day window, last run's own value
         ("fed", None, None),  # runs, but never reported: unknown, not 0
         ("fr", None, 4),      # reported only outside the window; its last run (30 d ago) said 4
-        ("gb", 0, 0),         # reported 0: checked and clean, which is not the same as NULL
+        ("gb", 0, 0),         # reported 0, which is not the same as NULL (not reported)
         ("it", 5, 5),
     ]
 

@@ -124,7 +124,7 @@ Consumer contract:
 6. `discovery_errors.last_seen_at` is ingestion time while `seen_at_is_ingestion_time` is TRUE.
 7. The 7-day / 90-day windows of `source_health` are choices, named in the columns; use `runs_sources` for any other window. No anomaly threshold lives in a view — the detector owns it as a documented config value.
 8. Indexes: `idx_documents_live_agg` serves the per-source drill-down cards (not the whole-corpus rollup, which correctly seq-scans); `idx_documents_corpus_doc_type` is used once a second corpus exists.
-9. `bad_content` (central-bank-corpus, since 2026-11-19) is a **sub-count of `docs_failed`**: documents whose every candidate URL served the wrong bytes (an HTML page for a PDF, a stub, a truncated PDF), as opposed to a dead URL. NULL means *not reported* (another producer, or a run before 2026-11-19), never 0: `runs_sources.bad_content`, `source_health.source_bad_content_7d` (sum over the 7-day window; NULL when no run of the window reported it, unlike its `coalesce(…, 0)` siblings) and `source_health.last_run_bad_content` (the value on the run behind the `last_run_*` columns) all keep that distinction. These three columns come last in their views.
+9. `bad_content` (central-bank-corpus, since 2026-11-19) is a **sub-count of `docs_failed`**: documents whose every candidate URL served the wrong bytes (an HTML page for a PDF, a stub, a truncated PDF), as opposed to a dead URL. NULL means *not reported* (another producer, or a run before 2026-11-19), never 0 — but 0 does not always mean *checked*: a run that downloads nothing (e.g. a `discover` without download) reports 0 too: `runs_sources.bad_content`, `source_health.source_bad_content_7d` (sum over the 7-day window; NULL when no run of the window reported it, unlike its `coalesce(…, 0)` siblings) and `source_health.last_run_bad_content` (the value on the run behind the `last_run_*` columns) all keep that distinction. These three columns come last in their views.
 
 ### Concurrency
 
@@ -199,14 +199,21 @@ columns. No table, no `.env` change, nothing to backfill (older runs carry no ke
   `vault_schema`. Readers holding the views (Metabase, the API, the MCP) delay it by at most
   `VAULT_DDL_LOCK_TIMEOUT` per attempt, as for any train (see
   [Schema migrations](#schema-migrations)). The next runs skip it.
+
+Everything below needs the new columns, which exist only **once that first ingestion run has
+re-run the train** (the `DDL train running: train changed` line, or `vault_schema.applied_at`
+moved), not as soon as the files are deployed:
+
 - Metabase: Admin → Databases → Sync schema (new view columns), then re-apply the cards
   (`python metabase/apply.py`): new card **Q6 · Bad content per bank** on *Coverage & QC*, and
   R3 gains a `bad_content` column.
 - `vault-query` 0.4.0 (see [Read queries](#read-queries-vault-query)): `runs_status` rows gain
   `bad_content`. `source_health` returns the view as is, so the MCP's `vault_runs_status` shows
-  the two new `source_health` columns as soon as the vault is deployed, before any pin bump;
-  its `source_runs[].bad_content` needs the pin bump, **after** this deploy (0.4.0 selects a
-  column an older vault does not have). `runs[].totals.bad_content` was already visible.
+  the two new `source_health` columns as soon as that run is done, before any pin bump (two
+  more keys per row: a call whose result sat just under the MCP's size cap may now be refused —
+  ask for a smaller `limit`); its `source_runs[].bad_content` needs the pin bump, **after** that
+  run (0.4.0 selects a column an older schema does not have). `runs[].totals.bad_content` was
+  already visible.
 
 ### Migration (2026-11 document_url rename)
 
@@ -377,8 +384,8 @@ takes an open psycopg2 connection that the caller owns (opens, closes, and choos
 
 Changes in 0.4.0 (additive): `RUN_COLUMNS` gains `bad_content`, so every `runs_status` row
 carries it (an integer, NULL when the producer did not report it). Needs a vault deployed with
-the 2026-11 `bad_content` views: against an older vault `runs_status` fails on the missing
-column, so bump a consumer's pin after the vault deploy. Every other function is unchanged.
+the 2026-11 `bad_content` views: against an older schema `runs_status` fails on the missing
+column, so bump a consumer's pin after the first ingestion run that follows the vault deploy. Every other function is unchanged.
 
 Changes in 0.3.0 (breaking — bump the pin together with the vault deploy that renames the
 column): `pdf_url` is now `document_url` everywhere — in `ALL_COLUMNS`, in `SEARCH_COLUMNS`, and

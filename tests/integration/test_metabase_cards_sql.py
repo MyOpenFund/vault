@@ -221,6 +221,44 @@ def test_q6_lists_only_banks_with_bad_content(seeded_db):
     assert _card_dicts(seeded_db, "Q6", fill_optional=True) == []  # bank = 'us'
 
 
+def test_q6_counts_reporting_runs_windows_and_picks_the_newest_bad_run(seeded_db):
+    # Its own corpus (and tool, outcome ok, nothing truncated), so the shared
+    # fixture's other cards are unaffected; removed again in `finally`.
+    now = datetime.now(timezone.utc)
+    runs = [  # (run_id, days ago, sources)
+        ("q6-new", 1, [{"source_code": "fr", "docs_failed": 4, "bad_content": 3},
+                       {"source_code": "it", "docs_failed": 1, "bad_content": 0}]),
+        ("q6-nokey", 2, [{"source_code": "fr", "docs_failed": 9}]),
+        ("q6-mid", 5, [{"source_code": "fr", "docs_failed": 2, "bad_content": 2}]),
+        ("q6-old", 120, [{"source_code": "fr", "docs_failed": 50, "bad_content": 50}]),
+    ]
+    for run_id, days, sources in runs:
+        finished = now - timedelta(days=days)
+        _exec(seeded_db, "INSERT INTO runs (run_id, tool, command, corpus, started_at, finished_at, "
+                         "outcome, exit_code, sources) VALUES (%s, 'q6-probe', 'x', 'q6-probe', %s, %s, "
+                         "'ok', 0, %s)", (run_id, finished, finished, json.dumps(sources)))
+    try:
+        card = next(c for c in CARDS if c["code"] == "Q6")
+        tags = json.loads(json.dumps(card["tags"]))
+        tags["corpus"]["default"] = "q6-probe"
+        sql = _render_for_test(card["sql"], tags)
+        conn = psycopg2.connect(seeded_db)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                names = [d[0] for d in cur.description]
+                rows = [dict(zip(names, r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
+        # it reported 0 only: not listed. fr: 3 in-window runs, 2 reporting; the
+        # 120-day-old run is outside the 90-day default; docs_failed over reporting runs.
+        assert [(r["bank"], r["runs"], r["runs_reporting"], r["docs_failed"], r["bad_content"])
+                for r in rows] == [("fr", 3, 2, 6, 5)]
+        assert rows[0]["last_bad_content_run_id"] == "q6-new"
+    finally:
+        _exec(seeded_db, "DELETE FROM runs WHERE corpus = 'q6-probe'", None)
+
+
 def test_r3_shows_the_run_bad_content_total(seeded_db):
     (row,) = [r for r in _card_dicts(seeded_db, "R3") if r["tool"] == "central-bank-corpus"]
     assert row["bad_content"] == 1

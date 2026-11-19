@@ -42,8 +42,8 @@ card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
   `coalesce(NULL::date [[, {{ref_date}}]], current_date)`: the optional block
   disappears when the widget is empty, so the card falls back to *today* instead
   of to a frozen literal. `{{ref_date}}` (Q1, Q3) uses it.
-- Cards **read only**: no card creates or alters a schema object. The only view
-  they use (`rag_backlog`, read by Q4, and `runs_sources`, read by Q6) belong to
+- Cards **read only**: no card creates or alters a schema object. The views they
+  use (`rag_backlog`, read by Q4, and `runs_sources`, read by Q6) belong to
   `ingestion/ingest.py`'s DDL train.
 - Dashboards are a 24-column grid; dashcards must not overlap.
 - **No `?` anywhere in a card's SQL.** Metabase reaches Postgres through pgjdbc,

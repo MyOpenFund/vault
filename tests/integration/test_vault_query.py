@@ -278,10 +278,15 @@ def test_runs_status_carries_bad_content(conn):
 def test_source_health_carries_the_bad_content_columns(conn):
     """`source_health` is the view as is: the two bad_content columns reach readers unchanged."""
     with conn.cursor() as cur:
-        cur.execute("SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'source_health'")
-        cols = {r[0] for r in cur.fetchall()}
-    assert {"source_bad_content_7d", "last_run_bad_content"} <= cols
+        cur.execute(
+            "INSERT INTO cadence (corpus, source_code, doc_type, interval_days, days_until, status, "
+            "updated_at) VALUES ('central-bank', 'us', 'C1', 30, 5, 'ok', now())"
+        )
+        cur.execute("SELECT now()")
+        now = cur.fetchone()[0]
+    _insert_run(conn, "b1", now, [{"source_code": "us", "docs_failed": 4, "bad_content": 3}])
+    (row,) = vq.source_health(conn, source_code="us")
+    assert row["source_bad_content_7d"] == 3 and row["last_run_bad_content"] == 3
 
 
 def test_recent_runs_lists_runs_with_no_sources(conn):

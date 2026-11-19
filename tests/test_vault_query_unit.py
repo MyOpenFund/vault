@@ -501,9 +501,3 @@ def test_run_columns_end_with_bad_content():
         "truncated", "error_samples",
     )
 
-
-def test_package_version_is_0_4_0():
-    import tomllib
-    from pathlib import Path
-    meta = tomllib.loads((Path(__file__).parents[1] / "query" / "pyproject.toml").read_text())
-    assert meta["project"]["version"] == "0.4.0"

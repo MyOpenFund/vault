@@ -412,6 +412,8 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
 -- bad_content (central-bank-corpus, 2026-11-19) is a sub-count of docs_failed:
 -- documents whose every URL served the wrong bytes (an HTML page for a PDF, a
 -- stub, a truncated PDF). NULL when the producer did not report it, never 0.
+-- At most 9 digits, so a value past the int range is NULL rather than an
+-- "integer out of range" that would make every reader of the view raise.
 -- Appended last so positional readers of the earlier columns are unaffected.
 CREATE VIEW runs_sources AS
 SELECT r.run_id, r.tool, r.command, r.corpus,
@@ -425,7 +427,7 @@ SELECT r.run_id, r.tool, r.command, r.corpus,
             THEN (s ->> 'truncated')::boolean ELSE FALSE END AS truncated,
        CASE WHEN jsonb_typeof(s -> 'error_samples') = 'array'
             THEN s -> 'error_samples' ELSE '[]'::jsonb END AS error_samples,
-       CASE WHEN s ->> 'bad_content'  ~ '^-?[0-9]+$' THEN (s ->> 'bad_content')::int  END AS bad_content
+       CASE WHEN s ->> 'bad_content'  ~ '^-?[0-9]{1,9}$' THEN (s ->> 'bad_content')::int  END AS bad_content
 FROM runs r
 CROSS JOIN LATERAL jsonb_array_elements(
     CASE WHEN jsonb_typeof(r.sources) = 'array' THEN r.sources ELSE '[]'::jsonb END
