@@ -41,7 +41,9 @@ checked.accepted    # not checked.refusals
 ```
 
 `check_row(row, vocabulary, *, expected_corpus, transition=True) -> CheckedRow` runs the
-three lower-level functions, which stay public for callers that need one step only:
+three lower-level functions, which stay public for callers that need one step only. Every
+`transition` argument defaults to `True` (see [The `transition` parameter](#the-transition-parameter));
+the vault ingests with `transition=False`.
 
 - `split_row(row, *, transition=True) -> (columns, extra)`: never refuses, never mutates
   `row` (data-orchestrator builds the RAG payload from it).
@@ -82,7 +84,7 @@ says what happens to a row without the field (absent, `null`, or `""`): **refuse
 | Field | Type | When absent | Rule | central-bank example | company example |
 |---|---|---|---|---|---|
 | `doc_id` | text | refused | Stable, **unique within its corpus**; the producer chooses its formula | `ceb04c0aa89ed888` (hash of bank, type, URL) | `cf0e49e6e176a851` (hash of CIK, form, accession) |
-| `corpus` | text | refused (notice `corpus_missing` during the transition) | Must equal the ingesting service's `CORPUS` | `central-bank` | `company` |
+| `corpus` | text | refused (with `transition=True` only a notice, `corpus_missing`) | Must equal the ingesting service's `CORPUS` | `central-bank` | `company` |
 | `source_code` | text | refused | The authority that publishes; declared in the corpus vocabulary | `ecb` | `sec` |
 | `doc_type` | text | refused | Declared in the corpus vocabulary; meaningful only with `corpus` | `A1` (rate decision) | `A1` (10-K) |
 | `title` | text | notice `empty_title` | Expected non-empty | `Monetary policy decisions` | `Apple Inc. 10-K (2024)` |
@@ -124,23 +126,28 @@ Rules around the table:
 - **`doc_type` belongs to its corpus.** central-bank `A1` (rate-decision press release) and
   company `A1` (10-K) share a code, not a meaning; a `doc_type` is always read with `corpus`.
 
-### Transition (`transition=True`, the switch the cleanup release flips)
+### The `transition` parameter
 
-Until every manifest is migrated, `transition=True` (the default everywhere) also reads, and
-notices each time:
+`check_row`, `split_row`, `validate_row`, `quality_notices` and `is_bad_local_path` take a
+keyword `transition`, **default `True`**; the checker runs with it unless given
+`--no-transition`. The default stays `True` for the whole 1.x line: flipping it would change
+which rows an existing caller accepts.
 
-- `bank_code` as `source_code` and `pdf_url` as `document_url`, when the contract key is
-  absent or blank; the old key never lands in `extra` (notice `legacy_alias`, `field` = the
-  old key);
-- a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`; a
-  bare `data/` is refused, not emptied);
-- a row without `corpus`: the ingesting service's `CORPUS` applies (`corpus_missing`).
+- `transition=True` also reads the pre-contract central-bank forms, and notices each time:
+  - `bank_code` as `source_code` and `pdf_url` as `document_url`, when the contract key is
+    absent or blank; the old key never lands in `extra` (notice `legacy_alias`, `field` = the
+    old key);
+  - a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`; a
+    bare `data/` is refused, not emptied);
+  - a row without `corpus`: the caller's expected corpus applies (`corpus_missing`).
+- `transition=False` is the contract proper: the old keys are ordinary extras (so a row with
+  `bank_code` only is `missing_source_code`), a `data/` path is refused (`bad_local_path`,
+  still noticed), and a row without `corpus` is `missing_corpus`.
 
-The cleanup release passes `transition=False`: the old keys are then ordinary extras (so a
-row with `bank_code` only is `missing_source_code`), a `data/` path is refused
-(`bad_local_path`, still noticed), and a row without `corpus` is `missing_corpus`. Run the checker with `--no-transition` to see that future on
-today's manifests. Independently, a corpus without a vocabulary file is checked without
-membership (`vocabulary=None`).
+**The vault ingests with `transition=False`** since its transition cleanup (2026-11-20, after
+both corpora were migrated): a producer should check its manifests with `--no-transition`.
+`transition=True` stays for a third party still migrating its own manifests. Independently, a
+corpus without a vocabulary file is checked without membership (`vocabulary=None`).
 
 ## Two levels: refusals and notices
 
@@ -162,7 +169,7 @@ columns' first.
 | Reason | When |
 |---|---|
 | `missing_doc_id` | `doc_id` absent or `""` |
-| `missing_corpus` | `corpus` absent or `""`, once the transition is over (`transition=False`) |
+| `missing_corpus` | `corpus` absent or `""`, with `transition=False` (how the vault ingests) |
 | `missing_source_code` | `source_code` absent or `""` (checked with or without a vocabulary) |
 | `missing_doc_type` | `doc_type` absent or `""` |
 | `missing_language` | `language` absent or `""` |
@@ -199,9 +206,9 @@ value as the producer wrote it.
 
 | Reason | When |
 |---|---|
-| `corpus_missing` | transition: no `corpus`; the ingesting service's `CORPUS` applies |
-| `legacy_alias` | transition: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
-| `legacy_data_prefix` | `local_path` starts with `data/`: stripped during the transition, refused (`bad_local_path`) after it; noticed in both modes |
+| `corpus_missing` | `transition=True` only: no `corpus`; the caller's expected corpus applies |
+| `legacy_alias` | `transition=True` only: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
+| `legacy_data_prefix` | `local_path` starts with `data/`: stripped with `transition=True`, refused (`bad_local_path`) with `transition=False`; noticed in both modes |
 | `empty_title` | `title` absent, null or blank |
 | `precision_not_stated` | `date` set, `date_precision` absent or null |
 | `date_not_period_start` | `date_precision` `month` and the day is not 1, or `year` and the date is not 1 January |
@@ -242,8 +249,8 @@ closed value sets and **both reason lists are part of the contract**:
 
 - **MAJOR**: a renamed or removed field, a new mandatory field, a changed meaning, and **a
   new refusal reason** or a stricter refusal (rows accepted yesterday would be refused),
-  unless the release announces it as the end of a transition (the cleanup release flipping
-  `transition`);
+  unless the release announces it as the end of a transition (a consumer passing
+  `transition=False`, as the vault does since 2026-11-20, changes no contract version);
 - **MINOR**: a new optional field, a new allowed value, **a new notice reason** (rows are
   still written);
 - **PATCH**: documentation and fixes that change no accepted or refused row and no notice.
@@ -288,11 +295,13 @@ JSON Lines files (one case per line, `case` naming it):
   meeting`) without notice; `sec_form4` (a Form 4 about Apple, insider as `filer_*` extras,
   text artefact without mime_type nor precision); `cb_legacy_form` (the pre-contract
   central-bank form: `bank_code`, `pdf_url`, no `corpus`, `data/raw/...`, a RePEc month date
-  on the 12th, an empty title); `cb_undated` (no date, a leftover precision and kind);
+  on the 12th, an empty title; accepted with `transition=True` only: the vault, ingesting with
+  `transition=False`, refuses it `missing_corpus`, `missing_source_code`, `bad_local_path`);
+  `cb_undated` (no date, a leftover precision and kind);
   `cb_rendered_html` (ECB speech rendered from HTML: `application/pdf`, `html_path` extra,
   `sha256` of the HTML);
 - `refused()` (`refused.jsonl`): exactly one case per refusal reason, with its
-  `expected_corpus`, `expected_reasons` and, for a case judged as after the cleanup,
+  `expected_corpus`, `expected_reasons` and, for a case judged with `transition=False`,
   `"transition": false`;
 - `vocabulary("company")`, `vocabulary("central-bank")`: the vocabulary excerpts they are
   checked against.

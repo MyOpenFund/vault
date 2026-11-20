@@ -218,6 +218,41 @@ updated (deploy of 2026-11-20), so the transition code goes. One DDL train re-ru
   `(corpus, doc_id, collection)` serves an upsert now. No value is touched, no view changes
   (the train recreates them as on every train run), and a fresh database never gets the index.
 
+The ingestion checks rows with `check_row(..., transition=False)`: the three pre-contract
+forms read during the transition are now refused instead of tolerated with a notice
+(`corpus_missing`, `legacy_alias`, `legacy_data_prefix` are no longer logged by the vault):
+
+| Manifest row | Until this release | Now |
+|---|---|---|
+| no `corpus`, or `""` | the service's `CORPUS` applies, notice `corpus_missing` | refused, `missing_corpus` |
+| `bank_code` (no `source_code`) | read as `source_code`, notice `legacy_alias` | an ordinary `extra` key; the row is refused `missing_source_code` |
+| `pdf_url` (no `document_url`) | read as `document_url`, notice `legacy_alias` | an ordinary `extra` key; `document_url` stays NULL |
+| `local_path` starting with `data/` | prefix stripped, notice `legacy_data_prefix` | refused, `bad_local_path` |
+
+#### Breaking changes (2026-11 transition cleanup)
+
+- **Legacy manifest forms are refused.** A producer still writing `bank_code` instead of
+  `source_code`, `data/` paths, or no `corpus` gets those rows refused (not written, stored in
+  `ingestion_refusals`), and since any refused row skips the soft-delete sweep and makes the
+  run exit 1, its corpus is no longer swept until it writes the contract form. Both producers
+  write it since the 2026-11-20 migration (`migrate-contract` in each producer repo).
+- `pdf_url` is no longer mapped: a row carrying it alone keeps `document_url` NULL and gets the
+  key in `extra`.
+- The pre-contract data-orchestrator (before `2695b26`) fails on `rag_ingestions`
+  (`ON CONFLICT (doc_id, collection)`: no matching constraint).
+- Producers checking their manifests with `python -m vault_contract.check` should pass
+  `--no-transition`: that is how the vault ingests (the checker's default stays
+  `transition=True`, see the [contract README](contract/README.md#the-transition-parameter)).
+
+#### Deploy notes (2026-11 transition cleanup)
+
+- **One DDL train re-run**, nothing else: deploy the tree and run each ingestion once as usual;
+  the first run logs `DDL train running: train changed (recorded d96f2c37d33a, code …)` and drops
+  the index. No `.env`, compose, API, MCP or Metabase change.
+- Gates (all met 2026-11-20): the last central-bank and company ingestions logged no
+  `corpus_missing`, `legacy_alias` or `legacy_data_prefix` notice, and no orchestrator older
+  than `2695b26` writes to `rag_ingestions`.
+
 **Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
 ingestion once; its train text differs, so it re-runs and recreates the index. Nothing else
 to undo.
@@ -231,11 +266,10 @@ The ingestion checks every manifest row against the [documents contract](contrac
   `UNIQUE (doc_id)` → `UNIQUE (corpus, doc_id)`; a plain index on `doc_id` for lookups by
   `doc_id` alone; an index on `(entity_scheme, entity_value)`.
 - `rag_ingestions`: primary key `(corpus, doc_id, collection)`, foreign key `(corpus, doc_id)`;
-  the backlog views join on both. **Transition:** a unique index
-  `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps the deployed
-  data-orchestrator's `ON CONFLICT (doc_id, collection)` working until its update (valid while
-  collections are per corpus; removed in code by the cleanup PR's train, never by hand — see
-  [Table `rag_ingestions`](#table-rag_ingestions)).
+  the backlog views join on both. Until the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a unique index
+  `rag_ingestions_doc_collection_transition (doc_id, collection)` kept the pre-contract
+  data-orchestrator's `ON CONFLICT (doc_id, collection)` working; the cleanup's train dropped it.
 - New tables `vocabulary` (the corpus vocabulary, full replace per corpus) and
   `ingestion_refusals` (the refused rows of each corpus's last run, replaced every run;
   `value` is the repr of the refused value cut at 200 characters).
@@ -245,21 +279,23 @@ Before deploying, check that no `rag_ingestions` row has another corpus than its
 must be 0. Otherwise the train stops with that count (one transaction: nothing changes) and the
 run fails. Measured: the train takes well under a second on 40k documents.
 
-**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` of another
-corpus, a line that is not a JSON object such as a torn write or a UTF-8 BOM on line 1, an
-`extra` value JSONB cannot hold) is not written, is logged as `file:line reason field=value`
+**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` absent or of
+another corpus, a pre-contract key or `data/` path since the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a line that is
+not a JSON object such as a torn write or a UTF-8 BOM on line 1, an `extra` value JSONB cannot
+hold) is not written, is logged as `file:line reason field=value`
 (the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
 soft-delete sweep and makes the run exit 1** after the cadence, runs and discovery-error passes:
 a refused row is a document "not seen", and a vocabulary mistake on a whole source must not
-soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, transition forms, …) are
-counted in the run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
+soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, …) are counted in the
+run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
 in `extra` until now, move to their columns on the first run.
 
 **Vocabulary file.** The run reads `vocabulary.json` at `DATA_DIR`, or at `VOCABULARY_PATH`
 when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest directory, e.g.
 `/cbdata/manifest`) the file sits one level up, at the data root: set
 `VOCABULARY_PATH=/cbdata/vocabulary.json`, as `CADENCE_PATH` points one level up too.
-- Absent: code membership is not checked (transition); the run logs
+- Absent (a corpus that ships no vocabulary yet): code membership is not checked; the run logs
   `vocabulary: missing (membership not checked)`.
 - Present and valid: it replaces this corpus's `vocabulary` rows (its own transaction, before
   the documents pass) and every row's `source_code`, `doc_type`, `provenance` and
@@ -307,8 +343,9 @@ For every consumer of the API, `vaultctl` and `vault-query`, in one place:
 - **MCP server**: vault-query 0.4.0, its current pin, keeps working on the new schema (it reads
   no new table or column), so its bump to 0.5.0 is not urgent; do it after the ingestion has
   run, never before.
-- **data-orchestrator**: its writes keep working (the transitional index serves its
-  `ON CONFLICT (doc_id, collection)`, see [Table `rag_ingestions`](#table-rag_ingestions)).
+- **data-orchestrator**: its writes kept working during the deploy (a transitional index
+  served its `ON CONFLICT (doc_id, collection)`; dropped since by the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup)).
   The real constraint is its reads: after the first new ingestion, `date_precision` and
   `date_kind` leave `extra` for their columns and `local_path` loses its `data/` prefix, both of
   which the old orchestrator relies on. So **no old-orchestrator ingestion and no
@@ -407,11 +444,10 @@ applies it:
   Readers holding the tables (Metabase, the API, the MCP) delay it by at most
   `VAULT_DDL_LOCK_TIMEOUT` per attempt; if they never let go, the run fails and ingests nothing
   (see [Schema migrations](#schema-migrations)). Later runs skip the train.
-- Manifests: a line carrying `document_url` fills the column; a line still carrying the legacy
-  `pdf_url` (a manifest not migrated yet) fills it too, `document_url` winning when both are
-  present. `pdf_url` never lands in `extra`. Transition only: the `pdf_url` fallback in
-  `ingestion/ingest.py` (`KNOWN_FIELDS`, `parse_line`) is removed once every producer writes
-  `document_url`.
+- Manifests: a line carrying `document_url` fills the column. At this release a line still
+  carrying the legacy `pdf_url` filled it too; since the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) `pdf_url` is
+  an ordinary key that lands in `extra` and never fills `document_url`.
 - Readers that name the column must move with it: the API's `Document` model and `vault-query`
   0.3.0 (this release) return `document_url`; a consumer pinned to an older `vault-query` (the
   MCP) selects a column that no longer exists and fails until its pin is bumped. Re-apply the
@@ -419,8 +455,8 @@ applies it:
   built by hand in the Metabase UI are not in `cards.json`: fix any that name `pdf_url` there.
 - **Deploy this before the producers migrate their manifests.** The previous ingestion code does
   not know `document_url`: run on a migrated manifest, it would put the URL in `extra` and set
-  the column to NULL on every row until the new code runs. This version accepts both keys, so
-  the order is: vault, then the MCP pin bump, then the producers' manifest migration.
+  the column to NULL on every row until the new code runs. This version accepted both keys, so
+  the order was: vault, then the MCP pin bump, then the producers' manifest migration.
 
 ### Migration (2026-09 substrate)
 
@@ -552,10 +588,10 @@ Identity is `(corpus, doc_id)` (documents contract): a `doc_id` is unique within
   255 bytes, the whole past 4096); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
   `corpus` is required (400) when the `doc_id` exists in several corpora. `RAW_DATA_DIR` and
   the split on the `raw` path component are gone.
-- **Transition note.** The ingestion now stores `local_path` without the old `data/` prefix
-  (`raw/...`). Rows ingested before the deploy still hold `data/raw/...` and are a 404 (`File
-  not found on disk`) until the first post-deploy ingestion of their corpus rewrites every live
-  row; no compatibility code exists for them, so run the ingestion right after deploying.
+- **`data/` paths.** `local_path` is relative to the corpus data root (`raw/...`); the
+  ingestion refuses a manifest's old `data/raw/...` form (`bad_local_path`). A row still
+  holding `data/...` (written before the documents contract, or by hand) is looked up as stored,
+  with no compatibility code, and is a 404 (`File not found on disk`).
 
 The document and stats routes read through `vault-query` (below); the image installs it from
 the same checkout, which is why `api`'s build context is the repo root (`api/Dockerfile`).

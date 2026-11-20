@@ -88,6 +88,8 @@ services:
       MANIFEST_GLOBS: ${MANIFEST_GLOBS:-}
       DISCOVERY_ERROR_MAX_CHARS: ${DISCOVERY_ERROR_MAX_CHARS:-2000}
       DISCOVERY_ERRORS_MIN_RETAIN_FRACTION: ${DISCOVERY_ERRORS_MIN_RETAIN_FRACTION:-0.5}
+      # Every manifest row must carry this same `corpus`: absent or another one
+      # is a refusal (documents contract, README "Refused rows").
       CORPUS: ${CORPUS:-central-bank}
       # Least-privilege roles (#5). Set → the DDL train creates/refreshes that
       # role and re-issues its grants on every run; unset → it is skipped with

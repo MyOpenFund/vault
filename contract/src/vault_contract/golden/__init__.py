@@ -10,7 +10,8 @@ two JSON Lines files in this directory, one case per line, `case` naming it:
   per notice, [] for a clean row); together they trigger every notice;
 - refused.jsonl, refused(): exactly one row per refusal reason, `{"case",
   "description", "expected_corpus", "row", "expected_reasons"}`, plus
-  `"transition": false` for a case judged as after the cleanup;
+  `"transition": false` for a case judged with transition=False (how the
+  vault ingests);
 - vocabulary(corpus): the vocabulary excerpt the cases are checked against,
   `vocabulary_<corpus with - as _>.json`.
 

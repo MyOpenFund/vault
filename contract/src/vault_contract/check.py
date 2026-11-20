@@ -7,10 +7,13 @@ Files are read as the vault ingestion reads them: UTF-8, lines ended by \n,
 \r\n or \r only, each line stripped, blank lines skipped. A line that is not a
 JSON object (unparsable, deep nesting and oversized integers included, or
 valid JSON of another type) is refused as not_json, as the ingestion refuses
-it; every other line goes through check_row exactly as the ingestion will. doc_ids are then resolved as the vault resolves
-them: the last valid line of a doc_id wins (dedupe_rows within a file, upserts
-in file order across files), so every earlier valid occurrence is refused as
-duplicate_doc_id, pointing at the kept one. Prints the counts of refusals and
+it; every other line goes through check_row as the ingestion will (the vault
+ingests with transition=False: pass --no-transition to judge exactly as it
+does; the default, transition=True, also reads the pre-contract forms).
+doc_ids are then resolved as the vault resolves them: the last valid line of a
+doc_id wins (dedupe_rows within a file, upserts in file order across files),
+so every earlier valid occurrence is refused as duplicate_doc_id, pointing at
+the kept one. Prints the counts of refusals and
 notices per reason with up to 3 examples each.
 
 Exit 0: no row refused. 1: at least one row refused (not_json included), or
@@ -90,7 +93,8 @@ def main(argv=None):
                         help="vocabulary.json; without it code membership is not checked")
     parser.add_argument("--glob", default="*.jsonl", help="manifest files under manifest_dir")
     parser.add_argument("--no-transition", dest="transition", action="store_false",
-                        help="judge as after the cleanup: no old key mapped, no corpus implied")
+                        help="judge as the vault ingests (transition=False): no old key "
+                             "mapped, no corpus implied; default: transition=True")
     parser.add_argument("--strict", action="store_true",
                         help="exit 1 on any notice too")
     args = parser.parse_args(argv)

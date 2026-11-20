@@ -4,7 +4,8 @@
   structure, identity, and what a database cannot store. A refused row is not
   written, and the vault skips its soft-delete sweep for that run.
 - Notices (quality_notices): the row is written, the notice is counted (an
-  empty title, a date whose precision is not stated, a transition key read).
+  empty title, a date whose precision is not stated, an old key read with
+  transition=True).
 
 check_row runs split_row and both levels on one row: the entry point for a
 consumer. The lower-level functions stay public for callers that need one
@@ -155,11 +156,13 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
                  expected_corpus: str, transition: bool = True) -> list[Refusal]:
     """Every refusal of one split row ([] = accepted).
 
-    `vocabulary` None (the corpus has no vocabulary file yet, transition)
-    skips the membership checks (source_code, doc_type, provenance,
-    entity_scheme); every presence and shape check is kept. A vocabulary of
-    another corpus is a caller error: ValueError. With `transition`, a row
-    without `corpus` is accepted (quality_notices says corpus_missing).
+    `vocabulary` None (the corpus has no vocabulary file yet) skips the
+    membership checks (source_code, doc_type, provenance, entity_scheme);
+    every presence and shape check is kept. A vocabulary of another corpus is
+    a caller error: ValueError. With `transition` (default True; the vault
+    passes False), a row without `corpus` is accepted (quality_notices says
+    corpus_missing) and a `data/` local_path is not refused (split_row
+    stripped it).
     A field refused for presence or type is not judged further.
     `expected_corpus` must be a code (CODE_PATTERN): ValueError otherwise, so
     a row `corpus` that is not a code is always corpus_conflict (or bad_text).
