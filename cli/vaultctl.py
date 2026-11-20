@@ -8,8 +8,8 @@ Configuration: VAULT_API_URL environment variable
 Examples:
     vaultctl list --corpus central-bank --source-code us --year 2010
     vaultctl list --q "housing bubble" --limit 10
-    vaultctl get c184d44f298ff622
-    vaultctl download c184d44f298ff622 -o ./downloads/
+    vaultctl get c184d44f298ff622 [--corpus central-bank]
+    vaultctl download c184d44f298ff622 --corpus central-bank -o ./downloads/
     vaultctl stats
 """
 
@@ -44,11 +44,24 @@ def _die(message: str):
     raise typer.Exit(code=1)
 
 
+def _status_error(e: httpx.HTTPStatusError) -> str:
+    """The status line plus the API's `detail` when it sends one (a 400's
+    reason: `doc_type needs corpus: ...`, a doc_id in several corpora)."""
+    detail = _error_detail(e.response)
+    return f"{e}: {detail}" if detail else str(e)
+
+
+# A doc_id is unique within its corpus only (documents contract).
+CORPUS_OPTION = typer.Option(
+    None, help="The document's corpus (needed when the doc_id exists in several corpora)")
+
+
 @app.command("list")
 def list_documents(
     corpus: Optional[str] = typer.Option(None, help="Filter by corpus (e.g. central-bank)"),
     source_code: Optional[str] = typer.Option(None, help="Filter by source code (e.g. us)"),
-    doc_type: Optional[str] = typer.Option(None, help="Filter by document type (e.g. C1)"),
+    doc_type: Optional[str] = typer.Option(
+        None, help="Filter by document type (e.g. C1); needs --corpus"),
     language: Optional[str] = typer.Option(None, help="Filter by language (e.g. en)"),
     provenance: Optional[str] = typer.Option(None, help="Filter by provenance"),
     year: Optional[int] = typer.Option(None, help="Filter by year"),
@@ -82,6 +95,8 @@ def list_documents(
         try:
             resp = client.get("/documents", params=params)
             resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            _die(_status_error(e))
         except httpx.HTTPError as e:
             _die(str(e))
 
@@ -108,11 +123,12 @@ def list_documents(
 
 
 @app.command("get")
-def get_document(doc_id: str):
-    """Show the full detail of a document."""
+def get_document(doc_id: str, corpus: Optional[str] = CORPUS_OPTION):
+    """Show the full detail of a document (of every corpus holding the doc_id without --corpus)."""
+    params = {"corpus": corpus} if corpus is not None else {}
     with _client() as client:
         try:
-            resp = client.get(f"/documents/{doc_id}")
+            resp = client.get(f"/documents/{doc_id}", params=params)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -121,9 +137,16 @@ def get_document(doc_id: str):
         except httpx.HTTPError as e:
             _die(str(e))
 
-    doc = resp.json()
-    for key, value in doc.items():
-        console.print(f"[cyan]{escape(str(key))}[/cyan]: {escape(str(value))}")
+    body = resp.json()
+    docs = body if isinstance(body, list) else [body]
+    if len(docs) > 1:
+        console.print(f"{len(docs)} documents with doc_id {escape(repr(doc_id))} "
+                      f"(one per corpus; --corpus picks one)")
+    for i, doc in enumerate(docs):
+        if i:
+            console.print()
+        for key, value in doc.items():
+            console.print(f"[cyan]{escape(str(key))}[/cyan]: {escape(str(value))}")
 
 
 def safe_filename(content_disposition, fallback):
@@ -173,18 +196,20 @@ def _error_detail(response: httpx.Response) -> str:
 def download_document(
     doc_id: str,
     output_dir: Path = typer.Option(Path("."), "--output", "-o", help="Destination directory"),
+    corpus: Optional[str] = CORPUS_OPTION,
 ):
     """Download the actual file associated with a document."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    params = {"corpus": corpus} if corpus is not None else {}
 
     with _client() as client:
         try:
-            resp = client.get(f"/documents/{doc_id}/file")
+            resp = client.get(f"/documents/{doc_id}/file", params=params)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 _die(f"File not found for '{doc_id}' ({_error_detail(e.response)})")
-            _die(str(e))
+            _die(_status_error(e))
         except httpx.HTTPError as e:
             _die(str(e))
 
@@ -220,7 +245,9 @@ def stats():
         table.add_column("Value")
         table.add_column("Count", justify="right")
         for row in data[section]:
-            table.add_row(escape(str(row["key"])), str(row["count"]))
+            # by_doc_type is per corpus: a code means something only within it.
+            key = f"{row['corpus']}: {row['key']}" if "corpus" in row else str(row["key"])
+            table.add_row(escape(key), str(row["count"]))
         console.print(table)
 
 

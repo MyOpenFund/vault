@@ -527,9 +527,10 @@ from cron.
 ```bash
 pip install -e cli/
 vaultctl stats                                # corpus totals from the API
-vaultctl list --source-code ecb --doc-type D1 # query documents
-vaultctl get <doc_id>                         # one document's metadata
-vaultctl download <doc_id>                    # fetch the raw file via the API
+vaultctl list --corpus central-bank --source-code ecb --doc-type D1  # doc_type needs corpus
+vaultctl get <doc_id>                         # metadata, one per corpus holding the doc_id
+vaultctl get <doc_id> --corpus company        # one document
+vaultctl download <doc_id> --corpus central-bank  # the file (corpus needed if the id is in several)
 ```
 
 ## Tests
