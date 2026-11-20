@@ -682,3 +682,12 @@ def test_a_service_corpus_that_is_not_a_code_stops_the_run_before_connecting(
         ingest.main(data_dir=str(tmp_path))
     assert exc.value.code == 1
     assert "CORPUS" in caplog.text
+
+
+def test_a_too_long_doc_id_is_stored_cut_in_the_refusal_row():
+    long_id = "d" * 9000
+    report = RunReport(CB, RUN_TS)
+    parse(json.dumps(cb_row(doc_id=long_id)), report=report)
+    stored = report.records[0][4]
+    assert report.records[0][5] == "too_long"
+    assert stored == long_id[:REFUSAL_VALUE_CHARS] + "…"

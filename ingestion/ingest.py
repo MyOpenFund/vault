@@ -1204,7 +1204,10 @@ class RunReport:
 
     def refuse(self, source_file, line_num, doc_id, refusals):
         self.refused_rows += 1
-        stored_id = doc_id if isinstance(doc_id, str) and _storable_text(doc_id) else None
+        # A storable doc_id is kept for the row, cut like a value: a too_long
+        # id would otherwise land whole in the table and the Metabase card.
+        stored_id = (stored_text(doc_id)
+                     if isinstance(doc_id, str) and _storable_text(doc_id) else None)
         name = self.source_name(source_file)
         for r in refusals:
             self.refusals[r.reason] += 1
