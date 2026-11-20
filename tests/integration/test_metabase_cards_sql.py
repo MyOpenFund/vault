@@ -194,7 +194,36 @@ def seeded_db(pg_url, tmp_path_factory):
            "intfloat/multilingual-e5-base", "v1", 42))
     _exec(pg_url, PROBE_DOC_SQL, (True, 17, "us-a1-2019"))
     _exec(pg_url, PROBE_DOC_SQL, (False, 3, "us-a1-2020"))
+
+    # Malformed run reports, older than the good one so neither is the latest of
+    # its tool, inside the R5/R6 lookback. The ingester checks only container
+    # types and the orchestrator role can INSERT into runs directly, so such
+    # rows can exist; one of them must not make R3, R5 or R6 raise.
+    for run_id, days, totals, sources in MALFORMED_RUNS:
+        when = datetime.now(timezone.utc) - timedelta(days=days)
+        _exec(pg_url, "INSERT INTO runs (run_id, tool, command, corpus, started_at, finished_at, "
+                      "outcome, exit_code, totals, sources) VALUES (%s, 'central-bank-corpus', "
+                      "'discover', 'central-bank', %s, %s, 'ok', 0, %s, %s)",
+              (run_id, when, when, json.dumps(totals), json.dumps(sources)))
     return pg_url
+
+
+HUGE = 10000000000          # past the int range: a bare ::int raises
+MALFORMED_COUNTERS = {"docs_seen": HUGE, "docs_ingested": 1.5, "docs_new": "yes please",
+                      "docs_failed": -5, "docs_path_metadata": HUGE, "bad_content": 1.5}
+MALFORMED_RUNS = [  # (run_id, days ago, totals, sources)
+    # `sources` an object, not an array: jsonb_array_length / _elements raise.
+    ("metabase-card-malformed-object", 10, MALFORMED_COUNTERS,
+     {"source_code": "us", "truncated": "yes please"}),
+    # An array whose entries carry huge, float and string counters and a
+    # string `truncated`; the truncated one has a float counter, so R6 lists it.
+    ("metabase-card-malformed-array", 9, MALFORMED_COUNTERS, [
+        {"source_code": "us", "docs_seen": HUGE, "docs_new": 1.5, "docs_failed": "yes please",
+         "fetch_errors": HUGE, "truncated": "yes please", "error_samples": []},
+        {"source_code": "ecb", "docs_seen": 1.5, "docs_new": HUGE, "docs_failed": "yes please",
+         "fetch_errors": -1, "truncated": True, "error_samples": "not a list"},
+    ]),
+]
 
 
 @pytest.mark.parametrize("fill_optional", [False, True],
@@ -239,9 +268,10 @@ def _card_dicts(seeded_db, code, fill_optional=False, corpus=None):
 
 def test_q6_lists_only_banks_with_bad_content(seeded_db):
     # ecb reported 1 bad-content document; us reported none (no key): only ecb is listed.
+    # The malformed run's ecb entry counts as a run but reports no bad_content.
     rows = _card_dicts(seeded_db, "Q6")
     assert [(r["bank"], r["bad_content"], r["docs_failed"], r["runs"], r["runs_reporting"])
-            for r in rows] == [("ecb", 1, 1, 1, 1)]
+            for r in rows] == [("ecb", 1, 1, 2, 1)]
     assert rows[0]["last_bad_content_run_id"] == "metabase-card-guard-1"
     assert _card_dicts(seeded_db, "Q6", fill_optional=True) == []  # bank = 'us'
 
@@ -321,6 +351,15 @@ def test_q7_counts_refused_rows_by_corpus_and_reason(seeded_db):
 def test_r3_shows_the_run_bad_content_total(seeded_db):
     (row,) = [r for r in _card_dicts(seeded_db, "R3") if r["tool"] == "central-bank-corpus"]
     assert row["bad_content"] == 1
+
+
+def test_r5_reads_malformed_counters_as_null(seeded_db):
+    days = {(datetime.now(timezone.utc) - timedelta(days=d)).date() for _, d, _, _ in MALFORMED_RUNS}
+    rows = [r for r in _card_dicts(seeded_db, "R5") if r["day"] in days]
+    assert len(rows) == len(days)
+    assert {(r["runs"], r["docs_path_metadata"], r["docs_ingested"], r["pct_path_metadata"])
+            for r in rows} == {(1, None, None, None)}
+
 
 
 def test_renderer_drops_blocks_without_values_and_keeps_the_rest():
