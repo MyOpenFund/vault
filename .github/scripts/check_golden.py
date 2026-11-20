@@ -26,7 +26,7 @@ def main():
                 manifest = work / name
                 manifest.mkdir()
                 (manifest / f"{name}.jsonl").write_text(
-                    json.dumps(case["row"], ensure_ascii=False) + "\n", encoding="utf-8")
+                    json.dumps(case["row"]) + "\n", encoding="utf-8")
                 vocabulary = work / f"vocabulary-{name}.json"
                 vocabulary.write_text(json.dumps(golden.vocabulary(corpus)), encoding="utf-8")
                 argv = [sys.executable, "-m", "vault_contract.check", str(manifest),

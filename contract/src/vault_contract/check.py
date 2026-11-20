@@ -43,6 +43,14 @@ def _shown(value):
     return text if len(text) <= VALUE_CHARS else text[:VALUE_CHARS] + "…"
 
 
+def _field(name):
+    """A refusal's field as printed: an extra key (bad_extra) can hold a NUL
+    or a lone surrogate, which cannot be printed: its repr then."""
+    if isinstance(name, str) and is_text(name):
+        return name if len(name) <= VALUE_CHARS else name[:VALUE_CHARS] + "…"
+    return _shown(name)
+
+
 class _Tally:
     def __init__(self):
         self.counts = Counter()
@@ -155,7 +163,7 @@ def main(argv=None):
                 valid.setdefault(checked.columns["doc_id"], []).append(
                     (f"{path.name}:{line_num}", where))
             for r in checked.refusals:
-                refusals.add(r.reason, f"{where} {r.field}={_shown(r.value)}")
+                refusals.add(r.reason, f"{where} {_field(r.field)}={_shown(r.value)}")
             noticed_rows += bool(checked.notices)
             for n in checked.notices:
                 notices.add(n.reason, f"{where} {n.field}={_shown(n.value)}")

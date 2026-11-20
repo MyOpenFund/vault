@@ -264,3 +264,15 @@ def test_an_empty_corpus_is_a_usage_error(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         main([str(tmp_path), "--corpus", ""])
     assert exc.value.code == 2
+
+
+def test_bad_extra_is_reported_and_an_unprintable_key_shown_as_its_repr(tmp_path, capsys):
+    rows = [dict(_row("cb_rendered_html"), doc_id="a", note=float("nan")),
+            dict(_row("cb_rendered_html"), doc_id="b", **{"k\udfff": 1})]
+    (tmp_path / "a.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows),
+                                      encoding="utf-8")
+    code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank")
+    assert code == 1
+    assert "  bad_extra: 2" in out
+    assert "a.jsonl:1 doc_id='a' note=nan" in out
+    assert "a.jsonl:2 doc_id='b' 'k\\udfff'=1" in out

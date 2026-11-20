@@ -17,7 +17,8 @@ import pytest
 from vault_contract import golden
 from vault_contract.fields import split_row
 from vault_contract.validate import (
-    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, quality_notices, validate_row,
+    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, extra_refusals, quality_notices,
+    validate_row,
 )
 from vault_contract.vocabulary import (
     Vocabulary, is_supported_version, load_vocabulary, validate_vocabulary,
@@ -29,9 +30,8 @@ VOCABULARIES = {c: load_vocabulary(golden.vocabulary(c)) for c in ("company", "c
 def _reasons(row, *, expected_corpus, vocabulary="from corpus", transition=True):
     if vocabulary == "from corpus":
         vocabulary = VOCABULARIES[expected_corpus]
-    columns, _ = split_row(row, transition=transition)
-    return sorted(r.reason for r in validate_row(columns, vocabulary, transition=transition,
-                                                 expected_corpus=expected_corpus))
+    checked = check_row(row, vocabulary, expected_corpus=expected_corpus, transition=transition)
+    return sorted(r.reason for r in checked.refusals)
 
 
 def _notices(row, *, transition=True):
@@ -205,7 +205,7 @@ def test_reasons_are_the_decided_list():
         "missing_language", "missing_provenance", "bad_text", "corpus_conflict",
         "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
         "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
-        "bad_sha256", "entity_half", "unknown_entity_scheme",
+        "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
     )
 
 
@@ -603,3 +603,48 @@ def test_entity_half_names_the_missing_field(missing, present):
     columns, _ = split_row(row)
     assert validate_row(columns, VOCABULARIES["company"], expected_corpus="company") == [
         Refusal("entity_half", missing, None)]
+
+
+# --- bad_extra: what a JSON database cannot store in `extra` -------------------------
+
+@pytest.mark.parametrize("extra", [
+    {"note": "a\u0000b"},                       # NUL in a value
+    {"deep": [{"x": ["ok", "nul\u0000"]}]},      # at any depth
+    {"k\u0000": 1},                             # NUL in a key
+    {"outer": {"in\u0000ner": 1}},              # NUL in a nested key
+    {"surrogate": "\ud800"},                    # a lone surrogate
+    {"\udfff": "x"},                            # ... in a key
+    {"n": float("nan")},
+    {"n": [float("inf")]},
+    {"n": {"m": float("-inf")}},
+])
+def test_an_extra_a_database_cannot_hold_is_bad_extra(extra):
+    row = dict(_golden("sec_10k"), **extra)
+    checked = check_row(row, VOCABULARIES["company"], expected_corpus="company")
+    key = next(iter(extra))
+    (refusal,) = checked.refusals
+    assert (refusal.reason, refusal.field) == ("bad_extra", key)
+    assert refusal.value is extra[key]                # NaN != NaN: identity
+
+
+@pytest.mark.parametrize("extra", [
+    {"note": "\\u0000"},           # the six characters \u0000, not a NUL
+    {"n": 1e308, "m": -0.0, "big": 10 ** 30},
+    {"deep": [[[{"a": None, "b": True}]]]},
+    {"emoji": "\U0001F600", "nbsp": "a\u00a0b"},
+])
+def test_storable_extras_are_accepted(extra):
+    row = dict(_golden("sec_10k"), **extra)
+    assert check_row(row, VOCABULARIES["company"], expected_corpus="company").accepted
+
+
+def test_one_refusal_per_bad_top_level_key_in_row_order():
+    assert [r.field for r in extra_refusals({"a": "\u0000", "ok": 1, "b": float("nan")})] == [
+        "a", "b"]
+
+
+def test_extra_refusals_is_iterative_not_recursive():
+    deep = "x\u0000"
+    for _ in range(100_000):
+        deep = [deep]
+    assert [r.reason for r in extra_refusals({"deep": deep})] == ["bad_extra"]

@@ -155,7 +155,9 @@ Both reason lists, in check order, are part of the contract: run reports count r
 
 ### Refusal reasons
 
-`validate_row` returns one `Refusal(reason, field, value)` per defect.
+`validate_row` returns one `Refusal(reason, field, value)` per defect of the columns,
+`extra_refusals` one per unstorable top-level key of `extra`; `check_row` returns both, the
+columns' first.
 
 | Reason | When |
 |---|---|
@@ -179,6 +181,7 @@ Both reason lists, in check order, are part of the contract: run reports count r
 | `bad_sha256` | `sha256` not 64 lowercase hexadecimal characters |
 | `entity_half` | one of `entity_scheme` / `entity_value` without the other; `field` names the missing one |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
+| `bad_extra` | an `extra` key or value a JSON database (Postgres JSONB, UTF-8) cannot store: a NUL character or a lone surrogate in a string or a key, a `NaN` or an infinity (Python's `json` writes them, JSON does not allow them), at any depth; one refusal per top-level key, `field` the key as written (a consumer storing it shows its repr when the key itself is the culprit) |
 
 Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every valid
 occurrence of a `doc_id` before the last one within the corpus (the vault keeps the last).
@@ -243,6 +246,9 @@ closed value sets and **both reason lists are part of the contract**:
 - **MINOR**: a new optional field, a new allowed value, **a new notice reason** (rows are
   still written);
 - **PATCH**: documentation and fixes that change no accepted or refused row and no notice.
+
+`bad_extra` is part of 1.0.0: the extra check moved from the vault ingestion into the
+package before 1.0.0 was deployed anywhere, so no producer saw a release without it.
 
 A reader accepts its own MAJOR and any MINOR at or below its own (`is_supported_version`): a
 vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know what 1.1 added.

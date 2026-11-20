@@ -143,8 +143,10 @@ def test_unknown_doc_type_is_refused_only_with_a_vocabulary():
 
 def test_vault_reasons_are_not_contract_reasons():
     from vault_contract import REASONS
-    assert VAULT_REASONS == ("bad_extra", "not_json")
+    assert VAULT_REASONS == ("not_json",)
     assert not set(VAULT_REASONS) & set(REASONS)
+    assert "bad_extra" in REASONS                 # the contract's own since 1.0.0
+    assert not hasattr(ingest, "jsonb_storable") and not hasattr(ingest, "vault_refusals")
 
 
 @pytest.mark.parametrize("extra", [
@@ -618,3 +620,48 @@ def test_main_counts_the_notices_of_the_kept_duplicate_only(fake_run, caplog):
         fake_run["run"](rows)
     assert len(fake_run["upserted"]) == 2
     assert "notices: 0" in caplog.text
+
+
+# --- parity: the checker reports what the ingestion refuses ---------------------------
+
+PARITY_LINES = [
+    json.dumps(cb_row()),                                           # accepted
+    json.dumps(cb_row(note=float("nan"))),                          # NaN in extra
+    json.dumps(cb_row(n=[float("-inf")])),
+    json.dumps(cb_row(note="a\u0000b")),                            # NUL in a value
+    json.dumps(cb_row(**{"k\u0000": 1})),                           # NUL in a key
+    json.dumps(cb_row(note={"deep": ["\ud800"]})),                  # lone surrogate
+    json.dumps(cb_row(**{"\udfff": "x"})),                          # ... in a key
+    json.dumps(cb_row(title="a\ud800")),                            # in a column
+    json.dumps(cb_row(doc_id=" d1 ")),                              # padded doc_id
+    json.dumps(cb_row(doc_id="d\u0000")),
+    json.dumps(cb_row(corpus="company")),                           # corpus conflict
+    json.dumps(cb_row(language="english", note="\u0000")),          # two reasons
+    "{torn",                                                        # not_json
+    "[1, 2]",
+    "\ufeff" + json.dumps(cb_row()),                                # BOM glued to a line
+    '{"doc_id": ' + "9" * 5000 + "}",                               # int too large
+]
+
+
+@pytest.mark.parametrize("line", PARITY_LINES, ids=range(len(PARITY_LINES)))
+def test_the_checker_refuses_a_line_for_the_reasons_the_ingestion_does(tmp_path, capsys, line):
+    from vault_contract.check import main as check
+
+    report = RunReport(CB, RUN_TS)
+    parse(line, report=report)
+    ingestion = sorted(report.refusals.elements())
+
+    # An accepted row first: a file with no JSON object at all, or with a BOM
+    # at its very start, is the checker's usage error (exit 2), not a row's.
+    (tmp_path / "m.jsonl").write_text(json.dumps(cb_row(doc_id="d0")) + "\n" + line + "\n",
+                                      encoding="utf-8")
+    code = check([str(tmp_path), "--corpus", CB])
+    out = capsys.readouterr().out
+    section = out.split("refusals:", 1)[1].split("notices:", 1)[0]
+    checker = sorted(reason for reason, n in
+                     (l.strip().split(": ") for l in section.splitlines()[1:]
+                      if l.startswith("  ") and not l.startswith("    "))
+                     for _ in range(int(n)))
+    assert checker == ingestion
+    assert code == (1 if ingestion else 0)

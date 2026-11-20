@@ -96,8 +96,9 @@ log = logging.getLogger("ingest")
 
 # The documents contract (vault_contract, contract/README.md) decides what a
 # manifest row is: its 18 common fields become columns, everything else goes
-# to `extra` (JSONB), and check_row refuses or notes each row. The ingestion
-# adds the refusals of its own below (VAULT_REASONS) and nothing else.
+# to `extra` (JSONB), and check_row refuses or notes each row (bad_extra, an
+# extra JSONB cannot hold, included). The ingestion adds the refusal of its
+# own below (VAULT_REASONS) and nothing else.
 
 CREATE_TABLE_SQL = """
 -- Gated: this whole text only runs when its sha256 differs from the one
@@ -1120,22 +1121,17 @@ def find_manifest_files(data_dir, env):
 
 
 # Refusals the vault adds to the contract's (vault_contract.REASONS). Like
-# the checker's duplicate_doc_id, they are not contract reasons: they say what
-# this database cannot store, not what a row means.
-# - bad_extra: an extra value JSONB cannot hold -- a NUL character, a lone
-#   UTF-16 surrogate, a NaN or an infinity, at any depth (`field` is the
-#   top-level extra key). Without it, one such line made the whole upsert
-#   page, hence the run, fail.
-#   An extra KEY that cannot be stored is shown as its repr in `field`; a
-#   storable one is cut to REFUSAL_VALUE_CHARS characters (then "…"), as a
-#   value is.
+# the checker's duplicate_doc_id, they are not contract reasons.
+# (bad_extra, an extra JSONB cannot hold, is the contract's own since 1.0.0:
+# check_row returns it. Stored here with `field` = the top-level key, its repr
+# when the key itself cannot be stored, cut to REFUSAL_VALUE_CHARS.)
 # - not_json: a non-blank line that is not a JSON object (a torn write, a
 #   UTF-8 BOM on line 1, a JSON array). It cannot be a row, but its document
 #   is "not seen" all the same, so it must skip the sweep like any refusal
 #   rather than get that document soft-deleted. `field` is NULL and `value`
 #   the line's first REFUSAL_VALUE_CHARS characters (its repr when it holds a
 #   character TEXT cannot store).
-VAULT_REASONS = ("bad_extra", "not_json")
+VAULT_REASONS = ("not_json",)
 NOT_JSON = "not_json"
 
 # ingestion_refusals.value: the repr of the refused value, cut to this many
@@ -1166,49 +1162,12 @@ def _storable_text(text):
     return "\x00" not in text and _utf8(text)
 
 
-def jsonb_storable(value):
-    """Whether Postgres JSONB can hold `value` (a json.loads result).
-
-    Iterative, so a deeply nested value cannot exhaust the recursion limit.
-    """
-    stack = [value]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            if not _storable_text(item):
-                return False
-        elif isinstance(item, float):
-            if item != item or item in (float("inf"), float("-inf")):
-                return False
-        elif isinstance(item, dict):
-            for key, inner in item.items():
-                if not _storable_text(key):
-                    return False
-                stack.append(inner)
-        elif isinstance(item, list):
-            stack.extend(item)
-    return True
-
-
 def stored_text(value, limit=REFUSAL_VALUE_CHARS):
     """`value` when it is text Postgres can store, cut to `limit` characters
     (then "…"), else its repr (shown_value)."""
     if isinstance(value, str) and _storable_text(value):
         return value if len(value) <= limit else value[:limit] + "…"
     return shown_value(value, limit)
-
-
-def vault_refusals(checked):
-    """The vault's bad_extra refusals of a checked row (see VAULT_REASONS).
-
-    Text columns need nothing here: the contract refuses NUL and lone
-    surrogates in them itself (bad_text).
-    """
-    refusals = []
-    for key, value in checked.extra.items():
-        if not (_storable_text(key) and jsonb_storable(value)):
-            refusals.append(Refusal("bad_extra", key, value))
-    return refusals
 
 
 class RunReport:
@@ -1308,8 +1267,8 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
 
     None for a blank line, and for a refused line: not a JSON object
     (not_json), or refused by vault_contract.check_row (transition on, this
-    service's CORPUS expected, `vocabulary` None = codes not checked) or by
-    vault_refusals. A refused line is recorded in `report` (counted, logged,
+    service's CORPUS expected, `vocabulary` None = codes not checked; its
+    bad_extra included). A refused line is recorded in `report` (counted, logged,
     kept for ingestion_refusals); an accepted row's notices are appended to
     `report.pending`, counted by commit_notices once the row is known to be
     upserted (after dedupe_rows). Unlike before the contract, a doc_id that
@@ -1339,7 +1298,7 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
         return None
 
     checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=True)
-    refusals = list(checked.refusals) + vault_refusals(checked)
+    refusals = checked.refusals
     if refusals:
         report.refuse(source_file, line_num, checked.columns.get("doc_id"), refusals)
         return None

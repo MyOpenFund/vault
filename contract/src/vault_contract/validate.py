@@ -1,6 +1,7 @@
 """Two levels of checks on a manifest row (contract 1.0.0).
 
-- Refusals (validate_row): structure and identity. A refused row is not
+- Refusals (validate_row on the columns, extra_refusals on `extra`):
+  structure, identity, and what a database cannot store. A refused row is not
   written, and the vault skips its soft-delete sweep for that run.
 - Notices (quality_notices): the row is written, the notice is counted (an
   empty title, a date whose precision is not stated, a transition key read).
@@ -28,7 +29,7 @@ REASONS: tuple[str, ...] = (
     "missing_language", "missing_provenance", "bad_text", "corpus_conflict",
     "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
     "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
-    "bad_sha256", "entity_half", "unknown_entity_scheme",
+    "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
 )
 
 # Every reason quality_notices can give, in check order. Counted by run
@@ -195,6 +196,44 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
     return refusals
 
 
+def _storable_text(text: str) -> bool:
+    return "\x00" not in text and not _SURROGATE.search(text)
+
+
+def _storable(value: object) -> bool:
+    """Whether a JSON database (Postgres JSONB, UTF-8) can hold `value`, a
+    json.loads result: no NUL and no lone surrogate in any string or key, no
+    NaN or infinity, at any depth. Iterative: no recursion limit to hit."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if not _storable_text(item):
+                return False
+        elif isinstance(item, float):
+            if item != item or item in (float("inf"), float("-inf")):
+                return False
+        elif isinstance(item, Mapping):
+            for key, inner in item.items():
+                if not (isinstance(key, str) and _storable_text(key)):
+                    return False
+                stack.append(inner)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return True
+
+
+def extra_refusals(extra: Mapping) -> list[Refusal]:
+    """One bad_extra refusal per top-level `extra` key whose key or value a
+    JSON database cannot store (see _storable), in row order ([] = fine).
+
+    `field` is the top-level key as written (it may itself be the unstorable
+    part: a consumer storing it shows its repr), `value` its value.
+    """
+    return [Refusal("bad_extra", key, value) for key, value in extra.items()
+            if not (isinstance(key, str) and _storable_text(key) and _storable(value))]
+
+
 def _not_period_start(day: datetime.date, precision: object) -> bool:
     return (precision == "month" and day.day != 1) or \
         (precision == "year" and (day.month, day.day) != (1, 1))
@@ -244,12 +283,13 @@ def quality_notices(columns: Mapping, *, row: Mapping, transition: bool = True) 
 
 def check_row(row: Mapping, vocabulary: Vocabulary | None, *, expected_corpus: str,
               transition: bool = True) -> CheckedRow:
-    """split_row, validate_row and quality_notices on one manifest row."""
+    """split_row, validate_row, extra_refusals and quality_notices on one
+    manifest row: every refusal of the row, columns first, then `extra`."""
     columns, extra = split_row(row, transition=transition)
     return CheckedRow(
         columns=columns,
         extra=extra,
         refusals=tuple(validate_row(columns, vocabulary, expected_corpus=expected_corpus,
-                                    transition=transition)),
+                                    transition=transition) + extra_refusals(extra)),
         notices=tuple(quality_notices(columns, row=row, transition=transition)),
     )
