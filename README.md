@@ -53,18 +53,25 @@ A `doc_id` repeated inside one manifest file keeps its **last valid line** (what
 
 ### Table `rag_ingestions`
 
-Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
+Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(corpus, doc_id, collection)` (the primary key), upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` and `corpus` (foreign key `(corpus, doc_id)` to `documents`), `collection`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
 
 Write contract (`data-orchestrator` is the only writer):
 
     INSERT INTO rag_ingestions (doc_id, collection, corpus, source_code,
         embedding_model, embedding_version, chunk_count)
     VALUES (...)
-    ON CONFLICT (doc_id, collection) DO UPDATE SET
+    ON CONFLICT (corpus, doc_id, collection) DO UPDATE SET
         corpus = EXCLUDED.corpus, source_code = EXCLUDED.source_code,
         embedding_model = EXCLUDED.embedding_model,
         embedding_version = EXCLUDED.embedding_version,
         chunk_count = EXCLUDED.chunk_count, ingested_at = now();
+
+**Transitional:** the deployed data-orchestrator still writes `ON CONFLICT (doc_id, collection)`
+(the key before the [documents contract](#migration-2026-11-documents-contract)). The unique
+index `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps that form working
+until the orchestrator is updated; it is removed **in code**, by the cleanup PR's DDL train,
+never by hand (a hand-dropped index breaks the old orchestrator still running, and the train
+would not know it is gone). New writers use the key above.
 
 "Documents not yet in the RAG" is the anti-join on this table; drift between the vault and Qdrant becomes a SQL query. Cross-model history lives in the collection dimension: each re-embed campaign targets a fresh collection.
 
@@ -238,12 +245,27 @@ when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest 
 
 **Rollback to the 2d0457e schema.** With the ingestion stopped, and only while no `doc_id`
 exists under two corpora (`UNIQUE (doc_id)` would fail), run as `docuser` in one transaction
-(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The new columns
-and tables may stay: the old code ignores them. Emptying `vault_schema` makes the old code
-re-run its train once, which puts the views back on `doc_id` alone.
+(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The first
+statement bounds the wait for the table locks (Metabase, the API or the orchestrator reading
+`documents`): if it times out, nothing has changed; re-run it. Preconditions and what stays:
+
+- The data-orchestrator must still write `ON CONFLICT (doc_id, collection)`: the rollback
+  restores that key, and an orchestrator already updated to `(corpus, doc_id, collection)`
+  fails on it, so roll it back too.
+- `date_precision`/`date_kind` come back into `extra` (where the 2d0457e code and the old
+  orchestrator read them) only when the 2d0457e ingestion writes the row again, at its first
+  run, and never for a document no longer in a manifest: the new code moved them to their
+  columns, which the old code ignores.
+- Left behind, ignored by the old code: the columns `date_precision`, `date_kind`,
+  `entity_scheme`, `entity_value` (with their values), the indexes `idx_documents_doc_id` and
+  `idx_documents_entity`, and the tables `vocabulary` and `ingestion_refusals` (with their
+  rows and index). Rolling forward again reuses them.
+- Emptying `vault_schema` makes the old code re-run its train once, which puts the views back
+  on `doc_id` alone.
 
 ```sql
 -- rollback: documents contract -> 2d0457e
+SET LOCAL lock_timeout = '5s';
 DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
 ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_corpus_doc_id_fkey;
 ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_pkey;
@@ -256,7 +278,9 @@ DELETE FROM vault_schema;
 ```
 
 Tested by `tests/integration/test_documents_contract.py` (the snippet above is read from this
-file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it).
+file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it;
+once on a freshly migrated database, once after an ingestion and orchestrator writes under the
+new code).
 
 ### Migration (2026-11 bad_content per source)
 

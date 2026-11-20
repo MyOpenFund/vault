@@ -575,6 +575,83 @@ def test_the_readme_rollback_returns_to_the_2d0457e_keys(clean_db, tmp_path, mon
     _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-3", "c1", CB, "us", "e5", "v1", 2))
 
 
+
+# The updated data-orchestrator's statement (PR 4): the contract's key.
+NEW_ORCHESTRATOR_UPSERT = OLD_ORCHESTRATOR_UPSERT.replace(
+    "ON CONFLICT (doc_id, collection)", "ON CONFLICT (corpus, doc_id, collection)")
+
+
+def test_the_readme_rollback_after_an_ingestion_under_the_new_code(
+    clean_db, tmp_path, monkeypatch
+):
+    """The realistic case: the new code has ingested (date facts moved from
+    `extra` to their columns, a refusal stored, a new document) and the
+    updated orchestrator has written under the new key before the rollback."""
+    from psycopg2.extras import execute_values
+
+    _build_pre_contract_database(clean_db)
+    write_manifest(tmp_path / "manifest", "cb.jsonl", [
+        dict(contract_cb_row("cb-1", "ecb", "A1"), date="2022-07-21", year=2022,
+             date_precision="day", date_kind="meeting"),
+        contract_cb_row("cb-3", "us", "C1"),
+        contract_cb_row("cb-4", "us", "C1"),                 # new under the new code
+        dict(contract_cb_row("cb-5", "us", "C1"), language="english"),   # refused
+    ])
+    with pytest.raises(SystemExit):
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert fetch_all(clean_db, "SELECT doc_id, date_precision, extra FROM documents "
+                               "WHERE doc_id IN ('cb-1', 'cb-2') ORDER BY doc_id") == [
+        ("cb-1", "day", None),                               # left `extra` for its column
+        ("cb-2", None, {"date_precision": "month", "date_source": "repec"}),  # not in a manifest
+    ]
+    for chunks in (4, 5):              # insert branch, then the DO UPDATE branch
+        _exec(clean_db, NEW_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", chunks))
+    assert fetch_all(clean_db, "SELECT count(*) FROM ingestion_refusals") == [(1,)]
+
+    rollback = _readme_rollback_sql()
+    # The wait for the table locks is bounded before any other statement.
+    assert rollback.splitlines()[1] == "SET LOCAL lock_timeout = '5s';"
+    _exec(clean_db, rollback)
+    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)] == [
+        ("documents", "p", ["id"]),
+        ("documents", "u", ["doc_id"]),
+        ("rag_ingestions", "f", ["doc_id"]),
+        ("rag_ingestions", "p", ["doc_id", "collection"]),
+    ]
+    # An orchestrator already updated to the contract's key fails on the
+    # rolled-back schema (README precondition: roll it back too).
+    with pytest.raises(psycopg2.errors.InvalidColumnReference):
+        _exec(clean_db, NEW_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", 9))
+    _exec(clean_db, PRE_CONTRACT_TRAIN)
+    assert fetch_all(clean_db, "SELECT doc_id, chunk_count FROM rag_ingestions "
+                               "ORDER BY doc_id") == [("cb-1", 3), ("cb-2", 7), ("cb-4", 5)]
+    # Left behind, ignored by the old code: the columns keep their values,
+    # the new tables their rows.
+    assert fetch_all(clean_db, "SELECT count(*) FROM ingestion_refusals") == [(1,)]
+    # cb-1's date facts are back in `extra` only once the 2d0457e ingestion
+    # writes the row again (its extra carried them).
+    conn = psycopg2.connect(clean_db)
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, PRE_CONTRACT_UPSERT, [(
+                "cb-1", CB, "ecb", "A1", "t1 again", None, None, "2022-07-21", 2022, "en",
+                "bank_site", None, None, "raw/x.pdf", None, None,
+                json.dumps({"date_precision": "day", "date_kind": "meeting"}))])
+        conn.commit()
+    finally:
+        conn.close()
+    assert fetch_all(clean_db, "SELECT extra FROM documents WHERE doc_id = 'cb-1'") == [
+        ({"date_precision": "day", "date_kind": "meeting"},)]
+    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", 6))
+    assert fetch_all(clean_db, "SELECT chunk_count FROM rag_ingestions "
+                               "WHERE doc_id = 'cb-4'") == [(6,)]
+
+
+def contract_cb_row(doc_id, source, doc_type):
+    """A contract row of the central-bank corpus (columns, not `extra`)."""
+    return {"doc_id": doc_id, "corpus": CB, "source_code": source, "doc_type": doc_type,
+            "title": f"t {doc_id}", "language": "en", "provenance": "bis_index"}
+
 # master 2d0457e's ingest.UPSERT_SQL, verbatim.
 PRE_CONTRACT_UPSERT = """
 INSERT INTO documents (
