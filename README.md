@@ -218,27 +218,34 @@ updated (deploy of 2026-11-20), so the transition code goes. One DDL train re-ru
   `(corpus, doc_id, collection)` serves an upsert now. No value is touched, no view changes
   (the train recreates them as on every train run), and a fresh database never gets the index.
 
-The ingestion checks rows with `check_row(..., transition=False)`: the pre-contract forms
-read during the transition are no longer tolerated with a notice (`corpus_missing`,
-`legacy_alias`, `legacy_data_prefix` are no longer logged by the vault). Three make the row
-refused; a lone `pdf_url` does not, it is an ordinary `extra` key:
+The ingestion checks rows with `check_row(..., transition=False)` (vault-contract 1.1.0): the
+pre-contract forms read during the transition are no longer tolerated with a notice
+(`corpus_missing`, `legacy_alias`, `legacy_data_prefix` are no longer logged by the vault).
+Every one makes the row refused:
 
 | Manifest row | Until this release | Now |
 |---|---|---|
 | no `corpus`, or `""` | the service's `CORPUS` applies, notice `corpus_missing` | refused, `missing_corpus` |
-| `bank_code` (no `source_code`) | read as `source_code`, notice `legacy_alias` | an ordinary `extra` key; the row is refused `missing_source_code` |
-| `pdf_url` (no `document_url`) | read as `document_url`, notice `legacy_alias` | an ordinary `extra` key; `document_url` stays NULL |
+| `bank_code` (no `source_code`) | read as `source_code`, notice `legacy_alias` | refused, `legacy_key` and `missing_source_code` |
+| `pdf_url` (no `document_url`) | read as `document_url`, notice `legacy_alias` | refused, `legacy_key` |
+| `bank_code` or `pdf_url` beside its contract key (any value, even null) | the old key dropped, no notice | refused, `legacy_key` |
 | `local_path` starting with `data/` | prefix stripped, notice `legacy_data_prefix` | refused, `bad_local_path` |
+
+`legacy_key` (new in vault-contract 1.1.0) refuses an old key by name rather than storing it as
+an `extra`: a row carrying `pdf_url` alone would otherwise be upserted with `document_url` NULL,
+wiping the stored URL. The run summary adds one line per old key seen, naming the contract key
+to write instead and the producer's manifest migration to rerun.
 
 #### Breaking changes (2026-11 transition cleanup)
 
-- **Three legacy manifest forms are refused.** A producer still writing `bank_code` instead of
-  `source_code`, `data/` paths, or no `corpus` gets those rows refused (not written, stored in
+- **The legacy manifest forms are refused.** A producer still writing `bank_code` or `pdf_url`
+  (even beside `source_code` / `document_url`), `data/` paths, or no `corpus` gets those rows
+  refused (not written, stored in
   `ingestion_refusals`), and since any refused row skips the soft-delete sweep and makes the
   run exit 1, its corpus is no longer swept until it writes the contract form. Both producers
   write it since the 2026-11-20 migration (`migrate-contract` in each producer repo).
-- `pdf_url` is no longer mapped: a row carrying it alone keeps `document_url` NULL and gets the
-  key in `extra`.
+- `ingestion_refusals.reason` (and Metabase card Q7, which groups by it) can hold a new
+  value, `legacy_key`; nothing enumerates the reasons, so no schema or card change.
 - The pre-contract data-orchestrator (before `2695b26`) fails on `rag_ingestions`
   (`ON CONFLICT (doc_id, collection)`: no matching constraint).
 - Producers checking their manifests with `python -m vault_contract.check` should pass
@@ -254,18 +261,26 @@ refused; a lone `pdf_url` does not, it is an ordinary `extra` key:
   `corpus_missing`, `legacy_alias` or `legacy_data_prefix` notice, and no orchestrator older
   than `2695b26` writes to `rag_ingestions`.
 - **Right before deploying**, re-check the gate on the manifests as they are now, judged as
-  the new ingestion will judge them, from wherever the `vault_contract` package is importable
-  (e.g. the NAS ingestion container, `--entrypoint python`; paths as that container sees them):
+  the new ingestion will judge them (`--no-transition`: it also catches a `pdf_url` or
+  `bank_code` left in a row, which no transition notice reveals when the contract key is
+  there too), inside the ingestion containers of the **new** tree (built or bind-mounted, so
+  that the checker is 1.1.0; paths as each container sees them):
 
   ```
-  python -m vault_contract.check /cbdata/manifest --corpus central-bank \
-      --vocabulary /cbdata/vocabulary.json --glob '**/*.jsonl' --no-transition
+  docker compose run --rm --no-deps --entrypoint python ingestion -m vault_contract.check \
+      /cbdata/manifest --corpus central-bank --vocabulary /cbdata/vocabulary.json \
+      --glob '**/*.jsonl' --no-transition
+  docker compose run --rm --no-deps --entrypoint python ingestion-company -m vault_contract.check \
+      /data/manifest --corpus company --vocabulary /data/vocabulary.json --no-transition
   ```
 
-  Expect `refusals: 0` and exit 0. `--glob '**/*.jsonl'` reads the subdirectories too, as the
-  ingestion's manifest-directory layout does (the checker's default `*.jsonl` reads the top
-  level only). Same for the company corpus with `--corpus company` and its own manifest
-  directory and vocabulary. Alternatively, deploy after a nightly central-bank sync and
+  Expect `refusals: 0` and exit 0 for both. `--no-deps` keeps Postgres out of it (the checker
+  is read-only and opens no connection). Central bank: `--glob '**/*.jsonl'` reads the
+  subdirectories too, as the ingestion's manifest-directory layout does; it also matches the
+  producer's non-manifest files (`download_errors.jsonl`, ...), which the checker skips, as the
+  ingestion does (`EXCLUDED_BASENAMES`, shared), along with hidden files. Company:
+  `ingestion-company` reads `manifest/*.jsonl` at the top level only (`MANIFEST_GLOBS`), which
+  is the checker's default glob. Alternatively, deploy after a nightly central-bank sync and
   ingestion whose log shows none of the three notices.
 
 **Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
@@ -307,9 +322,8 @@ must be 0. Otherwise the train stops with that count (one transaction: nothing c
 run fails. Measured: the train takes well under a second on 40k documents.
 
 **Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` absent or of
-another corpus, `bank_code` without `source_code` or a `data/` path since the
-[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) — a lone
-`pdf_url` is not refused, it stays in `extra` with `document_url` NULL —, a line that is
+another corpus, a `bank_code` or `pdf_url` key (`legacy_key`) or a `data/` path since the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a line that is
 not a JSON object such as a torn write or a UTF-8 BOM on line 1, an `extra` value JSONB cannot
 hold) is not written, is logged as `file:line reason field=value`
 (the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
@@ -474,8 +488,8 @@ applies it:
   (see [Schema migrations](#schema-migrations)). Later runs skip the train.
 - Manifests: a line carrying `document_url` fills the column. At this release a line still
   carrying the legacy `pdf_url` filled it too; since the
-  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) `pdf_url` is
-  an ordinary key that lands in `extra` and never fills `document_url`.
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) a line
+  carrying `pdf_url` is refused (`legacy_key`), never written with `document_url` NULL.
 - Readers that name the column must move with it: the API's `Document` model and `vault-query`
   0.3.0 (this release) return `document_url`; a consumer pinned to an older `vault-query` (the
   MCP) selects a column that no longer exists and fails until its pin is bumped. Re-apply the
