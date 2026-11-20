@@ -167,7 +167,8 @@ def test_a_2d0457e_database_gets_the_contract_schema_once_with_data_intact(
     indexes = {name for (name,) in fetch_all(
         clean_db, "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()")}
     assert {"idx_documents_entity", "idx_documents_doc_id",
-            "idx_ingestion_refusals_corpus_reason"} <= indexes
+            "idx_ingestion_refusals_corpus_reason",
+            "rag_ingestions_doc_collection_transition"} <= indexes
     assert _columns(clean_db, "vocabulary") == {"corpus", "kind", "code", "label", "family"}
     assert _columns(clean_db, "ingestion_refusals") == {
         "corpus", "run_ts", "source_file", "line", "doc_id", "reason", "field", "value"}
@@ -503,3 +504,62 @@ def test_a_bom_on_the_first_line_is_refused_and_soft_deletes_nothing(
         run_ingest(monkeypatch, clean_db, tmp_path)
     assert len(_live(clean_db)) == 3
     assert fetch_all(clean_db, "SELECT line, reason FROM ingestion_refusals") == [(1, "not_json")]
+
+
+# The deployed data-orchestrator's statement (master 81ead10, data_orchestrator/vault.py),
+# kept working by the transitional unique index until its own update.
+OLD_ORCHESTRATOR_UPSERT = """
+INSERT INTO rag_ingestions (
+    doc_id, collection, corpus, source_code,
+    embedding_model, embedding_version, chunk_count
+) VALUES (%s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (doc_id, collection) DO UPDATE SET
+    corpus = EXCLUDED.corpus,
+    source_code = EXCLUDED.source_code,
+    embedding_model = EXCLUDED.embedding_model,
+    embedding_version = EXCLUDED.embedding_version,
+    chunk_count = EXCLUDED.chunk_count,
+    ingested_at = now();
+"""
+
+
+def test_the_deployed_orchestrator_upsert_still_works_after_the_train(
+    clean_db, tmp_path, monkeypatch
+):
+    _build_pre_contract_database(clean_db)
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    for chunks in (11, 12):            # insert branch, then the DO UPDATE branch
+        _exec(clean_db, OLD_ORCHESTRATOR_UPSERT,
+              ("cb-3", "c1", CB, "us", "e5", "v1", chunks))
+    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-1", "c1", CB, "ecb", "e5", "v1", 5))
+    assert fetch_all(clean_db, "SELECT doc_id, chunk_count FROM rag_ingestions "
+                               "ORDER BY doc_id") == [("cb-1", 5), ("cb-2", 7), ("cb-3", 12)]
+
+
+# master 2d0457e's ingest.UPSERT_SQL, verbatim.
+PRE_CONTRACT_UPSERT = """
+INSERT INTO documents (
+    doc_id, corpus, source_code, doc_type, title, document_url, source_url,
+    date, year, language, provenance, mime_type, sha256, local_path,
+    updated_at, last_seen_at, extra
+) VALUES %s
+ON CONFLICT (doc_id) DO UPDATE SET
+    corpus = EXCLUDED.corpus,
+    source_code = EXCLUDED.source_code,
+    doc_type = EXCLUDED.doc_type,
+    title = EXCLUDED.title,
+    document_url = EXCLUDED.document_url,
+    source_url = EXCLUDED.source_url,
+    date = EXCLUDED.date,
+    year = EXCLUDED.year,
+    language = EXCLUDED.language,
+    provenance = EXCLUDED.provenance,
+    mime_type = EXCLUDED.mime_type,
+    sha256 = EXCLUDED.sha256,
+    local_path = EXCLUDED.local_path,
+    extra = EXCLUDED.extra,
+    updated_at = EXCLUDED.updated_at,
+    -- never rewind: a slower run carrying an older run timestamp must not make a live row look stale to a newer run's sweep (vault #3)
+    last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at),
+    deleted_at = NULL;
+"""

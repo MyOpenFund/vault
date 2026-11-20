@@ -408,6 +408,15 @@ BEGIN
     END LOOP;
 END $$;
 
+-- TRANSITION (removed by the cleanup PR 6): the deployed data-orchestrator
+-- upserts with ON CONFLICT (doc_id, collection), which needs a unique index on
+-- exactly those columns. Keeping one lets it run between the vault deploy
+-- and its own update. Valid only while collections are per corpus (a
+-- collection never holds two corpora's documents); a mixed-corpus collection
+-- needs this index gone first.
+CREATE UNIQUE INDEX IF NOT EXISTS rag_ingestions_doc_collection_transition
+    ON rag_ingestions (doc_id, collection);
+
 CREATE INDEX IF NOT EXISTS idx_documents_doc_id ON documents (doc_id);
 -- Documents about one company (contract: entity = the company the document is about).
 CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents (entity_scheme, entity_value);
