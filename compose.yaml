@@ -75,6 +75,9 @@ services:
       # Repo root, not ./ingestion: the image copies contract/ (vault-contract) too.
       context: .
       dockerfile: ingestion/Dockerfile
+    # One tag for both ingestion services: `docker compose build` (which
+    # skips the `company` profile) refreshes the image ingestion-company runs.
+    image: vault-ingestion:local
     container_name: vault_ingestion
     environment:
       DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
@@ -123,10 +126,13 @@ services:
     # The company corpus (documents contract): the same image, CORPUS=company,
     # over a copy of the company data root (manifest/ + vocabulary.json, no
     # files). In the `company` profile, so `docker compose up` does not start
-    # it: run it on demand with `docker compose run --rm ingestion-company`.
+    # it: run it on demand with `docker compose run --rm ingestion-company`,
+    # or set COMPOSE_PROFILES=company to have every `up` start it too (README
+    # "Deploy notes"). The two runs serialize only on the DDL train.
     build:
       context: .
       dockerfile: ingestion/Dockerfile
+    image: vault-ingestion:local
     container_name: vault_ingestion_company
     profiles: ["company"]
     environment:
@@ -135,6 +141,10 @@ services:
       CORPUS: company
       MANIFEST_GLOBS: manifest/*.jsonl
       VOCABULARY_PATH: /data/vocabulary.json
+      # No manifest = failure (exit 1), not a run of 0 rows: this service
+      # exists only for the company manifests (COMPANY_MANIFEST_DIR unset
+      # mounts the empty /var/empty).
+      REQUIRE_MANIFESTS: "1"
       SWEEP_MAX_DELETE_FRACTION: ${SWEEP_MAX_DELETE_FRACTION:-0.05}
       DISCOVERY_ERROR_MAX_CHARS: ${DISCOVERY_ERROR_MAX_CHARS:-2000}
       DISCOVERY_ERRORS_MIN_RETAIN_FRACTION: ${DISCOVERY_ERRORS_MIN_RETAIN_FRACTION:-0.5}
@@ -148,7 +158,10 @@ services:
       VAULT_DDL_RETRY_DELAYS: ${VAULT_DDL_RETRY_DELAYS:-}
       VAULT_DDL_FORCE: ${VAULT_DDL_FORCE:-}
     volumes:
-      - ${COMPANY_MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # the company data root copy: manifest/*.jsonl + vocabulary.json
+      # The company data root copy: manifest/*.jsonl + vocabulary.json.
+      # Optional, so a deployment without a company corpus can still run
+      # every compose command; unset, this service fails loudly (above).
+      - ${COMPANY_MANIFEST_DIR:-/var/empty}:/data:ro
     depends_on:
       postgres:
         condition: service_healthy

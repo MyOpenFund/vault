@@ -115,7 +115,10 @@ def test_the_raw_path_variables_are_gone():
 
 def test_the_company_ingestion_service():
     block = service_block("ingestion-company")
-    # Same image as the central-bank ingestion.
+    # Same image as the central-bank ingestion, under the same tag, so a
+    # `docker compose build` (the profile inactive) refreshes both.
+    assert "image: vault-ingestion:local" in block
+    assert "image: vault-ingestion:local" in service_block("ingestion")
     assert "dockerfile: ingestion/Dockerfile" in block
     assert "context: ." in block
     assert "container_name: vault_ingestion_company" in block
@@ -123,7 +126,13 @@ def test_the_company_ingestion_service():
     assert "DATA_DIR: /data" in block
     assert "MANIFEST_GLOBS: manifest/*.jsonl" in block
     assert "VOCABULARY_PATH: /data/vocabulary.json" in block
-    assert "- ${COMPANY_MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro" in block
+    # Optional: a deployment without a company corpus can run every compose
+    # command; unset, the service mounts an empty directory and REQUIRE_MANIFESTS
+    # makes the run fail instead of ingesting 0 rows.
+    assert "- ${COMPANY_MANIFEST_DIR:-/var/empty}:/data:ro" in block
+    assert 'REQUIRE_MANIFESTS: "1"' in block
+    assert "COMPANY_MANIFEST_DIR:?" not in COMPOSE
+    assert "REQUIRE_MANIFESTS" not in service_block("ingestion")
     assert 'restart: "no"' in block
     # Not started by `docker compose up`: run on demand, like `ingestion`.
     assert 'profiles: ["company"]' in block
