@@ -12,9 +12,9 @@ ALLOWED_TYPES = {"text", "number", "date"}
 GRID_WIDTH = 24
 
 
-def test_nineteen_unique_cards():
+def test_twenty_unique_cards():
     codes = [c["code"] for c in CARDS]
-    assert len(codes) == 19 and len(set(codes)) == 19
+    assert len(codes) == 20 and len(set(codes)) == 20
     assert all(c["name"].startswith(c["code"] + " · ") for c in CARDS)
 
 
@@ -185,3 +185,42 @@ def test_q6_bad_content_sits_on_coverage_and_qc():
     assert q6["mappings"] == {"corpus": "corpus", "bank": "bank"}
     card = next(c for c in CARDS if c["code"] == "Q6")
     assert "FROM runs_sources" in card["sql"] and "bad_content" in card["sql"]
+
+
+# --- documents contract (corpus, doc_id) -------------------------------------
+
+@pytest.mark.parametrize("card", CARDS, ids=[c["code"] for c in CARDS])
+def test_rag_ingestions_joins_documents_on_corpus_and_doc_id(card):
+    """A doc_id is unique per corpus only: a join on doc_id alone marks a
+    document "in RAG" because another corpus's document of the same doc_id is."""
+    for on in re.findall(r"JOIN rag_ingestions r\s+ON (.*?)(?:WHERE|GROUP|ORDER|$)",
+                         card["sql"], flags=re.S):
+        assert "r.corpus = d.corpus" in on and "r.doc_id = d.doc_id" in on, card["code"]
+
+
+@pytest.mark.parametrize("card", CARDS, ids=[c["code"] for c in CARDS])
+def test_a_doc_type_filter_is_scoped_by_corpus(card):
+    """doc_type codes are a corpus's vocabulary (spec §3): the same code can
+    mean two things in two corpora, so a card that filters on one restricts
+    the corpus too."""
+    if "{{doc_type}}" in card["sql"]:
+        assert re.search(r"\.corpus = \{\{corpus\}\}", card["sql"]), card["code"]
+
+
+def test_c4_lists_the_date_and_entity_facts():
+    sql = next(c for c in CARDS if c["code"] == "C4")["sql"]
+    select = sql.split("FROM documents", 1)[0]
+    for column in ("d.date_precision", "d.date_kind", "d.entity_value"):
+        assert column in select, column
+
+
+def test_q7_refused_rows_sits_on_coverage_and_qc():
+    qc = next(d for d in DASHBOARDS if d["name"] == "Vault — Coverage & QC")
+    (q7,) = [dc for dc in qc["cards"] if dc["code"] == "Q7"]
+    card = next(c for c in CARDS if c["code"] == "Q7")
+    assert card["name"] == "Q7 · Refused rows by corpus and reason"
+    assert "FROM ingestion_refusals" in card["sql"]
+    assert "max(f.run_ts)" in card["sql"] and "GROUP BY 1, 2" in card["sql"]
+    # Every corpus at once: the card is the cross-corpus view, so it takes no
+    # corpus tag and the dashboard's corpus filter does not drive it.
+    assert card["tags"] == {} and q7["mappings"] == {}

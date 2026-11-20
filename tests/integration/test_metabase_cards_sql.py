@@ -97,6 +97,13 @@ INSERT INTO rag_ingestions (
 ON CONFLICT (corpus, doc_id, collection) DO NOTHING;
 """
 
+COMPANY_DOC_SQL = """
+INSERT INTO documents (doc_id, corpus, source_code, doc_type, title, date, year,
+                       date_precision, date_kind, entity_scheme, entity_value, last_seen_at)
+VALUES (%s, 'company', 'sec', '10-K', 'Annual report', '2020-02-01', 2020,
+        'day', 'publication', 'cik', '0000320193', now());
+"""
+
 PROBE_DOC_SQL = """
 UPDATE documents SET has_text_layer = %s, page_count = %s WHERE doc_id = %s;
 """
@@ -116,19 +123,25 @@ def _exec(pg_url, sql, params):
 def seeded_db(pg_url, tmp_path_factory):
     """One small but complete corpus: documents over two sources (one of them
     undated), a cadence row, a run report carrying a truncated source, the real
-    discovery-errors fixture, and one rag_ingestions row. Every table and view
-    the 19 cards read is populated, so an empty result means the SQL is wrong,
-    not that the fixture is thin."""
+    discovery-errors fixture, two refused manifest lines, and one
+    rag_ingestions row. A `company` document shares a central-bank doc_id and
+    is in RAG, so a card joining on doc_id alone would show the central-bank one
+    as ingested. Every table and view the 20 cards read is populated, so an
+    empty result means the SQL is wrong, not that the fixture is thin."""
     data = tmp_path_factory.mktemp("metabase-cards")
 
     write_manifest(data, "us.jsonl", [
         make_doc("us-a1-2019", source="us", doc_type="A1",
-                 date="2019-03-01", year=2019,
+                 date="2019-03-01", year=2019, date_precision="day", date_kind="publication",
                  document_url="https://example.invalid/us/2019.pdf"),
         make_doc("us-a1-2020", source="us", doc_type="A1",
                  date="2020-05-04", year=2020,
                  document_url="https://example.invalid/us/2020.pdf"),
+        # Refused (Q7): a precision outside the contract's values.
+        make_doc("us-a1-bad", source="us", doc_type="A1", date_precision="Day"),
     ])
+    with (data / "us.jsonl").open("a", encoding="utf-8") as f:
+        f.write("{torn\n")                     # refused (Q7): not_json
     # An undated document: C0 counts it, C1/C3 drop it, C4 must keep it.
     write_manifest(data, "ecb.jsonl", [
         make_doc("ecb-e4-undated", source="ecb", doc_type="E4",
@@ -162,9 +175,18 @@ def seeded_db(pg_url, tmp_path_factory):
 
     monkeypatch = pytest.MonkeyPatch()
     try:
-        run_ingest(monkeypatch, pg_url, data)
+        with pytest.raises(SystemExit) as refused:      # the two refused lines
+            run_ingest(monkeypatch, pg_url, data)
+        assert refused.value.code == 1
     finally:
         monkeypatch.undo()
+
+    # Another corpus's document under a central-bank doc_id, in RAG (company
+    # rows are written by their own ingestion service; inserted directly here).
+    _exec(pg_url, COMPANY_DOC_SQL, ("us-a1-2020",))
+    _exec(pg_url, UPSERT_RAG_SQL,
+          ("us-a1-2020", "cb_corpus_v2", "company", "sec",
+           "intfloat/multilingual-e5-base", "v1", 7))
 
     # data-orchestrator's writes, which the vault's ingester never makes.
     _exec(pg_url, UPSERT_RAG_SQL,
@@ -190,7 +212,7 @@ def test_card_sql_executes(seeded_db, card, fill_optional):
 # only exclusion: it reports *publication anomalies*, and a fixture with none is
 # a healthy corpus rather than a broken card.
 NON_EMPTY = ["C0", "C1", "C2", "C3", "C4", "C5", "C6",
-             "Q2", "Q3", "Q4", "Q5", "Q6", "R1", "R2", "R3", "R4", "R5", "R6"]
+             "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "R1", "R2", "R3", "R4", "R5", "R6"]
 
 
 @pytest.mark.parametrize("code", NON_EMPTY)
@@ -200,12 +222,15 @@ def test_card_returns_rows_on_the_fixture(seeded_db, code):
     assert fetch_all(seeded_db, sql), code
 
 
-def _card_dicts(seeded_db, code, fill_optional=False):
+def _card_dicts(seeded_db, code, fill_optional=False, corpus=None):
     card = next(c for c in CARDS if c["code"] == code)
+    tags = json.loads(json.dumps(card["tags"]))
+    if corpus is not None:
+        tags["corpus"]["default"] = corpus
     conn = psycopg2.connect(seeded_db)
     try:
         with conn.cursor() as cur:
-            cur.execute(_render_for_test(card["sql"], card["tags"], fill_optional=fill_optional))
+            cur.execute(_render_for_test(card["sql"], tags, fill_optional=fill_optional))
             names = [d[0] for d in cur.description]
             return [dict(zip(names, r)) for r in cur.fetchall()]
     finally:
@@ -257,6 +282,40 @@ def test_q6_counts_reporting_runs_windows_and_picks_the_newest_bad_run(seeded_db
         assert rows[0]["last_bad_content_run_id"] == "q6-new"
     finally:
         _exec(seeded_db, "DELETE FROM runs WHERE corpus = 'q6-probe'", None)
+
+
+def test_c4_joins_rag_on_corpus_and_shows_the_date_and_entity_facts(seeded_db):
+    rows = {r["doc_id"]: r for r in _card_dicts(seeded_db, "C4")}
+    assert set(rows) == {"us-a1-2019", "us-a1-2020", "ecb-e4-undated"}
+    # The company document of the same doc_id is in RAG; this one is not.
+    assert rows["us-a1-2020"]["in_rag"] is False and rows["us-a1-2020"]["n_chunks"] is None
+    assert rows["us-a1-2019"]["in_rag"] is True and rows["us-a1-2019"]["n_chunks"] == 42
+    assert (rows["us-a1-2019"]["date_precision"], rows["us-a1-2019"]["date_kind"]) == (
+        "day", "publication")
+    assert rows["us-a1-2020"]["date_precision"] is None
+    (company,) = _card_dicts(seeded_db, "C4", corpus="company")
+    assert {k: company[k] for k in ("doc_id", "bank", "type", "date_precision", "date_kind",
+                                    "entity_value", "in_rag", "n_chunks")} == {
+        "doc_id": "us-a1-2020", "bank": "sec", "type": "10-K", "date_precision": "day",
+        "date_kind": "publication", "entity_value": "0000320193", "in_rag": True,
+        "n_chunks": 7}
+
+
+def test_r2_counts_only_its_corpus_rag_rows(seeded_db):
+    rows = {(r["bank"], r["type"]): r for r in _card_dicts(seeded_db, "R2")}
+    assert (rows[("us", "A1")]["documents"], rows[("us", "A1")]["in_rag"],
+            rows[("us", "A1")]["chunks"]) == (2, 1, 42)
+
+
+def test_q7_counts_refused_rows_by_corpus_and_reason(seeded_db):
+    rows = _card_dicts(seeded_db, "Q7")
+    assert [(r["corpus"], r["reason"], r["refusals"], r["refused_lines"], r["files"])
+            for r in rows] == [("central-bank", "bad_date_precision", 1, 1, 1),
+                               ("central-bank", "not_json", 1, 1, 1)]
+    (run_ts,) = {r["last_run_ts"] for r in rows}
+    assert run_ts is not None
+    assert rows[0]["sample"] == "us.jsonl:3 date_precision='Day'"
+    assert rows[1]["sample"] == "us.jsonl:4={torn"
 
 
 def test_r3_shows_the_run_bad_content_total(seeded_db):

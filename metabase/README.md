@@ -1,7 +1,7 @@
 # Metabase over the vault, as code
 
 `cards.json` and `dashboards.json` are the truth for the vault's Metabase layer:
-19 native-SQL cards on three dashboards. They are **edited by hand** here and
+20 native-SQL cards on three dashboards. They are **edited by hand** here and
 **applied** to a Metabase instance by `apply.py` — never the other way round. A
 change made in the Metabase UI is overwritten on the next apply.
 
@@ -13,8 +13,11 @@ change made in the Metabase UI is overwritten on the next apply.
 ## Dashboards
 
 - **Vault — Corpus** (C0–C6) — what is in the corpus: volume, shape, coverage, document explorer.
-- **Vault — Coverage & QC** (Q1–Q6) — what is missing, late or wrong. Q6 lists the banks
+- **Vault — Coverage & QC** (Q1–Q7) — what is missing, late or wrong. Q6 lists the banks
   whose runs met bad content (wrong bytes served for a document); empty is healthy.
+  Q7 lists the manifest rows the last ingestion of each corpus refused, per reason,
+  from `ingestion_refusals`; empty is healthy. It shows every corpus at once, so the
+  dashboard's corpus filter does not drive it.
 - **Vault — RAG & Runs** (R1–R6) — is the machine healthy.
 
 Dashboard 1's `doc_type` filter drives **C1, C3 and C4 only**: C2, C5 and C6
@@ -38,13 +41,18 @@ card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
   `cb_corpus_v2`.
 - Every card reading `documents` carries `d.deleted_at IS NULL` (C0 carries it per
   `FILTER` clause, because reporting the soft-deleted count is its job).
+- A document is `(corpus, doc_id)`: a card joining `rag_ingestions` to `documents`
+  joins on both (`r.corpus = d.corpus AND r.doc_id = d.doc_id`), and a card with a
+  `{{doc_type}}` filter also restricts `corpus` — a doc_type code belongs to its
+  corpus's vocabulary (pinned by `test_rag_ingestions_joins_documents_on_corpus_and_doc_id`
+  and `test_a_doc_type_filter_is_scoped_by_corpus`).
 - A date variable that means "evaluate as of now" is written
   `coalesce(NULL::date [[, {{ref_date}}]], current_date)`: the optional block
   disappears when the widget is empty, so the card falls back to *today* instead
   of to a frozen literal. `{{ref_date}}` (Q1, Q3) uses it.
 - Cards **read only**: no card creates or alters a schema object. The views they
-  use (`rag_backlog`, read by Q4, and `runs_sources`, read by Q6) belong to
-  `ingestion/ingest.py`'s DDL train.
+  and tables they use (`rag_backlog`, read by Q4, `runs_sources`, read by Q6, and
+  `ingestion_refusals`, read by Q7) belong to `ingestion/ingest.py`'s DDL train.
 - Dashboards are a 24-column grid; dashcards must not overlap.
 - **No `?` anywhere in a card's SQL.** Metabase reaches Postgres through pgjdbc,
   which reads a bare `?` in a native query as a positional placeholder, so the
