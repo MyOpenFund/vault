@@ -362,16 +362,20 @@ No table, no `.env` change, nothing to backfill. A malformed `runs` row (a count
 range, a float, a string, a negative; an object `sources`; a string `truncated`) no longer makes
 a card raise:
 
-- **Cards**: R3 and R5 read a `totals` counter as NULL unless it is 1–9 digits, a non-array
-  `sources` as empty and a non-boolean `truncated` as false; R6 now selects from `runs_sources`
+- **Cards**: R3 and R5 read a `totals` counter as NULL unless it is 1–9 digits; R3 also reads
+  a non-array `sources` as empty (`n_sources` 0) and a non-boolean `truncated` as false (R5
+  reads neither). Where a card shows `coalesce(docs_ingested, docs_new)` (R3, R5), a malformed
+  `docs_ingested` is NULL and so falls back to `docs_new`. R6 now selects from `runs_sources`
   (same columns; a non-array `error_samples` shows as `[]`). R3's `bad_content` no longer
   admits a negative. After merging, re-apply the cards: `python metabase/apply.py`.
 - **View**: `runs_sources` reads a negative counter as NULL (it accepted `-?`), so a negative
-  `bad_content` can no longer offset a positive one and hide a bank from Q6. Only the view's
-  regex changes, but the train's text changed, so **the first ingestion run after deploying
-  re-runs the DDL train once** (views only: dropped and recreated, grants re-issued, the new
-  fingerprint recorded; no table altered), under the usual bounded lock wait (see
-  [Schema migrations](#schema-migrations)). Later runs skip it.
+  `bad_content` can no longer offset a positive one and hide a bank from Q6. Side effect in
+  `source_health`: a negative `docs_seen` is now NULL, which `coalesce(docs_seen, 0) = 0`
+  counts as a **zero-yield run** (`source_zero_yield_runs_7d`), as a garbage `docs_seen`
+  already was. Only the view's regex changes, but the train's text changed, so **the first
+  ingestion run after deploying re-runs the DDL train once** (views only: dropped and
+  recreated, grants re-issued, the new fingerprint recorded; no table altered), under the
+  usual bounded lock wait (see [Schema migrations](#schema-migrations)). Later runs skip it.
 
 ### Migration (2026-11 bad_content per source)
 
