@@ -6,11 +6,13 @@ codes its rows may use for `source_code`, `doc_type`, `provenance` and
 is always judged against that corpus's vocabulary.
 """
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
 CODE_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+_SURROGATE = re.compile("[\ud800-\udfff]")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
@@ -67,8 +69,12 @@ def _check_labelled(doc: Mapping, key: str, errors: list[str], *, with_family: b
         else:
             seen.add(code)
         label = entry.get("label")
-        if not isinstance(label, str) or not label.strip() or "\x00" in label:
-            errors.append(f"{where}: label must be a non-empty string without NUL")
+        if not isinstance(label, str) or not label.strip() or _SURROGATE.search(label):
+            errors.append(f"{where}: label must be a non-empty string")
+        elif any(unicodedata.category(c) == "Cc" for c in label):
+            # NUL included: a TEXT column cannot store it, and a newline or an
+            # escape sequence breaks the messages and UIs that show labels.
+            errors.append(f"{where}: label {label!r} must not contain a control character")
         if with_family and entry.get("family") is not None and not _is_code(entry["family"]):
             errors.append(f"{where}: family {entry['family']!r} must match {CODE_PATTERN.pattern}")
 

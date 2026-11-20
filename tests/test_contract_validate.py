@@ -117,6 +117,12 @@ def _broken(**changes):
     (_broken(provenances=[]), "provenances"),
     (_broken(source_codes=[{"code": "sec", "label": "SEC\x00EDGAR"}]), "label"),
     (_broken(doc_types=[{"code": "A1", "label": "Annual\x00report"}]), "label"),
+    # Control characters (Unicode Cc): a label is shown in error messages and UIs.
+    (_broken(doc_types=[{"code": "A1", "label": "Annual\nreport"}]), "control"),
+    (_broken(doc_types=[{"code": "A1", "label": "Annual\treport"}]), "control"),
+    (_broken(source_codes=[{"code": "sec", "label": "SEC\x1bEDGAR"}]), "control"),
+    (_broken(source_codes=[{"code": "sec", "label": "SEC\x85EDGAR"}]), "control"),
+    (_broken(source_codes=[{"code": "sec", "label": "SEC\ud800"}]), "label"),
 ])
 def test_validate_vocabulary_reports_each_defect(doc, fragment):
     errors = validate_vocabulary(doc)
@@ -129,6 +135,11 @@ def test_validate_vocabulary_reports_each_defect(doc, fragment):
 @pytest.mark.parametrize("not_a_doc", [None, [], "documents"])
 def test_validate_vocabulary_refuses_something_that_is_not_an_object(not_a_doc):
     assert validate_vocabulary(not_a_doc) != []
+
+
+def test_a_label_may_hold_any_printable_text():
+    doc = _broken(doc_types=[{"code": "A1", "label": "Rapport annuel — 10‑K (é, 中文)"}])
+    assert validate_vocabulary(doc) == []
 
 
 def test_unknown_top_level_keys_are_allowed():

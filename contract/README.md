@@ -228,7 +228,7 @@ validates it with `validate_vocabulary` in its CI:
   `[A-Za-z0-9_.-]{1,32}`, case-sensitive; no duplicate within a list.
 - `source_codes`, `doc_types` and `provenances` are non-empty lists; `entity_schemes` may be
   empty (a corpus whose documents concern no single company).
-- `label` (non-blank, no NUL) is required for source codes and document types; `family` is
+- `label` (non-blank, no control character such as NUL, a newline or a tab, no lone surrogate) is required for source codes and document types; `family` is
   optional.
 - Unknown top-level keys are allowed.
 
