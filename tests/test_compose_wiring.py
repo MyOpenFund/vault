@@ -76,3 +76,9 @@ def test_ingestion_forwards_manifest_globs_as_optional():
     # Empty = layout detection (ingest.find_manifest_files); the NAS sets nothing.
     assert "MANIFEST_GLOBS: ${MANIFEST_GLOBS:-}" in COMPOSE
     assert "#MANIFEST_GLOBS=" in ENV_EXAMPLE
+
+
+def test_ingestion_forwards_the_vocabulary_path_as_optional():
+    # Empty = <DATA_DIR>/vocabulary.json; the NAS (manifest-dir layout) sets it.
+    assert "VOCABULARY_PATH: ${VOCABULARY_PATH:-}" in COMPOSE
+    assert "#VOCABULARY_PATH=" in ENV_EXAMPLE

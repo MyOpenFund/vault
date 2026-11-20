@@ -33,7 +33,7 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 ### Table `documents`
 
-Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); upsert key is `doc_id` (TEXT UNIQUE NOT NULL, the ON CONFLICT target). Columns: `id` (PK), `doc_id` (unique, upsert key), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `document_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB). `document_url` is the document's own URL (a PDF or any other format); it was named `pdf_url` before 2026-11 (see [Migration (2026-11 document_url rename)](#migration-2026-11-document_url-rename)).
+Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); identity and upsert key is `(corpus, doc_id)` (`UNIQUE (corpus, doc_id)`, the ON CONFLICT target, since the documents contract: a `doc_id` is unique within its corpus only). Columns: `id` (PK), `doc_id`, `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `document_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, `date_precision`, `date_kind`, `entity_scheme`, `entity_value` (the 18 common fields of the [documents contract](contract/README.md)), plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB). `document_url` is the document's own URL (a PDF or any other format); it was named `pdf_url` before 2026-11 (see [Migration (2026-11 document_url rename)](#migration-2026-11-document_url-rename)).
 
 Write contract (the ingestion service is the only writer):
 
@@ -186,6 +186,76 @@ with `VAULT_DDL_FORCE=1`. Two services on different code versions against the sa
 (e.g. two corpora deployed at different times) see different fingerprints and re-run the train
 alternately, each time the other one has recorded its own — the nightly lock convoy comes back
 until both run the same tree.
+
+### Migration (2026-11 documents contract)
+
+The ingestion checks every manifest row against the [documents contract](contract/README.md)
+(`vault_contract.check_row`) and the schema follows it. One DDL train re-run:
+
+- `documents`: columns `date_precision`, `date_kind`, `entity_scheme`, `entity_value`; identity
+  `UNIQUE (doc_id)` → `UNIQUE (corpus, doc_id)`; a plain index on `doc_id` for lookups by
+  `doc_id` alone; an index on `(entity_scheme, entity_value)`.
+- `rag_ingestions`: primary key `(corpus, doc_id, collection)`, foreign key `(corpus, doc_id)`;
+  the backlog views join on both. **Transition:** a unique index
+  `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps the deployed
+  data-orchestrator's `ON CONFLICT (doc_id, collection)` working until its update (valid while
+  collections are per corpus; removed by the cleanup release).
+- New tables `vocabulary` (the corpus vocabulary, full replace per corpus) and
+  `ingestion_refusals` (the refused rows of each corpus's last run, replaced every run;
+  `value` is the repr of the refused value cut at 200 characters).
+
+Before deploying, check that no `rag_ingestions` row has another corpus than its document:
+`SELECT count(*) FROM rag_ingestions r JOIN documents d USING (doc_id) WHERE r.corpus <> d.corpus;`
+must be 0. Otherwise the train stops with that count (one transaction: nothing changes) and the
+run fails. Measured: the train takes well under a second on 40k documents.
+
+**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` of another
+corpus, a line that is not a JSON object such as a torn write or a UTF-8 BOM on line 1, an
+`extra` value JSONB cannot hold) is not written, is logged as `file:line reason field=value`
+(the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
+soft-delete sweep and makes the run exit 1** after the cadence, runs and discovery-error passes:
+a refused row is a document "not seen", and a vocabulary mistake on a whole source must not
+soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, transition forms, …) are
+counted in the run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
+in `extra` until now, move to their columns on the first run.
+
+**Vocabulary file.** The run reads `vocabulary.json` at `DATA_DIR`, or at `VOCABULARY_PATH`
+when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest directory, e.g.
+`/cbdata/manifest`) the file sits one level up, at the data root: set
+`VOCABULARY_PATH=/cbdata/vocabulary.json`, as `CADENCE_PATH` points one level up too.
+- Absent: code membership is not checked (transition); the run logs
+  `vocabulary: missing (membership not checked)`.
+- Present and valid: it replaces this corpus's `vocabulary` rows (its own transaction, before
+  the documents pass) and every row's `source_code`, `doc_type`, `provenance` and
+  `entity_scheme` are checked against it.
+- Present but unreadable, invalid, of another corpus, or declaring a newer MINOR contract
+  version than this vault reads: **the whole run stops before connecting (exit 1)**: no DDL
+  train, no documents, no cadence, runs or discovery-error pass. Checking rows against a
+  vocabulary the vault cannot read would refuse or accept them on the strength of a producer
+  bug or of codes it does not know; nothing is better than a wrong partial run. Fix the file
+  (or deploy the vault that reads the newer MINOR) and run again.
+
+**Rollback to the 2d0457e schema.** With the ingestion stopped, and only while no `doc_id`
+exists under two corpora (`UNIQUE (doc_id)` would fail), run as `docuser` in one transaction
+(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The new columns
+and tables may stay: the old code ignores them. Emptying `vault_schema` makes the old code
+re-run its train once, which puts the views back on `doc_id` alone.
+
+```sql
+-- rollback: documents contract -> 2d0457e
+DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
+ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_corpus_doc_id_fkey;
+ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_pkey;
+ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (doc_id, collection);
+ALTER TABLE documents ADD CONSTRAINT documents_doc_id_key UNIQUE (doc_id);
+ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_doc_id_fkey
+    FOREIGN KEY (doc_id) REFERENCES documents (doc_id);
+ALTER TABLE documents DROP CONSTRAINT documents_corpus_doc_id_key;
+DELETE FROM vault_schema;
+```
+
+Tested by `tests/integration/test_documents_contract.py` (the snippet above is read from this
+file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it).
 
 ### Migration (2026-11 bad_content per source)
 

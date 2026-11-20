@@ -536,6 +536,45 @@ def test_the_deployed_orchestrator_upsert_still_works_after_the_train(
                                "ORDER BY doc_id") == [("cb-1", 5), ("cb-2", 7), ("cb-3", 12)]
 
 
+def _readme_rollback_sql():
+    readme = (Path(__file__).parent.parent.parent / "README.md").read_text(encoding="utf-8")
+    start = readme.index("-- rollback: documents contract -> 2d0457e")
+    return readme[start:readme.index("```", start)]
+
+
+def test_the_readme_rollback_returns_to_the_2d0457e_keys(clean_db, tmp_path, monkeypatch):
+    from psycopg2.extras import execute_values
+
+    _build_pre_contract_database(clean_db)
+    run_ingest(monkeypatch, clean_db, tmp_path)                    # contract schema
+    _exec(clean_db, _readme_rollback_sql())
+    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)] == [
+        ("documents", "p", ["id"]),
+        ("documents", "u", ["doc_id"]),
+        ("rag_ingestions", "f", ["doc_id"]),
+        ("rag_ingestions", "p", ["doc_id", "collection"]),
+    ]
+    # No fingerprint: the 2d0457e code re-runs its own train once (views back
+    # on doc_id). That train succeeds on the rolled-back schema, twice.
+    assert fetch_all(clean_db, "SELECT count(*) FROM vault_schema") == [(0,)]
+    _exec(clean_db, PRE_CONTRACT_TRAIN)
+    _exec(clean_db, PRE_CONTRACT_TRAIN)
+    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)][1] == ("documents", "u", ["doc_id"])
+    # The 2d0457e upsert and the deployed orchestrator's run again.
+    conn = psycopg2.connect(clean_db)
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, PRE_CONTRACT_UPSERT, [(
+                "cb-1", CB, "ecb", "A1", "t1 again", None, None, "2022-07-21", 2022, "en",
+                "bank_site", None, None, "raw/x.pdf", None, None, None)])
+        conn.commit()
+    finally:
+        conn.close()
+    assert fetch_all(clean_db, "SELECT title FROM documents WHERE doc_id = 'cb-1'") == [
+        ("t1 again",)]
+    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-3", "c1", CB, "us", "e5", "v1", 2))
+
+
 # master 2d0457e's ingest.UPSERT_SQL, verbatim.
 PRE_CONTRACT_UPSERT = """
 INSERT INTO documents (

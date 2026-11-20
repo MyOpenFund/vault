@@ -108,6 +108,9 @@ services:
       RUNS_PATH: ${RUNS_PATH:-}
       DISCOVERY_ERRORS_PATH: ${DISCOVERY_ERRORS_PATH:-}
       # The corpus vocabulary (documents contract); empty = <DATA_DIR>/vocabulary.json.
+      # Manifest-dir layout (DATA_DIR is the manifest dir, as on the NAS): the file
+      # sits one level up, e.g. /cbdata/vocabulary.json. Invalid or newer-MINOR
+      # file: the whole run stops before connecting (README).
       VOCABULARY_PATH: ${VOCABULARY_PATH:-}
     volumes:
       - ${MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # the corpus data/ root: manifest/**/*.jsonl (+ legacy manifest.jsonl) plus cadence.jsonl, runs.jsonl, discovery_errors.jsonl — never raw/
