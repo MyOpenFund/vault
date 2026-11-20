@@ -126,7 +126,7 @@ Dropped and recreated by the DDL train whenever it runs (see [Schema migrations]
 
 | view | grain | what it answers |
 |---|---|---|
-| `runs_sources` | one row per (run, source) | the base for every runs-shaped question; no time window; defensive casts (garbage or out-of-range counters — more than 9 digits — → NULL, non-boolean `truncated` → FALSE, non-array `error_samples` → `[]`, non-array `sources` → no rows); `bad_content` is NULL when the producer did not report it |
+| `runs_sources` | one row per (run, source) | the base for every runs-shaped question; no time window; defensive casts (garbage, negative or out-of-range counters — more than 9 digits — → NULL, non-boolean `truncated` → FALSE, non-array `error_samples` → `[]`, non-array `sources` → no rows); `bad_content` is NULL when the producer did not report it |
 | `rag_backlog` | (document, collection) | documents missing from each collection seen in `rag_ingestions` — the campaign resume query. **Empty when `rag_ingestions` has no rows** |
 | `rag_backlog_any` | document | live documents in no collection at all — correct on a fresh deployment |
 | `source_health` | (corpus, source_code, doc_type) | expected (cadence) × observed (runs) per series |
@@ -355,6 +355,23 @@ For every consumer of the API, `vaultctl` and `vault-query`, in one place:
   REQUIRE_MANIFESTS is set` instead of a successful run of 0 rows. `REQUIRE_MANIFESTS` (1/true/
   yes, 0/false/no; default off) works for any ingestion service; the central-bank one keeps the
   historical behaviour (no manifest = a WARNING, the train and producer-file passes still run).
+
+### Migration (2026-11 Metabase runs guards)
+
+No table, no `.env` change, nothing to backfill. A malformed `runs` row (a counter past the int
+range, a float, a string, a negative; an object `sources`; a string `truncated`) no longer makes
+a card raise:
+
+- **Cards**: R3 and R5 read a `totals` counter as NULL unless it is 1–9 digits, a non-array
+  `sources` as empty and a non-boolean `truncated` as false; R6 now selects from `runs_sources`
+  (same columns; a non-array `error_samples` shows as `[]`). R3's `bad_content` no longer
+  admits a negative. After merging, re-apply the cards: `python metabase/apply.py`.
+- **View**: `runs_sources` reads a negative counter as NULL (it accepted `-?`), so a negative
+  `bad_content` can no longer offset a positive one and hide a bank from Q6. Only the view's
+  regex changes, but the train's text changed, so **the first ingestion run after deploying
+  re-runs the DDL train once** (views only: dropped and recreated, grants re-issued, the new
+  fingerprint recorded; no table altered), under the usual bounded lock wait (see
+  [Schema migrations](#schema-migrations)). Later runs skip it.
 
 ### Migration (2026-11 bad_content per source)
 

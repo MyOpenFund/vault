@@ -51,8 +51,16 @@ card on that dashboard has an `{{as_of}}` tag — so this is not a mis-wiring to
   disappears when the widget is empty, so the card falls back to *today* instead
   of to a frozen literal. `{{ref_date}}` (Q1, Q3) uses it.
 - Cards **read only**: no card creates or alters a schema object. The views they
-  and tables they use (`rag_backlog`, read by Q4, `runs_sources`, read by Q6, and
-  `ingestion_refusals`, read by Q7) belong to `ingestion/ingest.py`'s DDL train.
+  and tables they use (`rag_backlog`, read by Q4, `runs_sources`, read by Q6 and
+  R6, and `ingestion_refusals`, read by Q7) belong to `ingestion/ingest.py`'s DDL train.
+- **No bare cast on `runs` JSON.** One malformed row must not break a card, even
+  an old one (R3's casts run before its `DISTINCT ON`). Per-source fields: read
+  `runs_sources`, whose casts are guarded. `totals` counters: `CASE WHEN
+  r.totals ->> 'k' ~ '^[0-9]{1,9}$' THEN (r.totals ->> 'k')::int END` (a negative,
+  a float, a string or more than 9 digits → NULL); `sources`: `CASE WHEN
+  jsonb_typeof(r.sources) = 'array' THEN r.sources ELSE '[]'::jsonb END`; a JSON
+  boolean: a `CASE` on `jsonb_typeof(…) = 'boolean'` (not an `AND`, whose operand
+  order Postgres does not promise).
 - Dashboards are a 24-column grid; dashcards must not overlap.
 - **No `?` anywhere in a card's SQL.** Metabase reaches Postgres through pgjdbc,
   which reads a bare `?` in a native query as a positional placeholder, so the
