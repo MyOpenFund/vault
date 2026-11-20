@@ -1104,7 +1104,9 @@ def find_manifest_files(data_dir, env):
 #   UTF-16 surrogate, a NaN or an infinity, at any depth (`field` is the
 #   top-level extra key). Without it, one such line made the whole upsert
 #   page, hence the run, fail.
-#   An extra KEY that cannot be stored is shown as its repr in `field`.
+#   An extra KEY that cannot be stored is shown as its repr in `field`; a
+#   storable one is cut to REFUSAL_VALUE_CHARS characters (then "…"), as a
+#   value is.
 # - not_json: a non-blank line that is not a JSON object (a torn write, a
 #   UTF-8 BOM on line 1, a JSON array). It cannot be a row, but its document
 #   is "not seen" all the same, so it must skip the sweep like any refusal
@@ -1166,9 +1168,12 @@ def jsonb_storable(value):
     return True
 
 
-def stored_text(value):
-    """`value` when it is text Postgres can store, else its repr (shown_value)."""
-    return value if isinstance(value, str) and _storable_text(value) else shown_value(value)
+def stored_text(value, limit=REFUSAL_VALUE_CHARS):
+    """`value` when it is text Postgres can store, cut to `limit` characters
+    (then "…"), else its repr (shown_value)."""
+    if isinstance(value, str) and _storable_text(value):
+        return value if len(value) <= limit else value[:limit] + "…"
+    return shown_value(value, limit)
 
 
 def vault_refusals(checked):
@@ -1223,9 +1228,14 @@ class RunReport:
         for r in refusals:
             self.refusals[r.reason] += 1
             if r.reason == NOT_JSON:          # the raw line, not a value
-                field, value = None, stored_text(r.value[:REFUSAL_VALUE_CHARS])
-                shown = f"line={shown_value(r.value)}"
+                # Sliced first: a torn line can be megabytes long, and its
+                # repr would be built in full only to be cut.
+                head = r.value[:REFUSAL_VALUE_CHARS]
+                field, value = None, stored_text(head)
+                shown = f"line={shown_value(head)}"
             else:
+                # A contract field name, or a bad_extra key: any producer
+                # string, capped like a value.
                 field, value = stored_text(r.field), shown_value(r.value)
                 shown = f"{field}={value}"
             self.records.append((self.corpus, self.run_ts, name, line_num, stored_id,
@@ -1286,6 +1296,14 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
     """
     if report is None:
         report = RunReport(default_corpus, run_ts)
+    # str.strip() removes every Unicode whitespace character, not only ASCII
+    # ones: the information separators U+001C..U+001F, NEL U+0085, NBSP
+    # U+00A0, U+2028, U+3000, ... A line made of them alone is blank here, not
+    # not_json: it holds no JSON value, so it was never a document (a torn
+    # write keeps at least its "{"), and refusing it would only skip the
+    # sweep for nothing. The flip side, accepted: an object padded with such
+    # characters is read although strict JSON would refuse the padding. The
+    # checker (vault_contract.check) strips the same way, so both agree.
     line = line.strip()
     if not line:
         return None

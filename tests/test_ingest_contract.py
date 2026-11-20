@@ -195,12 +195,21 @@ def test_a_bad_extra_key_is_stored_and_logged_as_its_repr(key, caplog):
 
 
 def test_a_blank_corpus_takes_the_service_corpus():
-    for blank in ("",):
-        report = RunReport(CB, RUN_TS)
-        row = parse(cb_row(corpus=blank), report=report)
-        assert as_dict(row)["corpus"] == CB
-        report.commit_notices()
-        assert report.notices["corpus_missing"] == 1
+    report = RunReport(CB, RUN_TS)
+    row = parse(cb_row(corpus=""), report=report)
+    assert as_dict(row)["corpus"] == CB
+    report.commit_notices()
+    assert report.notices["corpus_missing"] == 1
+
+
+def test_a_long_storable_bad_extra_key_is_capped_like_a_value(caplog):
+    key = "k" * 5000
+    report = RunReport(CB, RUN_TS)
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        assert parse(json.dumps(cb_row(**{key: "a\u0000b"})), report=report) is None
+    (record,) = report.records
+    assert record[5:7] == ("bad_extra", "k" * REFUSAL_VALUE_CHARS + "…")
+    assert len(caplog.records[0].getMessage()) < 3 * REFUSAL_VALUE_CHARS
 
 
 def test_a_whitespace_corpus_is_refused_by_the_contract():
@@ -243,10 +252,29 @@ def test_a_not_json_line_holding_nul_is_stored_as_its_repr():
     assert report.records[0][7] == repr("{bad\x00line")
 
 
-def test_blank_lines_count_nowhere():
+@pytest.mark.parametrize("line", ["   ", "\t\r\n", "\x1c\x1d\x1e\x1f", "\x85", "\u00a0\u2028\u3000"])
+def test_blank_lines_count_nowhere(line):
+    """str.strip() blanks every Unicode whitespace character, the information
+    separators U+001C..U+001F and NEL U+0085 included: such a line holds no
+    JSON value, so it is not a document either (see parse_line)."""
     report = RunReport(CB, RUN_TS)
-    assert parse("   ", report=report) is None
+    assert parse(line, report=report) is None
     assert (report.rows_read, report.refused_rows) == (0, 0)
+
+
+def test_a_huge_not_json_line_is_cut_before_it_is_shown(caplog, monkeypatch):
+    line = "{" + "x" * 1_000_000
+    shown = []
+    real = ingest.shown_value
+    monkeypatch.setattr(ingest, "shown_value", lambda v, *a: shown.append(len(v)) or real(v, *a))
+    report = RunReport(CB, RUN_TS)
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        assert parse(line, report=report) is None
+    assert report.records[0][7] == line[:REFUSAL_VALUE_CHARS]
+    assert caplog.records[0].getMessage() == (
+        "manifest/ecb.jsonl:1 not_json line=" + repr(line[:REFUSAL_VALUE_CHARS])[:REFUSAL_VALUE_CHARS]
+        + "…")
+    assert max(shown) <= REFUSAL_VALUE_CHARS        # never the repr of the whole line
 
 
 # --- refusal rows and logs -----------------------------------------------------------
