@@ -224,3 +224,11 @@ def test_q7_refused_rows_sits_on_coverage_and_qc():
     # Every corpus at once: the card is the cross-corpus view, so it takes no
     # corpus tag and the dashboard's corpus filter does not drive it.
     assert card["tags"] == {} and q7["mappings"] == {}
+
+
+def test_the_json_files_keep_literal_characters():
+    """Both files are written as json.dumps(..., indent=2, ensure_ascii=False):
+    a hand edit reads `·` and `—`, not `\\u00b7` escapes."""
+    for name in ("cards.json", "dashboards.json"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert text == json.dumps(json.loads(text), indent=2, ensure_ascii=False) + "\n", name

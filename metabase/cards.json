@@ -1,8 +1,8 @@
 [
   {
     "code": "C0",
-    "name": "C0 \u00b7 Corpus KPIs",
-    "description": "KPI strip: live documents, banks, doc types, undated, soft-deleted and the date span of the corpus \u2014 the header context every other card is read against.",
+    "name": "C0 · Corpus KPIs",
+    "description": "KPI strip: live documents, banks, doc types, undated, soft-deleted and the date span of the corpus — the header context every other card is read against.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false
@@ -19,7 +19,7 @@
   },
   {
     "code": "C1",
-    "name": "C1 \u00b7 Documents by year",
+    "name": "C1 · Documents by year",
     "description": "Documents published per year (inventory #4, #2); undated rows are dropped here by construction and counted separately by C0.",
     "display": "bar",
     "visualization_settings": {
@@ -60,7 +60,7 @@
   },
   {
     "code": "C2",
-    "name": "C2 \u00b7 Documents by group (A\u2013G)",
+    "name": "C2 · Documents by group (A–G)",
     "description": "Documents per taxonomy group (inventory #4); the group letters are inlined as a VALUES list so an empty group renders as a zero bar instead of vanishing.",
     "display": "row",
     "visualization_settings": {
@@ -71,7 +71,7 @@
         "documents"
       ]
     },
-    "sql": "-- Documents by taxonomy group\nWITH groups (group_letter, group_label) AS (\n    VALUES ('A', 'Monetary policy \u2014 decisions & deliberation'),\n           ('B', 'Press conferences & transcripts'),\n           ('C', 'Speeches & interviews'),\n           ('D', 'Research'),\n           ('E', 'Reports'),\n           ('F', 'Projections'),\n           ('G', 'Supervisory / statistical')\n)\nSELECT g.group_letter,\n       g.group_label,\n       count(d.doc_id) AS documents\nFROM groups g\nLEFT JOIN documents d\n       ON left(d.doc_type, 1) = g.group_letter\n      AND d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      [[AND d.source_code = {{bank}}]]\n      [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\nGROUP BY 1, 2\nORDER BY 1;\n",
+    "sql": "-- Documents by taxonomy group\nWITH groups (group_letter, group_label) AS (\n    VALUES ('A', 'Monetary policy — decisions & deliberation'),\n           ('B', 'Press conferences & transcripts'),\n           ('C', 'Speeches & interviews'),\n           ('D', 'Research'),\n           ('E', 'Reports'),\n           ('F', 'Projections'),\n           ('G', 'Supervisory / statistical')\n)\nSELECT g.group_letter,\n       g.group_label,\n       count(d.doc_id) AS documents\nFROM groups g\nLEFT JOIN documents d\n       ON left(d.doc_type, 1) = g.group_letter\n      AND d.deleted_at IS NULL\n      AND d.corpus = {{corpus}}\n      [[AND d.source_code = {{bank}}]]\n      [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\nGROUP BY 1, 2\nORDER BY 1;\n",
     "tags": {
       "corpus": {
         "type": "text",
@@ -95,8 +95,8 @@
   },
   {
     "code": "C3",
-    "name": "C3 \u00b7 Cumulative corpus over time",
-    "description": "Monthly and cumulative document counts (inventory #4); the one card that drops undated documents on purpose \u2014 a cumulative curve cannot place them.",
+    "name": "C3 · Cumulative corpus over time",
+    "description": "Monthly and cumulative document counts (inventory #4); the one card that drops undated documents on purpose — a cumulative curve cannot place them.",
     "display": "line",
     "visualization_settings": {
       "graph.dimensions": [
@@ -137,8 +137,8 @@
   },
   {
     "code": "C4",
-    "name": "C4 \u00b7 Document explorer (with RAG state)",
-    "description": "Browsable document table with the official link and RAG state (inventory #3, #5, #2); rag_state any/in/out replaces the Streamlit \"only in the RAG\" toggle. Keep the LIMIT \u2014 the file download stays `vaultctl download <doc_id>`. `date_precision` / `date_kind` say how far `date` can be trusted (a year-precision date is 1 January) and `entity_value` names the entity the document is about (a CIK for `company`).",
+    "name": "C4 · Document explorer (with RAG state)",
+    "description": "Browsable document table with the official link and RAG state (inventory #3, #5, #2); rag_state any/in/out replaces the Streamlit \"only in the RAG\" toggle. Keep the LIMIT — the file download stays `vaultctl download <doc_id>`. `date_precision` / `date_kind` say how far `date` can be trusted (a year-precision date is 1 January) and `entity_value` names the entity the document is about (a CIK for `company`).",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false,
@@ -190,7 +190,7 @@
   },
   {
     "code": "C5",
-    "name": "C5 \u00b7 Inventory per bank \u00d7 doc_type",
+    "name": "C5 · Inventory per bank × doc_type",
     "description": "One row per (bank, type) series with total, active span, average and median per year (inventory #6); the median is zero-filled over the active span and `empty_years` makes that zero-filling visible.",
     "display": "table",
     "visualization_settings": {
@@ -220,8 +220,8 @@
   },
   {
     "code": "C6",
-    "name": "C6 \u00b7 Coverage matrix year \u00d7 doc_type",
-    "description": "Pivot-ready year \u00d7 type \u00d7 documents (inventory #7); kept as three long columns so a new doc_type appears on its own. Run it with a bank filter.",
+    "name": "C6 · Coverage matrix year × doc_type",
+    "description": "Pivot-ready year × type × documents (inventory #7); kept as three long columns so a new doc_type appears on its own. Run it with a bank filter.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": true,
@@ -252,7 +252,7 @@
   },
   {
     "code": "Q1",
-    "name": "Q1 \u00b7 Publication anomalies",
+    "name": "Q1 · Publication anomalies",
     "description": "Missing / low / exceptional yearly volume per (bank, type) against a zero-filled non-zero median baseline (inventory #9); all six knobs are parameters, not constants.",
     "display": "table",
     "visualization_settings": {
@@ -312,7 +312,7 @@
   },
   {
     "code": "Q2",
-    "name": "Q2 \u00b7 Upcoming & overdue",
+    "name": "Q2 · Upcoming & overdue",
     "description": "The watchdog's cadence snapshot for every (bank, type) series it knows (inventory #10). `snapshot_at` is surfaced as a column: cadence is a full-replace snapshot and stale data does not look stale.",
     "display": "table",
     "visualization_settings": {
@@ -342,7 +342,7 @@
   },
   {
     "code": "Q3",
-    "name": "Q3 \u00b7 Expected vs observed per year",
+    "name": "Q3 · Expected vs observed per year",
     "description": "Data-driven replacement for the hard-coded EXPECTED_PER_YEAR calendar (inventory #8): cadence's expectation against the last 3 years actually recorded. A triage list, not a verdict.",
     "display": "table",
     "visualization_settings": {
@@ -372,7 +372,7 @@
   },
   {
     "code": "Q4",
-    "name": "Q4 \u00b7 RAG backlog by bank \u00d7 type",
+    "name": "Q4 · RAG backlog by bank × type",
     "description": "Documents in the vault but not in the target collection, read from the `rag_backlog` view (inventory #3, inverse side); `needs_ocr` / `not_probed` make it double as the OCR work queue. Backlog 0 with C0's live_documents 0 means \"no data\", not \"done\".",
     "display": "table",
     "visualization_settings": {
@@ -402,8 +402,8 @@
   },
   {
     "code": "Q5",
-    "name": "Q5 \u00b7 Fetching problems",
-    "description": "Open discovery failures grouped by bank \u00d7 context \u00d7 error class (inventory #11), de-duplicated by fingerprint with `attempts` = summed occurrences.",
+    "name": "Q5 · Fetching problems",
+    "description": "Open discovery failures grouped by bank × context × error class (inventory #11), de-duplicated by fingerprint with `attempts` = summed occurrences.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false
@@ -432,7 +432,7 @@
   },
   {
     "code": "Q6",
-    "name": "Q6 \u00b7 Bad content per bank",
+    "name": "Q6 · Bad content per bank",
     "description": "Banks whose runs failed on documents that downloaded but were not the document (an HTML page served for a PDF, a stub, a truncated PDF), over the lookback window, from `runs_sources.bad_content` (a sub-count of `docs_failed`, reported by central-bank-corpus since 2026-11-19). Only banks with bad content are listed: empty is healthy. `runs_reporting` counts the runs that reported the counter at all; `docs_failed` is summed over those runs only, so `bad_content` / `docs_failed` compares like with like.",
     "display": "table",
     "visualization_settings": {
@@ -462,7 +462,7 @@
   },
   {
     "code": "Q7",
-    "name": "Q7 \u00b7 Refused rows by corpus and reason",
+    "name": "Q7 · Refused rows by corpus and reason",
     "description": "Manifest rows the vault ingestion refused at its last run of each corpus, per reason, read from `ingestion_refusals` (replaced at every run, so it always shows the last one; a corpus whose last run refused nothing has no row). Every corpus at once, so the dashboard's corpus filter does not apply. `refusals` counts one per defect, `refused_lines` one per line (a line with two defects counts under both reasons); `sample` is the first refusal in file order. Any row here means that run skipped its soft-delete sweep and exited 1.",
     "display": "table",
     "visualization_settings": {
@@ -473,7 +473,7 @@
   },
   {
     "code": "R1",
-    "name": "R1 \u00b7 Chunks by collection",
+    "name": "R1 · Chunks by collection",
     "description": "Documents and chunks recorded as ingested per collection and embedding model (inventory #1). Accepted loss: this is the vault's belief, not live Qdrant state.",
     "display": "table",
     "visualization_settings": {
@@ -491,7 +491,7 @@
   },
   {
     "code": "R2",
-    "name": "R2 \u00b7 RAG coverage by bank \u00d7 type",
+    "name": "R2 · RAG coverage by bank × type",
     "description": "How far along the RAG ingestion is per (bank, type) (inventory #3). Q4 answers \"what is left\"; this answers \"how far along\".",
     "display": "table",
     "visualization_settings": {
@@ -521,8 +521,8 @@
   },
   {
     "code": "R3",
-    "name": "R3 \u00b7 Last run per tool",
-    "description": "The most recent run of every producer with its totals and `age` \u2014 the silent-failure detector: a nightly tool whose last run is 3 days old is broken even when `outcome` says ok. `bad_content` (failed documents whose URL served the wrong bytes) is empty when the producer does not report it.",
+    "name": "R3 · Last run per tool",
+    "description": "The most recent run of every producer with its totals and `age` — the silent-failure detector: a nightly tool whose last run is 3 days old is broken even when `outcome` says ok. `bad_content` (failed documents whose URL served the wrong bytes) is empty when the producer does not report it.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false
@@ -532,7 +532,7 @@
   },
   {
     "code": "R4",
-    "name": "R4 \u00b7 Degraded / failed streaks",
+    "name": "R4 · Degraded / failed streaks",
     "description": "Gaps-and-islands over consecutive non-ok runs per tool: one bad night is noise, four in a row is an incident, and this card tells them apart.",
     "display": "table",
     "visualization_settings": {
@@ -556,8 +556,8 @@
   },
   {
     "code": "R5",
-    "name": "R5 \u00b7 Path-metadata trend",
-    "description": "Share of ingested documents whose metadata came from the file path rather than the manifest, per day and tool \u2014 a rising share is a silent quality regression. `jsonb_exists(totals, 'docs_path_metadata')` excludes runs from before the key existed.",
+    "name": "R5 · Path-metadata trend",
+    "description": "Share of ingested documents whose metadata came from the file path rather than the manifest, per day and tool — a rising share is a silent quality regression. `jsonb_exists(totals, 'docs_path_metadata')` excludes runs from before the key existed.",
     "display": "combo",
     "visualization_settings": {
       "graph.dimensions": [
@@ -589,8 +589,8 @@
   },
   {
     "code": "R6",
-    "name": "R6 \u00b7 Truncated sources",
-    "description": "Runs whose per-source listing stopped early (`truncated: true`) with the fetch-error counters and error samples \u2014 without this card the honest-discovery flag is invisible.",
+    "name": "R6 · Truncated sources",
+    "description": "Runs whose per-source listing stopped early (`truncated: true`) with the fetch-error counters and error samples — without this card the honest-discovery flag is invisible.",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false
