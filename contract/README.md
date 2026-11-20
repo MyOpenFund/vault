@@ -168,6 +168,7 @@ columns' first.
 | `missing_language` | `language` absent or `""` |
 | `missing_provenance` | `provenance` absent or `""` |
 | `bad_text` | a text column set to something else than a non-blank string without NUL or lone surrogate: a number (a CIK `320193` has lost its zeros), a list, an object, `"  "`, a NUL, an escaped `\ud800`; also a `doc_id` with leading or trailing whitespace; `field` names the column |
+| `too_long` | a text column past its cap; `field` names it. Identifiers and paths count UTF-8 bytes, other text characters: `doc_id`, `entity_value` ≤ 512 bytes (`MAX_ID_BYTES`); `corpus`, `source_code`, `doc_type`, `date_precision`, `date_kind`, `language`, `provenance`, `entity_scheme` ≤ 32 characters (`MAX_CODE_CHARS`, as a vocabulary code); `local_path` ≤ 4096 bytes and each segment ≤ 255 bytes (`MAX_PATH_BYTES`, `MAX_PATH_SEGMENT_BYTES`: Linux PATH_MAX and NAME_MAX); `title` ≤ 2000 characters (`MAX_TITLE_CHARS`); `document_url`, `source_url` ≤ 4096 characters (`MAX_URL_CHARS`). A too-long field is not judged further |
 | `corpus_conflict` | `corpus` present and not the ingesting service's corpus |
 | `unknown_source_code` | `source_code` not declared in the vocabulary |
 | `unknown_doc_type` | `doc_type` not declared in the vocabulary (a raw form such as `10-K` included) |
@@ -247,8 +248,9 @@ closed value sets and **both reason lists are part of the contract**:
   still written);
 - **PATCH**: documentation and fixes that change no accepted or refused row and no notice.
 
-`bad_extra` is part of 1.0.0: the extra check moved from the vault ingestion into the
-package before 1.0.0 was deployed anywhere, so no producer saw a release without it.
+`bad_extra` and `too_long` are part of 1.0.0: both were added (the extra check moved from
+the vault ingestion into the package) before 1.0.0 was deployed anywhere, so no producer saw
+a release without them.
 
 A reader accepts its own MAJOR and any MINOR at or below its own (`is_supported_version`): a
 vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know what 1.1 added.

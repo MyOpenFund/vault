@@ -26,7 +26,7 @@ from .vocabulary import Vocabulary
 # refused rows per reason: these strings are part of the contract.
 REASONS: tuple[str, ...] = (
     "missing_doc_id", "missing_corpus", "missing_source_code", "missing_doc_type",
-    "missing_language", "missing_provenance", "bad_text", "corpus_conflict",
+    "missing_language", "missing_provenance", "bad_text", "too_long", "corpus_conflict",
     "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
     "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
     "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
@@ -48,6 +48,43 @@ TEXT_COLUMNS: tuple[str, ...] = (
     "language", "provenance", "document_url", "source_url", "mime_type", "local_path",
     "entity_scheme", "entity_value",
 )
+
+# Length caps (too_long). Generous for real data, small enough that one row
+# cannot bloat an index entry (a btree entry holds ~2,700 bytes), a log line,
+# or a filesystem call. Identifiers and paths count UTF-8 bytes (what an index
+# and a filesystem see), free text and URLs characters.
+MAX_ID_BYTES = 512             # doc_id, entity_value
+MAX_CODE_CHARS = 32            # codes: as vocabulary.CODE_PATTERN allows ({1,32})
+MAX_PATH_BYTES = 4096          # local_path, whole (Linux PATH_MAX)
+MAX_PATH_SEGMENT_BYTES = 255   # local_path, each segment (Linux NAME_MAX)
+MAX_TITLE_CHARS = 2000
+MAX_URL_CHARS = 4096           # document_url, source_url
+
+_CODE_COLUMNS: tuple[str, ...] = (
+    "corpus", "source_code", "doc_type", "date_precision", "date_kind", "language",
+    "provenance", "entity_scheme",
+)
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def is_too_long(name: str, value: str) -> bool:
+    """Whether text `value` of column `name` is past its cap (see MAX_*)."""
+    if name in ("doc_id", "entity_value"):
+        return _utf8_len(value) > MAX_ID_BYTES
+    if name in _CODE_COLUMNS:
+        return len(value) > MAX_CODE_CHARS
+    if name == "local_path":
+        return (_utf8_len(value) > MAX_PATH_BYTES
+                or any(_utf8_len(s) > MAX_PATH_SEGMENT_BYTES for s in value.split("/")))
+    if name == "title":
+        return len(value) > MAX_TITLE_CHARS
+    if name in ("document_url", "source_url"):
+        return len(value) > MAX_URL_CHARS
+    return False
+
 
 _LANGUAGE = re.compile(r"[a-z]{2}")                     # ISO 639-1
 _ISO_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -149,6 +186,9 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
             refuse("bad_text", name)
     if ok("doc_id") and columns["doc_id"] != columns["doc_id"].strip():
         refuse("bad_text", "doc_id")             # an id is compared byte for byte
+    for name in TEXT_COLUMNS:
+        if ok(name) and is_too_long(name, columns[name]):
+            refuse("too_long", name)
 
     if ok("corpus") and columns["corpus"] != expected_corpus:
         refuse("corpus_conflict", "corpus")

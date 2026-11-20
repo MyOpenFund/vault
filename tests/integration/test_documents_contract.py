@@ -315,6 +315,23 @@ def _live(pg_url, corpus=CB):
                                         "AND corpus = %s", (corpus,))}
 
 
+def test_a_9000_character_doc_id_is_refused_not_a_crash(clean_db, tmp_path, monkeypatch, caplog):
+    """Before the too_long cap, an incompressible doc_id that long failed the
+    upsert ("index row requires ... bytes"), hence the whole run."""
+    import hashlib
+    huge = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(141))[:9000]
+    write_manifest(tmp_path / "manifest", "us.jsonl",
+                   [make_doc("d1"), make_doc(huge, title="t", local_path="raw/x.pdf"),
+                    make_doc("d2")])
+    with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert exc.value.code == 1
+    assert _live(clean_db) == {"d1", "d2"}
+    assert fetch_all(clean_db, "SELECT line, reason, field, length(value) FROM "
+                               "ingestion_refusals") == [(2, "too_long", "doc_id", 201)]
+    assert max(len(r.getMessage()) for r in caplog.records) < 1000     # the log line is capped
+
+
 def test_one_bad_doc_type_among_ten_is_refused_and_blocks_the_sweep(
     clean_db, tmp_path, monkeypatch, caplog
 ):

@@ -17,7 +17,8 @@ import pytest
 from vault_contract import golden
 from vault_contract.fields import split_row
 from vault_contract.validate import (
-    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, extra_refusals, quality_notices,
+    MAX_CODE_CHARS, MAX_ID_BYTES, MAX_PATH_BYTES, MAX_PATH_SEGMENT_BYTES, MAX_TITLE_CHARS,
+    MAX_URL_CHARS, NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, extra_refusals, quality_notices,
     validate_row,
 )
 from vault_contract.vocabulary import (
@@ -202,7 +203,7 @@ def test_every_refusal_reason_has_a_refused_golden_row():
 def test_reasons_are_the_decided_list():
     assert REASONS == (
         "missing_doc_id", "missing_corpus", "missing_source_code", "missing_doc_type",
-        "missing_language", "missing_provenance", "bad_text", "corpus_conflict",
+        "missing_language", "missing_provenance", "bad_text", "too_long", "corpus_conflict",
         "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
         "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
         "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
@@ -648,3 +649,61 @@ def test_extra_refusals_is_iterative_not_recursive():
     for _ in range(100_000):
         deep = [deep]
     assert [r.reason for r in extra_refusals({"deep": deep})] == ["bad_extra"]
+
+
+# --- too_long: length caps -------------------------------------------------------------
+
+def test_the_caps_are_the_decided_ones():
+    assert (MAX_ID_BYTES, MAX_CODE_CHARS, MAX_PATH_BYTES, MAX_PATH_SEGMENT_BYTES,
+            MAX_TITLE_CHARS, MAX_URL_CHARS) == (512, 32, 4096, 255, 2000, 4096)
+
+
+def _path(total_bytes):
+    """A plain relative path of exactly `total_bytes` bytes, segments of 200."""
+    segments, left = [], total_bytes
+    while left > 200:
+        segments.append("a" * 199)          # + "/"
+        left -= 200
+    segments.append("b" * left)
+    return "/".join(segments)
+
+
+CODE_FIELDS = ("source_code", "doc_type", "provenance", "corpus", "entity_scheme", "language",
+               "date_kind", "date_precision")
+
+
+@pytest.mark.parametrize("field, at_cap, over_cap", [
+    ("doc_id", "d" * 512, "d" * 513),
+    ("doc_id", "é" * 256, "é" * 256 + "d"),            # bytes, not characters
+    ("entity_value", "0" * 512, "0" * 513),
+    ("title", "t" * 2000, "t" * 2001),
+    ("document_url", "https://x.org/" + "u" * 4082, "https://x.org/" + "u" * 4083),
+    ("source_url", "https://x.org/" + "u" * 4082, "https://x.org/" + "u" * 4083),
+    ("local_path", _path(4096), _path(4097)),
+    ("local_path", "raw/" + "s" * 255, "raw/" + "s" * 256),
+    ("local_path", "raw/" + "é" * 127 + "s", "raw/" + "é" * 128),   # 256-byte segment
+] + [(f, None, "x" * 33) for f in CODE_FIELDS])
+def test_a_value_past_its_cap_is_too_long(field, at_cap, over_cap):
+    base = _golden("sec_form4")
+    corpus = base["corpus"]
+    if field == "corpus":
+        corpus = None
+    for value, refused in ((at_cap, False), (over_cap, True)):
+        if value is None:
+            continue
+        row = dict(base, **{field: value})
+        if field == "entity_value":
+            row["entity_scheme"] = "cik"
+        checked = check_row(row, None, expected_corpus=corpus or value)
+        reasons = [(r.reason, r.field) for r in checked.refusals]
+        if refused:
+            assert reasons == [("too_long", field)], reasons
+        else:
+            assert ("too_long", field) not in reasons, reasons
+
+
+def test_a_too_long_field_is_not_judged_further():
+    row = dict(_golden("sec_10k"), doc_type="X" * 40, language="e" * 40)
+    reasons = [(r.reason, r.field) for r in check_row(
+        row, VOCABULARIES["company"], expected_corpus="company").refusals]
+    assert reasons == [("too_long", "doc_type"), ("too_long", "language")]

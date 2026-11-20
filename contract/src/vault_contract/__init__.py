@@ -13,7 +13,8 @@ from .fields import (
     split_row,
 )
 from .validate import (
-    NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, extra_refusals, quality_notices,
+    MAX_CODE_CHARS, MAX_ID_BYTES, MAX_PATH_BYTES, MAX_PATH_SEGMENT_BYTES, MAX_TITLE_CHARS,
+    MAX_URL_CHARS, NOTICES, REASONS, CheckedRow, Notice, Refusal, check_row, extra_refusals, quality_notices,
     validate_row,
 )
 from .vocabulary import Vocabulary, is_supported_version, load_vocabulary, validate_vocabulary
@@ -22,7 +23,8 @@ CONTRACT_NAME = "documents"
 CONTRACT_VERSION = "1.0.0"
 
 __all__ = [
-    "COLUMNS", "CONTRACT_NAME", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "EXPECTED",
+    "COLUMNS", "CONTRACT_NAME", "MAX_CODE_CHARS", "MAX_ID_BYTES", "MAX_PATH_BYTES",
+    "MAX_PATH_SEGMENT_BYTES", "MAX_TITLE_CHARS", "MAX_URL_CHARS", "CONTRACT_VERSION", "DATE_KINDS", "DATE_PRECISIONS", "EXPECTED",
     "NOTICES", "REASONS", "REFUSED_WHEN_ABSENT", "TRANSITION_ALIASES", "CheckedRow", "Notice",
     "Refusal", "Vocabulary", "check_row", "extra_refusals", "is_supported_version", "load_vocabulary",
     "quality_notices", "split_row", "validate_row", "validate_vocabulary",
