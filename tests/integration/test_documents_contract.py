@@ -216,8 +216,8 @@ def test_a_2d0457e_database_gets_the_contract_schema_once_with_data_intact(
 def test_central_bank_date_facts_move_from_extra_to_their_columns(
     clean_db, tmp_path, monkeypatch
 ):
-    """The deploy-day ingestion: the same three documents, rows as producers
-    write them today (date facts beside the other fields, no corpus)."""
+    """The deploy-day ingestion: the same three documents, rows in the
+    contract form (date facts beside the other fields)."""
     _build_pre_contract_database(clean_db)
     write_manifest(tmp_path, "m.jsonl", [
         make_doc("cb-1", source="ecb", doc_type="A1", date="2022-07-21", year=2022,
@@ -235,16 +235,36 @@ def test_central_bank_date_facts_move_from_extra_to_their_columns(
     ]
 
 
-def test_the_golden_central_bank_legacy_row_lands_with_its_date_facts_in_columns(
-    clean_db, tmp_path, monkeypatch
+def test_the_golden_legacy_form_row_is_refused_and_blocks_the_sweep(
+    clean_db, tmp_path, monkeypatch, caplog
 ):
-    case = golden.accepted()["cb_legacy_form"]
-    write_manifest(tmp_path, "m.jsonl", [case["row"]])
+    """Transition over (PR 6): a producer still writing the pre-contract form
+    (no corpus, bank_code, a data/ path) gets its row refused, and the sweep
+    is skipped so the live rows it no longer lists survive."""
+    write_vocabulary(tmp_path, golden.vocabulary(CB))
+    write_manifest(tmp_path / "manifest", "jp.jsonl",
+                   [make_doc("d1", source="jp"), make_doc("gone", source="jp")])
     run_ingest(monkeypatch, clean_db, tmp_path)
-    ((precision, extra),) = fetch_all(clean_db, "SELECT date_precision, extra FROM documents")
-    assert precision == "month"
-    assert "date_precision" not in extra and "date_kind" not in extra
-    assert "bank_code" not in extra and "pdf_url" not in extra
+    assert _live(clean_db) == {"d1", "gone"}
+
+    legacy = golden.accepted()["cb_legacy_form"]["row"]
+    write_manifest(tmp_path / "manifest", "jp.jsonl", [make_doc("d1", source="jp"), legacy])
+    with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert exc.value.code == 1
+
+    assert _live(clean_db) == {"d1", "gone"}                          # nothing soft-deleted
+    assert _rows(clean_db, "SELECT count(*) FROM documents WHERE doc_id = %s",
+                 (legacy["doc_id"],)) == [(0,)]
+    assert fetch_all(clean_db, "SELECT source_file, line, doc_id, reason, field FROM "
+                               "ingestion_refusals ORDER BY reason") == [
+        ("manifest/jp.jsonl", 2, legacy["doc_id"], "bad_local_path", "local_path"),
+        ("manifest/jp.jsonl", 2, legacy["doc_id"], "missing_corpus", "corpus"),
+        ("manifest/jp.jsonl", 2, legacy["doc_id"], "missing_source_code", "source_code"),
+    ]
+    assert "sweep skipped: 1 refused rows" in caplog.text
+    for notice in ("corpus_missing", "legacy_alias"):
+        assert notice not in caplog.text
 
 
 def test_a_rag_row_whose_corpus_is_not_its_documents_stops_the_train(
@@ -478,10 +498,16 @@ def test_the_vocabulary_is_replaced_per_corpus(clean_db, tmp_path, monkeypatch):
 # --- fix wave after review -------------------------------------------------------
 
 
-def test_a_blank_corpus_is_written_under_the_service_corpus(clean_db, tmp_path, monkeypatch):
-    write_manifest(tmp_path, "m.jsonl", [make_doc("d1", corpus="")])
-    run_ingest(monkeypatch, clean_db, tmp_path)
-    assert fetch_all(clean_db, "SELECT corpus, doc_id FROM documents") == [(CB, "d1")]
+def test_a_blank_corpus_is_refused_not_written_under_the_service_corpus(
+    clean_db, tmp_path, monkeypatch
+):
+    write_manifest(tmp_path, "m.jsonl", [make_doc("d0"), make_doc("d1", corpus="")])
+    with pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert exc.value.code == 1
+    assert fetch_all(clean_db, "SELECT corpus, doc_id FROM documents") == [(CB, "d0")]
+    assert fetch_all(clean_db, "SELECT doc_id, reason, field FROM ingestion_refusals") == [
+        ("d1", "missing_corpus", "corpus")]
 
 
 @pytest.mark.parametrize("key", ["k\u0000", "\ud800"])

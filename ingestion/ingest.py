@@ -10,7 +10,7 @@ overrides), checks each line against the documents contract
 into the `documents` table keyed on (corpus, doc_id). A doc_id repeated inside
 one file keeps its last valid line, with a WARNING (vault #6). Documents belong
 to a corpus: the service-level CORPUS env var is the expected one, a manifest
-line without "corpus" takes it (transition), and a contradicting one is
+line without "corpus" is refused (missing_corpus), and a contradicting one is
 refused (corpus_conflict: this service is being fed another corpus's
 manifests — never guess).
 
@@ -1271,9 +1271,10 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
     """One manifest line -> an upsert row (UPSERT_COLUMNS order), or None.
 
     None for a blank line, and for a refused line: not a JSON object
-    (not_json), or refused by vault_contract.check_row (transition on, this
-    service's CORPUS expected, `vocabulary` None = codes not checked; its
-    bad_extra included). A refused line is recorded in `report` (counted, logged,
+    (not_json), or refused by vault_contract.check_row (transition=False: a
+    row without `corpus`, an old key such as `bank_code` and a `data/` prefix
+    are refused, not tolerated; this service's CORPUS expected; `vocabulary`
+    None = codes not checked; its bad_extra included). A refused line is recorded in `report` (counted, logged,
     kept for ingestion_refusals); an accepted row's notices are appended to
     `report.pending`, counted by commit_notices once the row is known to be
     upserted (after dedupe_rows). Unlike before the contract, a doc_id that
@@ -1302,18 +1303,15 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
         report.refuse(source_file, line_num, None, [Refusal(NOT_JSON, None, line)])
         return None
 
-    checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=True)
+    checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=False)
     refusals = checked.refusals
     if refusals:
         report.refuse(source_file, line_num, checked.columns.get("doc_id"), refusals)
         return None
     report.pending.append(checked.notices)
 
-    columns = dict(checked.columns)
-    if not columns["corpus"]:           # transition: absent or "", corpus_missing, CORPUS applies
-        columns["corpus"] = default_corpus
     extra = json.dumps(checked.extra) if checked.extra else None
-    return tuple(columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
+    return tuple(checked.columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
 
 
 INSERT_REFUSALS_SQL = """

@@ -5,8 +5,8 @@ The deploy-day shape: a database built and fingerprinted by the previous train
 provisioned, rows carrying URLs. The first run of the new code re-runs the
 train once (its text changed), renames the column in place without touching a
 value, recreates the views on the new name and re-issues the grants; the next
-run skips the train. Manifests not yet migrated still say `pdf_url`: the
-ingester maps it to document_url and never lets it fall into `extra`.
+run skips the train. Since the transition cleanup (PR 6) a manifest's
+`pdf_url` is no longer read as document_url: it is an ordinary extra.
 """
 
 import logging
@@ -168,23 +168,23 @@ def test_a_fresh_database_has_document_url_only(clean_db, tmp_path, monkeypatch)
         ("https://x.invalid/d1.pdf", None)]
 
 
-def test_legacy_pdf_url_manifest_rows_fill_document_url(clean_db, tmp_path, monkeypatch):
-    """Ingested onto a renamed pre-rename database: the NAS between the vault
-    deploy and the manifest migration."""
+def test_a_manifest_pdf_url_is_an_extra_not_document_url(clean_db, tmp_path, monkeypatch):
+    """Ingested onto a renamed pre-rename database: the old key is no longer
+    mapped (transition over), so it lands in `extra` like any unknown key."""
     _build_pre_rename_database(clean_db)
     write_manifest(tmp_path, "m.jsonl", [
-        make_doc("keep-1", pdf_url="https://x.invalid/1-moved.pdf"),            # legacy key only
+        make_doc("keep-1", pdf_url="https://x.invalid/1-moved.pdf"),            # old key only
         make_doc("keep-2", document_url="https://x.invalid/2.html",
-                 pdf_url="https://x.invalid/2-stale.pdf"),                     # new key wins
-        make_doc("keep-3", document_url="https://x.invalid/3.pdf"),            # migrated row
+                 pdf_url="https://x.invalid/2-stale.pdf"),                     # both keys
+        make_doc("keep-3", document_url="https://x.invalid/3.pdf"),            # contract row
         make_doc("new-1"),                                                     # no URL at all
     ])
     run_ingest(monkeypatch, clean_db, tmp_path)
 
     assert fetch_all(clean_db, "SELECT doc_id, document_url, extra FROM documents "
                                "ORDER BY doc_id") == [
-        ("keep-1", "https://x.invalid/1-moved.pdf", None),
-        ("keep-2", "https://x.invalid/2.html", None),
+        ("keep-1", None, {"pdf_url": "https://x.invalid/1-moved.pdf"}),
+        ("keep-2", "https://x.invalid/2.html", {"pdf_url": "https://x.invalid/2-stale.pdf"}),
         ("keep-3", "https://x.invalid/3.pdf", None),
         ("new-1", None, None),
     ]
