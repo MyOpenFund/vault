@@ -218,9 +218,10 @@ updated (deploy of 2026-11-20), so the transition code goes. One DDL train re-ru
   `(corpus, doc_id, collection)` serves an upsert now. No value is touched, no view changes
   (the train recreates them as on every train run), and a fresh database never gets the index.
 
-The ingestion checks rows with `check_row(..., transition=False)`: the three pre-contract
-forms read during the transition are now refused instead of tolerated with a notice
-(`corpus_missing`, `legacy_alias`, `legacy_data_prefix` are no longer logged by the vault):
+The ingestion checks rows with `check_row(..., transition=False)`: the pre-contract forms
+read during the transition are no longer tolerated with a notice (`corpus_missing`,
+`legacy_alias`, `legacy_data_prefix` are no longer logged by the vault). Three make the row
+refused; a lone `pdf_url` does not, it is an ordinary `extra` key:
 
 | Manifest row | Until this release | Now |
 |---|---|---|
@@ -231,7 +232,7 @@ forms read during the transition are now refused instead of tolerated with a not
 
 #### Breaking changes (2026-11 transition cleanup)
 
-- **Legacy manifest forms are refused.** A producer still writing `bank_code` instead of
+- **Three legacy manifest forms are refused.** A producer still writing `bank_code` instead of
   `source_code`, `data/` paths, or no `corpus` gets those rows refused (not written, stored in
   `ingestion_refusals`), and since any refused row skips the soft-delete sweep and makes the
   run exit 1, its corpus is no longer swept until it writes the contract form. Both producers
@@ -252,10 +253,36 @@ forms read during the transition are now refused instead of tolerated with a not
 - Gates (all met 2026-11-20): the last central-bank and company ingestions logged no
   `corpus_missing`, `legacy_alias` or `legacy_data_prefix` notice, and no orchestrator older
   than `2695b26` writes to `rag_ingestions`.
+- **Right before deploying**, re-check the gate on the manifests as they are now, judged as
+  the new ingestion will judge them, from wherever the `vault_contract` package is importable
+  (e.g. the NAS ingestion container, `--entrypoint python`; paths as that container sees them):
+
+  ```
+  python -m vault_contract.check /cbdata/manifest --corpus central-bank \
+      --vocabulary /cbdata/vocabulary.json --glob '**/*.jsonl' --no-transition
+  ```
+
+  Expect `refusals: 0` and exit 0. `--glob '**/*.jsonl'` reads the subdirectories too, as the
+  ingestion's manifest-directory layout does (the checker's default `*.jsonl` reads the top
+  level only). Same for the company corpus with `--corpus company` and its own manifest
+  directory and vocabulary. Alternatively, deploy after a nightly central-bank sync and
+  ingestion whose log shows none of the three notices.
 
 **Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
-ingestion once; its train text differs, so it re-runs and recreates the index. Nothing else
-to undo.
+ingestion once; its train text differs, so it re-runs and recreates the unique index on
+`rag_ingestions (doc_id, collection)`. Precondition: no collection holds the same `doc_id`
+under two corpora (possible once the index is gone, since the key is
+`(corpus, doc_id, collection)`):
+
+```sql
+SELECT count(*) FROM (
+    SELECT doc_id, collection FROM rag_ingestions
+    GROUP BY doc_id, collection HAVING count(*) > 1
+) twins;
+```
+
+must be 0. Otherwise the old train fails on the index (one transaction: nothing changes) and
+every ingestion run of the old tree exits 1 until those rows are resolved. Nothing else to undo.
 
 ### Migration (2026-11 documents contract)
 
@@ -280,8 +307,9 @@ must be 0. Otherwise the train stops with that count (one transaction: nothing c
 run fails. Measured: the train takes well under a second on 40k documents.
 
 **Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` absent or of
-another corpus, a pre-contract key or `data/` path since the
-[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a line that is
+another corpus, `bank_code` without `source_code` or a `data/` path since the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) — a lone
+`pdf_url` is not refused, it stays in `extra` with `document_url` NULL —, a line that is
 not a JSON object such as a torn write or a UTF-8 BOM on line 1, an `extra` value JSONB cannot
 hold) is not written, is logged as `file:line reason field=value`
 (the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
