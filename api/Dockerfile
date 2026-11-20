@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY query /tmp/query
 RUN pip install --no-cache-dir /tmp/query && rm -rf /tmp/query
 
-COPY api/main.py api/db.py api/models.py ./
+COPY api/main.py api/db.py api/files.py api/models.py ./
 
 EXPOSE 8000
 
