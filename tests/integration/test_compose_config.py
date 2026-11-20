@@ -9,6 +9,7 @@ host, and — by uncommenting them into a scratch copy — that the two commente
 and resolve to the loopback rather than to every interface.
 """
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -157,4 +158,17 @@ def test_the_company_ingestion_is_off_by_default_and_runs_in_its_profile():
     assert company["restart"] == "no"
     [volume] = company["volumes"]
     assert (volume["target"], volume["read_only"]) == ("/data", True)
-    assert volume["source"] == "/path/to/company-corpus-copy/data"
+    # .env.example leaves COMPANY_MANIFEST_DIR commented out: the fallback
+    # mount is an empty directory, and REQUIRE_MANIFESTS makes that run fail.
+    assert volume["source"] == "/var/empty"
+    assert env["REQUIRE_MANIFESTS"] == "1"
+    honoured = subprocess.run(
+        ["docker", "compose", "--project-directory", str(ROOT),
+         "--env-file", str(ROOT / ".env.example"), "--profile", "company",
+         "-f", str(COMPOSE), "config", "--format", "json"],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+        env={**os.environ, "COMPANY_MANIFEST_DIR": "/srv/company-corpus/data"},
+    )
+    assert honoured.returncode == 0, honoured.stderr
+    [volume] = json.loads(honoured.stdout)["services"]["ingestion-company"]["volumes"]
+    assert volume["source"] == "/srv/company-corpus/data"
