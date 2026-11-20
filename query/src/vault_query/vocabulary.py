@@ -19,7 +19,7 @@ MAX_MESSAGE_CODES = 500
 MAX_LABEL_CHARS = 80
 
 # The doc_type codes of every corpus: its declared vocabulary, or, for a corpus
-# absent from `vocabulary` (none loaded yet: transition), the codes its live
+# absent from `vocabulary` (none loaded yet), the codes its live
 # documents use. A corpus with a vocabulary is described by it alone.
 _CODES_SQL = """
 SELECT corpus, code, label, TRUE AS declared

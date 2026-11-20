@@ -1,4 +1,4 @@
-"""The common fields of a `documents` row and `split_row` (contract 1.0.0).
+"""The common fields of a `documents` row and `split_row` (contract 1.1.0).
 
 Every manifest line is one JSON object. The keys named in COLUMNS have one
 name and one meaning in every corpus and become typed columns in the vault;
@@ -14,8 +14,8 @@ COLUMNS: tuple[str, ...] = (
 )
 
 # Absent (None or "") -> the row is refused (missing_<field>). `corpus` is
-# listed because the contract requires it; during the transition its absence
-# is only a notice (corpus_missing) and the ingesting service's CORPUS applies.
+# listed because the contract requires it; with transition=True its absence
+# is only a notice (corpus_missing) and the caller's expected corpus applies.
 REFUSED_WHEN_ABSENT: tuple[str, ...] = (
     "doc_id", "corpus", "source_code", "doc_type", "language", "provenance",
 )
@@ -27,9 +27,10 @@ DATE_PRECISIONS: tuple[str, ...] = ("day", "month", "year")
 DATE_KINDS: tuple[str, ...] = ("publication", "meeting", "period")
 
 # Old key -> contract column. Transition only: with split_row(transition=True)
-# (the default until the cleanup PR flips it) the old key fills the column when
+# (the default, kept for the whole 1.x line) the old key fills the column when
 # the contract key is absent or blank and never lands in `extra`; with
-# transition=False it is an ordinary extra.
+# transition=False (how the vault ingests since 2026-11-20) it stays in
+# `extra`, where extra_refusals refuses it (legacy_key, since 1.1.0).
 TRANSITION_ALIASES: dict[str, str] = {"bank_code": "source_code", "pdf_url": "document_url"}
 
 # Transition only: central-bank manifests stored local_path relative to the
@@ -61,10 +62,10 @@ def split_row(row: Mapping, *, transition: bool = True) -> tuple[dict, dict]:
     `columns` has every name of COLUMNS, in order (None when absent); `extra`
     holds every other key of the row, values untouched. Blank optional values
     are None; an undated row loses its date_precision and date_kind (pass the
-    row to quality_notices to count each drop). With `transition` (the
-    default until the cleanup PR) the old keys of TRANSITION_ALIASES fill their
-    columns and leave `extra`, and a leading `data/` is stripped from
-    local_path. See validate_row for what is accepted.
+    row to quality_notices to count each drop). With `transition` (default
+    True, kept for the whole 1.x line; the vault passes False) the old keys of
+    TRANSITION_ALIASES fill their columns and leave `extra`, and a leading
+    `data/` is stripped from local_path. See validate_row for what is accepted.
     """
     if not isinstance(row, Mapping):
         raise TypeError(f"a manifest row is a JSON object, not {type(row).__name__}")

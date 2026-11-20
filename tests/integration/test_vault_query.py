@@ -788,7 +788,7 @@ def _write_vocabulary(directory, doc):
 def corpora_conn(clean_db, tmp_path, monkeypatch):
     """Three corpora through the real ingester: central-bank and company both
     declare `A1` (a rate decision, a 10-K), both hold a document `shared`;
-    `third` ships no vocabulary (transition), so only its codes in use exist."""
+    `third` ships no vocabulary, so only its codes in use exist."""
     from vault_contract import golden
 
     cb, co, third = tmp_path / "cb", tmp_path / "co", tmp_path / "third"

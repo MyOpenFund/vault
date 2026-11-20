@@ -96,6 +96,73 @@ def test_without_transition_a_legacy_row_is_refused(tmp_path, capsys):
     code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank", "--no-transition")
     assert code == 1
     assert "missing_corpus" in out and "missing_source_code" in out
+    assert "  legacy_key: 2" in out                     # bank_code and pdf_url
+
+
+def test_without_transition_a_lone_pdf_url_is_refused_with_one_hint_per_key(tmp_path, capsys):
+    """The row the vault would otherwise write with document_url NULL."""
+    from vault_contract import legacy_key_message
+    rows = []
+    for doc_id in ("a1", "a2"):
+        row = _row("cb_rate_decision")
+        row["doc_id"] = doc_id
+        row["pdf_url"] = row.pop("document_url")
+        rows.append(row)
+    _write(tmp_path, "ecb.jsonl", rows)
+    code, out, err = _run(capsys, tmp_path, "--corpus", "central-bank", "--no-transition")
+    assert code == 1
+    assert "  legacy_key: 2" in out
+    assert "ecb.jsonl:1 doc_id='a1' pdf_url='https://" in out
+    assert err.splitlines() == [f"note: {legacy_key_message('pdf_url')}"]
+
+
+@pytest.mark.parametrize("change, named", [
+    (lambda r: None, "corpus_missing, legacy_alias, legacy_data_prefix"),
+    (lambda r: r.update(corpus="central-bank", source_code=r.pop("bank_code"),
+                        document_url=r.pop("pdf_url")), "legacy_data_prefix"),
+    (lambda r: r.update(local_path=r["local_path"].removeprefix("data/")),
+     "corpus_missing, legacy_alias"),
+])
+def test_with_transition_a_legacy_form_prints_one_stderr_hint(tmp_path, capsys, change, named):
+    """The default (transition=True) accepts the pre-contract forms the vault
+    refuses: one stderr line says so; stdout and the exit code are unchanged."""
+    row = _row("cb_legacy_form")
+    change(row)
+    _write(tmp_path, "jp.jsonl", [row])
+    code, _, err = _run(capsys, tmp_path, "--corpus", "central-bank")
+    assert code == 0
+    hints = [line for line in err.splitlines() if "--no-transition" in line]
+    assert hints == [(f"note: {named} noticed: the vault ingests with transition=False and "
+                      "refuses these rows; run with --no-transition to judge as it does")]
+
+
+def test_the_transition_hint_is_silent_without_legacy_forms_or_with_no_transition(
+        tmp_path, capsys):
+    _write(tmp_path / "clean", "ecb.jsonl", [_row("cb_rate_decision")])
+    code, _, err = _run(capsys, tmp_path / "clean", "--corpus", "central-bank")
+    assert code == 0 and err == ""
+    _write(tmp_path / "legacy", "jp.jsonl", [_row("cb_legacy_form")])
+    code, out, err = _run(capsys, tmp_path / "legacy", "--corpus", "central-bank",
+                          "--no-transition")
+    assert code == 1
+    assert "  legacy_data_prefix: 1" in out      # noticed in both modes
+    assert "noticed" not in err and "beside" not in err   # only the legacy_key notes
+    assert len(err.splitlines()) == 2
+
+
+def test_with_transition_an_old_key_beside_its_contract_key_prints_a_stderr_hint(
+        tmp_path, capsys):
+    """transition=True drops an old key shadowed by its contract key without a
+    notice; the vault refuses the row (legacy_key): one stderr line says so."""
+    row = _row("cb_rate_decision")
+    row["pdf_url"] = "https://x.invalid/stale.pdf"
+    _write(tmp_path, "ecb.jsonl", [row])
+    code, out, err = _run(capsys, tmp_path, "--corpus", "central-bank")
+    assert code == 0 and "notices: 0" in out
+    assert err.splitlines() == [(
+        "note: 1 row(s) carry an old key (pdf_url) that transition=True drops without a "
+        "notice (beside its contract key, or blank): the vault ingests with transition=False "
+        "and refuses these rows (legacy_key); run with --no-transition to judge as it does")]
 
 
 def test_the_vocabulary_checks_codes(tmp_path, capsys):
@@ -298,3 +365,31 @@ def test_a_corpus_that_is_not_a_code_is_a_usage_error(tmp_path, capsys, corpus):
         main([str(tmp_path), "--corpus", corpus])
     assert exc.value.code == 2
     assert "--corpus" in capsys.readouterr().err
+
+
+def test_producer_files_and_hidden_files_are_skipped_as_the_ingestion_skips_them(
+        tmp_path, capsys):
+    """`--glob '**/*.jsonl'` over a manifest directory also matches the
+    producer's audit files and hidden files; the ingestion never reads them
+    as manifests (EXCLUDED_BASENAMES; glob skips dot files), nor does the
+    checker."""
+    from vault_contract.check import EXCLUDED_BASENAMES
+    _write(tmp_path / "m", "ecb.jsonl", [_row("cb_rate_decision")])
+    for name in EXCLUDED_BASENAMES:
+        (tmp_path / "m" / "sub").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "m" / name).write_text('{"not": "a row"}\n', encoding="utf-8")
+        (tmp_path / "m" / "sub" / name).write_text('{"not": "a row"}\n', encoding="utf-8")
+    (tmp_path / "m" / ".partial.jsonl").write_text("{torn\n", encoding="utf-8")
+    (tmp_path / "m" / ".git" / "x.jsonl").parent.mkdir()
+    (tmp_path / "m" / ".git" / "x.jsonl").write_text("{torn\n", encoding="utf-8")
+    code, out, _ = _run(capsys, tmp_path / "m", "--corpus", "central-bank",
+                        "--glob", "**/*.jsonl")
+    assert code == 0, out
+    assert "files: 1" in out and "rows: 1 (refused 0, with notices 0)" in out
+
+
+def test_the_excluded_basenames_are_the_producer_files():
+    from vault_contract.check import EXCLUDED_BASENAMES
+    assert EXCLUDED_BASENAMES == frozenset({
+        "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl", "discovery_errors.jsonl",
+        "download_errors.jsonl", "download_quarantine.jsonl", "wp_dates_index.jsonl"})

@@ -1,4 +1,4 @@
-"""The corpus vocabulary file (`vocabulary.json`, contract 1.0.0, spec §3.2).
+"""The corpus vocabulary file (`vocabulary.json`, contract 1.1.0, spec §3.2).
 
 Each producer writes one at its data root, generated from its own code: the
 codes its rows may use for `source_code`, `doc_type`, `provenance` and

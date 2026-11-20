@@ -93,8 +93,6 @@ def download_db(clean_db, tmp_path, monkeypatch):
             make_doc("good", local_path="raw/us/C1/2010/good.pdf"),
             make_doc("twin", local_path="raw/us/C1/2010/twin.pdf"),
             make_doc("symlinked", local_path="raw/link/secret.txt"),
-            # Transition: a pre-contract `data/` path, stored without the prefix.
-            make_doc("legacy", local_path="data/raw/us/C1/2010/good.pdf"),
         ],
     )
     run_ingest(monkeypatch, clean_db, manifests)
@@ -103,7 +101,7 @@ def download_db(clean_db, tmp_path, monkeypatch):
         make_doc("nofile", corpus="company", local_path="raw/0000320193/absent.pdf"),
     ])
     run_ingest(monkeypatch, clean_db, tmp_path / "company", corpus="company")
-    # The documents contract refuses these two at ingestion (bad_local_path),
+    # The documents contract refuses these three at ingestion (bad_local_path),
     # so they are written by hand: the API must stay safe against a stored
     # row the ingestion would refuse today (a row written before the
     # contract, or by hand).
@@ -271,11 +269,10 @@ def test_download_reads_each_corpus_under_its_own_root(download_db, client):
     assert (co.status_code, co.content) == (200, b"%PDF company twin\n")
 
 
-def test_download_of_a_transition_row(download_db, client):
-    """The ingestion stores a manifest's `data/raw/...` as `raw/...`, so such a
-    row is served; a row still holding `data/...` (ingested before the
-    deploy, until the first post-deploy run rewrites it) is not found."""
-    assert client.get("/documents/legacy/file").content == b"%PDF-1.4 fixture\n"
+def test_a_stored_data_prefixed_path_is_looked_up_as_is(download_db, client):
+    """The ingestion refuses a manifest's `data/raw/...` (bad_local_path); a
+    row still holding one (written before the contract, or by hand) is looked
+    up as stored, without compatibility code, and not found."""
     prefixed = client.get("/documents/prefixed/file")
     assert prefixed.status_code == 404
     assert prefixed.json()["detail"] == "File not found on disk: data/raw/us/C1/2010/good.pdf"
@@ -314,7 +311,7 @@ def test_get_document_and_doc_type_across_two_corpora(download_db, client):
     by_doc_type = client.get("/stats/summary").json()["by_doc_type"]
     # The hand-written rows have no doc_type: their NULL group is kept.
     assert {(i["corpus"], i["key"]): i["count"] for i in by_doc_type} == {
-        ("central-bank", "C1"): 4, ("central-bank", None): 3, ("company", "C1"): 2}
+        ("central-bank", "C1"): 3, ("central-bank", None): 3, ("company", "C1"): 2}
 
 
 def test_the_app_refuses_to_start_when_its_role_does_not_exist(clean_db, monkeypatch):

@@ -10,7 +10,7 @@ overrides), checks each line against the documents contract
 into the `documents` table keyed on (corpus, doc_id). A doc_id repeated inside
 one file keeps its last valid line, with a WARNING (vault #6). Documents belong
 to a corpus: the service-level CORPUS env var is the expected one, a manifest
-line without "corpus" takes it (transition), and a contradicting one is
+line without "corpus" is refused (missing_corpus), and a contradicting one is
 refused (corpus_conflict: this service is being fed another corpus's
 manifests — never guess).
 
@@ -80,7 +80,9 @@ from collections import Counter
 
 import psycopg2
 from psycopg2.extras import execute_values
-from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row
+from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row, legacy_key_message
+from vault_contract.check import EXCLUDED_BASENAMES
+from vault_contract.validate import LEGACY_KEY
 import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
@@ -409,14 +411,11 @@ BEGIN
     END LOOP;
 END $$;
 
--- TRANSITION (removed by the cleanup PR 6): the deployed data-orchestrator
--- upserts with ON CONFLICT (doc_id, collection), which needs a unique index on
--- exactly those columns. Keeping one lets it run between the vault deploy
--- and its own update. Valid only while collections are per corpus (a
--- collection never holds two corpora's documents); a mixed-corpus collection
--- needs this index gone first.
-CREATE UNIQUE INDEX IF NOT EXISTS rag_ingestions_doc_collection_transition
-    ON rag_ingestions (doc_id, collection);
+-- The documents-contract deploy (2026-11) kept a unique index on
+-- rag_ingestions (doc_id, collection) so the pre-contract data-orchestrator's
+-- ON CONFLICT (doc_id, collection) worked until its update. Every writer now
+-- uses (corpus, doc_id, collection): the index goes (a no-op once gone).
+DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
 
 CREATE INDEX IF NOT EXISTS idx_documents_doc_id ON documents (doc_id);
 -- Documents about one company (contract: entity = the company the document is about).
@@ -1000,12 +999,8 @@ MANIFEST_DIR_LAYOUT_GLOBS = ("**/*.jsonl",)
 # with the pre-allowlist scan); MANIFEST_GLOBS is taken literally:
 # the cadence snapshot and the watchdog's private state (ingest_cadence.py),
 # the runs telemetry (ingest_runs.py), the discovery-error trail
-# (ingest_discovery_errors.py), and three producer audit files.
-EXCLUDED_BASENAMES = frozenset({
-    "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
-    "discovery_errors.jsonl", "download_errors.jsonl",
-    "download_quarantine.jsonl", "wp_dates_index.jsonl",
-})
+# (ingest_discovery_errors.py), and three producer audit files. The set lives
+# in vault_contract.check, so the manifest checker skips the same files.
 
 
 def parse_manifest_globs(raw):
@@ -1195,6 +1190,7 @@ class RunReport:
         self.records = []           # ingestion_refusals rows
         self.unlogged = 0
         self.pending = []           # notices of each row parse_line returned, in order
+        self.legacy_keys = set()    # old keys refused legacy_key: one hint each
 
     def source_name(self, source_file):
         """The file as stored in ingestion_refusals: relative to DATA_DIR when under it."""
@@ -1213,6 +1209,8 @@ class RunReport:
         name = self.source_name(source_file)
         for r in refusals:
             self.refusals[r.reason] += 1
+            if r.reason == LEGACY_KEY:
+                self.legacy_keys.add(r.field)
             if r.reason == NOT_JSON:          # the raw line, not a value
                 # Sliced first: a torn line can be megabytes long, and its
                 # repr would be built in full only to be cut.
@@ -1260,6 +1258,8 @@ class RunReport:
             + (f" ({by_reason(self.notices)})" if self.notices else ""),
             f"sweep: {sweep}",
         ]
+        # What the producer must write instead, once per old key.
+        lines[1:1] = [f"{LEGACY_KEY}: {legacy_key_message(k)}" for k in sorted(self.legacy_keys)]
         if self.unlogged:
             lines.insert(1, f"refusals: {self.unlogged} more not logged one by one "
                             f"(REFUSAL_LOG_LIMIT={REFUSAL_LOG_LIMIT}); all are in ingestion_refusals")
@@ -1271,10 +1271,12 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
     """One manifest line -> an upsert row (UPSERT_COLUMNS order), or None.
 
     None for a blank line, and for a refused line: not a JSON object
-    (not_json), or refused by vault_contract.check_row (transition on, this
-    service's CORPUS expected, `vocabulary` None = codes not checked; its
-    bad_extra included). A refused line is recorded in `report` (counted, logged,
-    kept for ingestion_refusals); an accepted row's notices are appended to
+    (not_json), or refused by vault_contract.check_row (transition=False: a
+    row without `corpus`, a `bank_code` or `pdf_url` key (legacy_key) and a
+    `data/` prefix are refused, not tolerated; this service's CORPUS expected;
+    `vocabulary` None = codes not checked; its bad_extra included). A refused
+    line is recorded in `report` (counted, logged, kept for
+    ingestion_refusals); an accepted row's notices are appended to
     `report.pending`, counted by commit_notices once the row is known to be
     upserted (after dedupe_rows). Unlike before the contract, a doc_id that
     is not a string, a corpus that contradicts CORPUS or a line that is not
@@ -1302,18 +1304,15 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
         report.refuse(source_file, line_num, None, [Refusal(NOT_JSON, None, line)])
         return None
 
-    checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=True)
+    checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=False)
     refusals = checked.refusals
     if refusals:
         report.refuse(source_file, line_num, checked.columns.get("doc_id"), refusals)
         return None
     report.pending.append(checked.notices)
 
-    columns = dict(checked.columns)
-    if not columns["corpus"]:           # transition: absent or "", corpus_missing, CORPUS applies
-        columns["corpus"] = default_corpus
     extra = json.dumps(checked.extra) if checked.extra else None
-    return tuple(columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
+    return tuple(checked.columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
 
 
 INSERT_REFUSALS_SQL = """

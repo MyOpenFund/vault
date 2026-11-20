@@ -69,7 +69,21 @@ def test_upsert_conflicts_on_corpus_and_doc_id():
 # --- golden rows ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name, case", sorted(golden.accepted().items()))
+# Golden cases that describe the pre-contract manifest form, accepted by the
+# contract only with transition=True. The vault ingests with transition=False:
+# they are refused (missing_corpus, missing_source_code, bad_local_path,
+# legacy_key).
+LEGACY_FORM_CASES = {"cb_legacy_form"}
+
+
+def test_the_legacy_form_cases_are_the_ones_with_a_transition_notice():
+    transition_notices = {"corpus_missing", "legacy_alias", "legacy_data_prefix"}
+    assert {n for n, c in golden.accepted().items()
+            if transition_notices & set(c["expected_notices"])} == LEGACY_FORM_CASES
+
+
+@pytest.mark.parametrize("name, case", sorted(
+    (n, c) for n, c in golden.accepted().items() if n not in LEGACY_FORM_CASES))
 def test_every_golden_accepted_row_is_upserted_with_its_columns(name, case):
     report = RunReport(case["expected_corpus"], RUN_TS)
     row = parse(case["row"], corpus=case["expected_corpus"], report=report,
@@ -77,10 +91,7 @@ def test_every_golden_accepted_row_is_upserted_with_its_columns(name, case):
                     golden.vocabulary(case["expected_corpus"])))
     assert row is not None, report.refusals
     got = as_dict(row)
-    expected = dict(case["expected_columns"])
-    if expected["corpus"] is None:          # transition: the service's CORPUS applies
-        expected["corpus"] = case["expected_corpus"]
-    assert {k: got[k] for k in COLUMNS} == expected
+    assert {k: got[k] for k in COLUMNS} == case["expected_columns"]
     report.commit_notices()
     assert report.notices == Counter(case.get("expected_notices", []))
     assert report.refused_rows == 0
@@ -88,8 +99,18 @@ def test_every_golden_accepted_row_is_upserted_with_its_columns(name, case):
     assert not set(extra) & set(COLUMNS)
 
 
-@pytest.mark.parametrize("name, case", sorted(
-    (n, c) for n, c in golden.refused().items() if c.get("transition", True)))
+def test_the_golden_legacy_form_row_is_refused():
+    report = RunReport(CB, RUN_TS)
+    assert parse(golden.accepted()["cb_legacy_form"]["row"], report=report,
+                 vocabulary=cb_vocabulary()) is None
+    assert report.refusals == {"missing_corpus": 1, "missing_source_code": 1,
+                               "bad_local_path": 1, "legacy_key": 2}   # bank_code, pdf_url
+    assert report.refused_rows == 1
+    report.commit_notices()
+    assert report.notices == Counter()
+
+
+@pytest.mark.parametrize("name, case", sorted(golden.refused().items()))
 def test_every_golden_refused_row_is_refused_with_its_reasons(name, case):
     report = RunReport(case["expected_corpus"], RUN_TS)
     row = parse(case["row"], corpus=case["expected_corpus"], report=report,
@@ -117,12 +138,15 @@ def test_company_golden_row_fills_all_eighteen_columns():
 
 def test_central_bank_date_facts_leave_extra_for_their_columns():
     # Before the contract, date_precision/date_kind of a cb row landed in extra.
-    legacy = golden.accepted()["cb_legacy_form"]["row"]
-    row = as_dict(parse(legacy))
+    migrated = dict(golden.accepted()["cb_legacy_form"]["row"])
+    migrated["corpus"] = CB
+    migrated["source_code"] = migrated.pop("bank_code")
+    migrated["document_url"] = migrated.pop("pdf_url")
+    migrated["local_path"] = migrated["local_path"].removeprefix("data/")
+    row = as_dict(parse(migrated))
     assert row["date_precision"] == "month"
     extra = json.loads(row["extra"])
     assert "date_precision" not in extra and "date_kind" not in extra
-    assert "bank_code" not in extra and "pdf_url" not in extra
     assert extra["date_source"] == "repec"
     assert row["source_code"] == "jp" and row["local_path"].startswith("raw/")
 
@@ -135,7 +159,7 @@ def test_unknown_doc_type_is_refused_only_with_a_vocabulary():
     report = RunReport(CB, RUN_TS)
     assert parse(bad, vocabulary=cb_vocabulary(), report=report) is None
     assert report.refusals == {"unknown_doc_type": 1}
-    assert parse(bad, vocabulary=None) is not None       # transition: codes not checked
+    assert parse(bad, vocabulary=None) is not None       # no vocabulary file: codes not checked
 
 
 # --- the vault's own refusals ----------------------------------------------------
@@ -196,12 +220,12 @@ def test_a_bad_extra_key_is_stored_and_logged_as_its_repr(key, caplog):
     message.encode("utf-8")                           # a lone surrogate would raise here
 
 
-def test_a_blank_corpus_takes_the_service_corpus():
+def test_a_blank_corpus_is_refused_not_filled_with_the_service_corpus():
     report = RunReport(CB, RUN_TS)
-    row = parse(cb_row(corpus=""), report=report)
-    assert as_dict(row)["corpus"] == CB
+    assert parse(cb_row(corpus=""), report=report) is None
+    assert report.refusals == {"missing_corpus": 1}
     report.commit_notices()
-    assert report.notices["corpus_missing"] == 1
+    assert report.notices == Counter()
 
 
 def test_a_long_storable_bad_extra_key_is_capped_like_a_value(caplog):
@@ -351,12 +375,12 @@ def test_summary_lines_show_rows_refusals_notices_and_the_sweep():
     report.rows_read, report.upserted, report.duplicates = 12, 8, 1
     report.refused_rows = 3
     report.refusals.update({"unknown_doc_type": 1, "not_json": 2})
-    report.notices.update({"corpus_missing": 9, "empty_title": 1})
+    report.notices.update({"precision_not_stated": 9, "empty_title": 1})
     lines = report.summary_lines("skipped (3 refused rows)")
     assert lines == [
         "documents: 12 rows read, 8 upserted, 3 refused (not_json=2, unknown_doc_type=1), "
         "1 duplicate line(s) dropped",
-        "notices: 10 (corpus_missing=9, empty_title=1)",
+        "notices: 10 (precision_not_stated=9, empty_title=1)",
         "sweep: skipped (3 refused rows)",
     ]
 

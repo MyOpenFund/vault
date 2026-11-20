@@ -42,7 +42,7 @@ def _project():
 
 def test_contract_name_and_version():
     assert vault_contract.CONTRACT_NAME == "documents"
-    assert vault_contract.CONTRACT_VERSION == "1.0.0"
+    assert vault_contract.CONTRACT_VERSION == "1.1.0"
 
 
 def test_package_version_is_the_contract_version():
@@ -100,7 +100,7 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
                          check=True, capture_output=True, text=True, timeout=60)
     file_line, name_line, accepted, refused, vocabularies = out.stdout.splitlines()
     assert Path(file_line).is_relative_to(env_dir), file_line
-    assert name_line == "documents 1.0.0"
+    assert name_line == "documents 1.1.0"
     assert accepted.split() == sorted(vault_contract.golden.accepted())
     assert len(accepted.split()) == 6
     assert refused.split() == sorted(vault_contract.golden.refused())

@@ -140,16 +140,18 @@ def write_manifest(directory, name, docs):
 
 
 def make_doc(doc_id, source="us", **overrides):
+    """A central-bank manifest row in the contract form (pass corpus= for another)."""
     doc = {
         "doc_id": doc_id,
-        "bank_code": source,
+        "corpus": "central-bank",
+        "source_code": source,
         "doc_type": "C1",
         "title": f"doc {doc_id}",
         "date": "2010-01-13",
         "year": 2010,
         "language": "en",
         "provenance": "bis_index",
-        "local_path": f"data/raw/{source}/C1/2010/{doc_id}.pdf",
+        "local_path": f"raw/{source}/C1/2010/{doc_id}.pdf",
     }
     doc.update(overrides)
     return doc

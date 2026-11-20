@@ -1,6 +1,6 @@
 # vault-contract
 
-The MyOpenFund **`documents` contract**, version **1.0.0**: what a corpus writes on each line
+The MyOpenFund **`documents` contract**, version **1.1.0**: what a corpus writes on each line
 of its manifests, what its vocabulary file declares, and how the vault checks both.
 
 One contract for every corpus. Common fields have one name and one meaning everywhere and
@@ -41,7 +41,9 @@ checked.accepted    # not checked.refusals
 ```
 
 `check_row(row, vocabulary, *, expected_corpus, transition=True) -> CheckedRow` runs the
-three lower-level functions, which stay public for callers that need one step only:
+three lower-level functions, which stay public for callers that need one step only. Every
+`transition` argument defaults to `True` (see [The `transition` parameter](#the-transition-parameter));
+the vault ingests with `transition=False`.
 
 - `split_row(row, *, transition=True) -> (columns, extra)`: never refuses, never mutates
   `row` (data-orchestrator builds the RAG payload from it).
@@ -51,6 +53,8 @@ three lower-level functions, which stay public for callers that need one step on
   raises `ValueError`.
 - `quality_notices(columns, *, row, transition=True) -> list[Notice]`: takes the original
   `row` too, because what `split_row` mapped or dropped only shows there.
+- `extra_refusals(extra) -> list[Refusal]`: `legacy_key` and `bad_extra` (see the refusal table).
+- `legacy_key_message(key) -> str`: what to tell the producer of a row refused `legacy_key`.
 - `validate_vocabulary(doc) -> list[str]` and `load_vocabulary(doc) -> Vocabulary`.
 - `vault_contract.golden`: the reference rows below, shipped with the package.
 
@@ -62,7 +66,11 @@ python -m vault_contract.check <manifest_dir> --corpus central-bank \
 ```
 
 It reads files as the vault ingestion does (UTF-8; lines ended by `\n`, `\r\n` or `\r` only)
-and prints the count of refusals and notices per reason with up to 3 examples each. A
+and skips the files the ingestion never reads as manifests: hidden ones (a segment starting
+with `.`, as Python's `glob` skips them) and the producer files of `EXCLUDED_BASENAMES`
+(`cadence.jsonl`, `cadence_state.jsonl`, `runs.jsonl`, `discovery_errors.jsonl`,
+`download_errors.jsonl`, `download_quarantine.jsonl`, `wp_dates_index.jsonl`, at any depth;
+the ingestion imports this very set). It prints the count of refusals and notices per reason with up to 3 examples each. A
 non-blank line that is not a JSON object (a torn write, a JSON array, nesting or an integer
 too large to parse) is refused as `not_json`, as the vault ingestion refuses it. It also
 resolves `doc_id`s as the vault does: the last valid line of a `doc_id` wins, so every earlier
@@ -73,6 +81,15 @@ UTF-8 or starts with a UTF-8 BOM (the ingestion would refuse its first line as `
 no line that is a JSON object at all, an unreadable or invalid vocabulary, a vocabulary of
 another corpus.
 
+With the default `transition=True`, a run that notices `corpus_missing`, `legacy_alias` or
+`legacy_data_prefix` also prints one line on stderr: the vault refuses those rows (it ingests
+with `transition=False`: `missing_corpus`, `legacy_key`, `bad_local_path`); run again with
+`--no-transition` to judge as it does. A second line counts the rows carrying `bank_code` or
+`pdf_url` that `transition=True` drops without a notice (beside its contract key, or blank),
+which the vault refuses `legacy_key` too. With `--no-transition`, each old key refused
+`legacy_key` gets one stderr line (`legacy_key_message`): the contract key to write instead
+and the producer's manifest migration to rerun. Exit code and stdout are unchanged.
+
 ## Fields
 
 A manifest line is one JSON object. These 18 keys are the common fields. "When absent"
@@ -82,7 +99,7 @@ says what happens to a row without the field (absent, `null`, or `""`): **refuse
 | Field | Type | When absent | Rule | central-bank example | company example |
 |---|---|---|---|---|---|
 | `doc_id` | text | refused | Stable, **unique within its corpus**; the producer chooses its formula | `ceb04c0aa89ed888` (hash of bank, type, URL) | `cf0e49e6e176a851` (hash of CIK, form, accession) |
-| `corpus` | text | refused (notice `corpus_missing` during the transition) | Must equal the ingesting service's `CORPUS` | `central-bank` | `company` |
+| `corpus` | text | refused (with `transition=True` only a notice, `corpus_missing`) | Must equal the ingesting service's `CORPUS` | `central-bank` | `company` |
 | `source_code` | text | refused | The authority that publishes; declared in the corpus vocabulary | `ecb` | `sec` |
 | `doc_type` | text | refused | Declared in the corpus vocabulary; meaningful only with `corpus` | `A1` (rate decision) | `A1` (10-K) |
 | `title` | text | notice `empty_title` | Expected non-empty | `Monetary policy decisions` | `Apple Inc. 10-K (2024)` |
@@ -124,23 +141,31 @@ Rules around the table:
 - **`doc_type` belongs to its corpus.** central-bank `A1` (rate-decision press release) and
   company `A1` (10-K) share a code, not a meaning; a `doc_type` is always read with `corpus`.
 
-### Transition (`transition=True`, the switch the cleanup release flips)
+### The `transition` parameter
 
-Until every manifest is migrated, `transition=True` (the default everywhere) also reads, and
-notices each time:
+`check_row`, `split_row`, `validate_row`, `quality_notices` and `is_bad_local_path` take a
+keyword `transition`, **default `True`**; the checker runs with it unless given
+`--no-transition`. The default stays `True` for the whole 1.x line: flipping it would change
+which rows an existing caller accepts.
 
-- `bank_code` as `source_code` and `pdf_url` as `document_url`, when the contract key is
-  absent or blank; the old key never lands in `extra` (notice `legacy_alias`, `field` = the
-  old key);
-- a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`; a
-  bare `data/` is refused, not emptied);
-- a row without `corpus`: the ingesting service's `CORPUS` applies (`corpus_missing`).
+- `transition=True` also reads the pre-contract central-bank forms, and notices each time:
+  - `bank_code` as `source_code` and `pdf_url` as `document_url`, when the contract key is
+    absent or blank; the old key never lands in `extra` (notice `legacy_alias`, `field` = the
+    old key);
+  - a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`; a
+    bare `data/` is refused, not emptied);
+  - a row without `corpus`: the caller's expected corpus applies (`corpus_missing`).
+- `transition=False` is the contract proper: an old key is not mapped and the row carrying
+  it is refused `legacy_key`, whatever its value and even beside its contract key (a row with
+  `bank_code` only is also `missing_source_code`); a `data/` path is refused (`bad_local_path`,
+  still noticed), and a row without `corpus` is `missing_corpus`. Before 1.1.0 an old key was
+  an ordinary extra there: a row with `pdf_url` alone was accepted with `document_url` NULL,
+  and its upsert wiped the stored URL.
 
-The cleanup release passes `transition=False`: the old keys are then ordinary extras (so a
-row with `bank_code` only is `missing_source_code`), a `data/` path is refused
-(`bad_local_path`, still noticed), and a row without `corpus` is `missing_corpus`. Run the checker with `--no-transition` to see that future on
-today's manifests. Independently, a corpus without a vocabulary file is checked without
-membership (`vocabulary=None`).
+**The vault ingests with `transition=False`** since its transition cleanup (2026-11-20, after
+both corpora were migrated): a producer should check its manifests with `--no-transition`.
+`transition=True` stays for a third party still migrating its own manifests. Independently, a
+corpus without a vocabulary file is checked without membership (`vocabulary=None`).
 
 ## Two levels: refusals and notices
 
@@ -162,7 +187,7 @@ columns' first.
 | Reason | When |
 |---|---|
 | `missing_doc_id` | `doc_id` absent or `""` |
-| `missing_corpus` | `corpus` absent or `""`, once the transition is over (`transition=False`) |
+| `missing_corpus` | `corpus` absent or `""`, with `transition=False` (how the vault ingests) |
 | `missing_source_code` | `source_code` absent or `""` (checked with or without a vocabulary) |
 | `missing_doc_type` | `doc_type` absent or `""` |
 | `missing_language` | `language` absent or `""` |
@@ -182,6 +207,7 @@ columns' first.
 | `bad_sha256` | `sha256` not 64 lowercase hexadecimal characters |
 | `entity_half` | one of `entity_scheme` / `entity_value` without the other; `field` names the missing one |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
+| `legacy_key` | since 1.1.0, `transition=False` only: the row carries an old key (`bank_code`, `pdf_url`), whatever its value, even beside its contract key; `field` = the old key. `legacy_key_message(key)` names the contract key to write instead and the producer's manifest migration to rerun. With `transition=True` the old key is mapped (`legacy_alias`) or dropped, never refused |
 | `bad_extra` | an `extra` key or value a JSON database (Postgres JSONB, UTF-8) cannot store: a NUL character or a lone surrogate in a string or a key, a `NaN` or an infinity (Python's `json` writes them, JSON does not allow them), at any depth; one refusal per top-level key, `field` the key as written (a consumer storing it shows its repr when the key itself is the culprit) |
 
 Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every valid
@@ -199,9 +225,9 @@ value as the producer wrote it.
 
 | Reason | When |
 |---|---|
-| `corpus_missing` | transition: no `corpus`; the ingesting service's `CORPUS` applies |
-| `legacy_alias` | transition: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
-| `legacy_data_prefix` | `local_path` starts with `data/`: stripped during the transition, refused (`bad_local_path`) after it; noticed in both modes |
+| `corpus_missing` | `transition=True` only: no `corpus`; the caller's expected corpus applies |
+| `legacy_alias` | `transition=True` only: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
+| `legacy_data_prefix` | `local_path` starts with `data/`: stripped with `transition=True`, refused (`bad_local_path`) with `transition=False`; noticed in both modes |
 | `empty_title` | `title` absent, null or blank |
 | `precision_not_stated` | `date` set, `date_precision` absent or null |
 | `date_not_period_start` | `date_precision` `month` and the day is not 1, or `year` and the date is not 1 January |
@@ -242,18 +268,26 @@ closed value sets and **both reason lists are part of the contract**:
 
 - **MAJOR**: a renamed or removed field, a new mandatory field, a changed meaning, and **a
   new refusal reason** or a stricter refusal (rows accepted yesterday would be refused),
-  unless the release announces it as the end of a transition (the cleanup release flipping
-  `transition`);
+  unless the release announces it as the end of a transition (a consumer passing
+  `transition=False`, as the vault does since 2026-11-20, changes no contract version);
 - **MINOR**: a new optional field, a new allowed value, **a new notice reason** (rows are
-  still written);
+  still written), a new refusal reason given only with `transition=False` (the end of a
+  transition: no row accepted with the default is refused);
 - **PATCH**: documentation and fixes that change no accepted or refused row and no notice.
 
 `bad_extra` and `too_long` are part of 1.0.0: both were added (the extra check moved from
 the vault ingestion into the package) before 1.0.0 was deployed anywhere, so no producer saw
 a release without them.
 
+**1.1.0** (2026-11-20) adds the refusal reason `legacy_key`, MINOR by the rule above: it only
+fires with `transition=False`, so a 1.0.0 caller on the default `transition=True` sees no
+change. A consumer passing `transition=False` (the vault) now refuses rows it accepted: those
+carrying `bank_code` or `pdf_url`. A run report may count a reason a 1.0.0 reader does not list.
+
 A reader accepts its own MAJOR and any MINOR at or below its own (`is_supported_version`): a
-vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know what 1.1 added.
+vocabulary declaring `1.2.0` is refused by a 1.1.x reader, which cannot know what 1.2 added. A
+producer that upgrades the package and writes `CONTRACT_VERSION` into its vocabulary needs a
+vault on that version or later first.
 
 ## Golden examples
 
@@ -288,11 +322,14 @@ JSON Lines files (one case per line, `case` naming it):
   meeting`) without notice; `sec_form4` (a Form 4 about Apple, insider as `filer_*` extras,
   text artefact without mime_type nor precision); `cb_legacy_form` (the pre-contract
   central-bank form: `bank_code`, `pdf_url`, no `corpus`, `data/raw/...`, a RePEc month date
-  on the 12th, an empty title); `cb_undated` (no date, a leftover precision and kind);
+  on the 12th, an empty title; accepted with `transition=True` only: the vault, ingesting with
+  `transition=False`, refuses it `missing_corpus`, `missing_source_code`, `bad_local_path` and
+  twice `legacy_key`);
+  `cb_undated` (no date, a leftover precision and kind);
   `cb_rendered_html` (ECB speech rendered from HTML: `application/pdf`, `html_path` extra,
   `sha256` of the HTML);
 - `refused()` (`refused.jsonl`): exactly one case per refusal reason, with its
-  `expected_corpus`, `expected_reasons` and, for a case judged as after the cleanup,
+  `expected_corpus`, `expected_reasons` and, for a case judged with `transition=False`,
   `"transition": false`;
 - `vocabulary("company")`, `vocabulary("central-bank")`: the vocabulary excerpts they are
   checked against.

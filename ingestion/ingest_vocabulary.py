@@ -7,9 +7,9 @@ checks every row's codes against it, and this module mirrors it into the
 `vocabulary` table as a full replace for the service's corpus (the
 cadence.jsonl model, ingest_cadence.py), in one transaction.
 
-- Absent file: transition (spec §4.3). Code membership is not checked, the
-  run says so, and the table is left untouched (a file that disappears is not
-  a vocabulary that became empty).
+- Absent file (a corpus that ships no vocabulary yet, spec §4.3): code
+  membership is not checked, the run says so, and the table is left untouched
+  (a file that disappears is not a vocabulary that became empty).
 - Present but unreadable, invalid (vault_contract.validate_vocabulary) or of
   another corpus: the run fails before connecting (VocabularyError, exit 1):
   checking rows against a broken vocabulary would refuse or accept them on

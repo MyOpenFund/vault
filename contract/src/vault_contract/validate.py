@@ -1,10 +1,11 @@
-"""Two levels of checks on a manifest row (contract 1.0.0).
+"""Two levels of checks on a manifest row (contract 1.1.0).
 
 - Refusals (validate_row on the columns, extra_refusals on `extra`):
   structure, identity, and what a database cannot store. A refused row is not
   written, and the vault skips its soft-delete sweep for that run.
 - Notices (quality_notices): the row is written, the notice is counted (an
-  empty title, a date whose precision is not stated, a transition key read).
+  empty title, a date whose precision is not stated, an old key read with
+  transition=True).
 
 check_row runs split_row and both levels on one row: the entry point for a
 consumer. The lower-level functions stay public for callers that need one
@@ -29,8 +30,15 @@ REASONS: tuple[str, ...] = (
     "missing_language", "missing_provenance", "bad_text", "too_long", "corpus_conflict",
     "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
     "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
-    "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
+    "bad_sha256", "entity_half", "unknown_entity_scheme", "legacy_key", "bad_extra",
 )
+
+# legacy_key (1.1.0): the old keys of TRANSITION_ALIASES are refused by name
+# once the transition is over (transition=False, how the vault ingests). Read
+# as a plain extra, a row carrying `pdf_url` alone would be written with
+# document_url NULL, wiping a stored URL on upsert; never refused with
+# transition=True, where split_row maps or drops them.
+LEGACY_KEY = "legacy_key"
 
 # Every reason quality_notices can give, in check order. Counted by run
 # reports too; the row is written all the same.
@@ -155,11 +163,13 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
                  expected_corpus: str, transition: bool = True) -> list[Refusal]:
     """Every refusal of one split row ([] = accepted).
 
-    `vocabulary` None (the corpus has no vocabulary file yet, transition)
-    skips the membership checks (source_code, doc_type, provenance,
-    entity_scheme); every presence and shape check is kept. A vocabulary of
-    another corpus is a caller error: ValueError. With `transition`, a row
-    without `corpus` is accepted (quality_notices says corpus_missing).
+    `vocabulary` None (the corpus has no vocabulary file yet) skips the
+    membership checks (source_code, doc_type, provenance, entity_scheme);
+    every presence and shape check is kept. A vocabulary of another corpus is
+    a caller error: ValueError. With `transition` (default True; the vault
+    passes False), a row without `corpus` is accepted (quality_notices says
+    corpus_missing) and a `data/` local_path is not refused (split_row
+    stripped it).
     A field refused for presence or type is not judged further.
     `expected_corpus` must be a code (CODE_PATTERN): ValueError otherwise, so
     a row `corpus` that is not a code is always corpus_conflict (or bad_text).
@@ -267,15 +277,30 @@ def _storable(value: object) -> bool:
     return True
 
 
+def legacy_key_message(key: str) -> str:
+    """What to tell the producer of a row refused legacy_key for `key`."""
+    return (f"{key!r} is a pre-contract key, refused since the transition ended: write "
+            f"{TRANSITION_ALIASES[key]!r} instead. Rerun the producer's manifest migration "
+            "(its contract-migration command) to rewrite existing manifests, then check them "
+            "with --no-transition")
+
+
 def extra_refusals(extra: Mapping) -> list[Refusal]:
-    """One bad_extra refusal per top-level `extra` key whose key or value a
-    JSON database cannot store (see _storable), in row order ([] = fine).
+    """One refusal per bad top-level `extra` key, in row order ([] = fine):
+    legacy_key for an old key of TRANSITION_ALIASES (only split_row with
+    transition=False leaves one in `extra`), else bad_extra when the key or
+    its value is something a JSON database cannot store (see _storable).
 
     `field` is the top-level key as written (it may itself be the unstorable
     part: a consumer storing it shows its repr), `value` its value.
     """
-    return [Refusal("bad_extra", key, value) for key, value in extra.items()
-            if not (isinstance(key, str) and _storable_text(key) and _storable(value))]
+    refusals = []
+    for key, value in extra.items():
+        if key in TRANSITION_ALIASES:
+            refusals.append(Refusal(LEGACY_KEY, key, value))
+        elif not (isinstance(key, str) and _storable_text(key) and _storable(value)):
+            refusals.append(Refusal("bad_extra", key, value))
+    return refusals
 
 
 def _not_period_start(day: datetime.date, precision: object) -> bool:

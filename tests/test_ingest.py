@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from ingest import UPSERT_COLUMNS, RunReport, parse_line
 
 RUN_TS = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -10,16 +12,28 @@ CORPUS = "central-bank"
 def make_line(**overrides):
     obj = {
         "doc_id": "c184d44f298ff622",
-        "bank_code": "us",
+        "corpus": "central-bank",
+        "source_code": "us",
         "doc_type": "C1",
         "title": "Some speech",
         "date": "2010-01-13",
         "year": 2010,
         "language": "en",
         "provenance": "bis_index",
-        "local_path": "data/raw/us/C1/2010/c184d44f298ff622.pdf",
+        "local_path": "raw/us/C1/2010/c184d44f298ff622.pdf",
     }
     obj.update(overrides)
+    return json.dumps(obj)
+
+
+def legacy_line(**overrides):
+    """make_line in a pre-contract form: `overrides` set, None deletes a key."""
+    obj = json.loads(make_line())
+    for key, value in overrides.items():
+        if value is None:
+            obj.pop(key, None)
+        else:
+            obj[key] = value
     return json.dumps(obj)
 
 
@@ -28,21 +42,19 @@ def as_dict(row):
     return dict(zip(UPSERT_COLUMNS, row, strict=True))
 
 
+def refusals_of(line):
+    report = RunReport(CORPUS, RUN_TS)
+    assert parse_line(line, "f.jsonl", 1, RUN_TS, CORPUS, report=report) is None
+    return report.refusals
+
+
 def test_valid_line_parses():
     row = parse_line(make_line(), "f.jsonl", 1, RUN_TS, CORPUS)
     assert row is not None
     assert row[0] == "c184d44f298ff622"  # doc_id
-    assert row[1] == "central-bank"  # corpus (from default)
-    assert row[2] == "us"  # source_code (mapped from bank_code)
-    # transition: the data/ prefix of local_path is dropped (contract)
+    assert row[1] == "central-bank"  # corpus
+    assert row[2] == "us"  # source_code
     assert as_dict(row)["local_path"] == "raw/us/C1/2010/c184d44f298ff622.pdf"
-
-
-def test_source_code_field_takes_precedence_over_bank_code():
-    row = parse_line(
-        make_line(source_code="ecb"), "f.jsonl", 1, RUN_TS, CORPUS
-    )
-    assert row[2] == "ecb"
 
 
 def test_manifest_corpus_field_matching_env_is_accepted():
@@ -51,6 +63,32 @@ def test_manifest_corpus_field_matching_env_is_accepted():
     )
     assert row is not None
     assert row[1] == "central-bank"
+
+
+@pytest.mark.parametrize("corpus", [None, ""])
+def test_a_line_without_corpus_is_refused(corpus):
+    # The 2026-11 transition is over: the service's CORPUS no longer fills an
+    # absent or empty corpus.
+    assert refusals_of(legacy_line(corpus=None) if corpus is None
+                       else make_line(corpus=corpus)) == {"missing_corpus": 1}
+
+
+def test_a_whitespace_corpus_is_refused():
+    assert sum(refusals_of(make_line(corpus="  ")).values()) == 1
+
+
+def test_bank_code_is_no_longer_read_as_source_code():
+    assert refusals_of(legacy_line(source_code=None, bank_code="us")) == {
+        "missing_source_code": 1, "legacy_key": 1}
+
+
+def test_bank_code_beside_source_code_is_refused_as_a_legacy_key():
+    assert refusals_of(make_line(bank_code="fr")) == {"legacy_key": 1}
+
+
+def test_a_data_prefixed_local_path_is_refused():
+    assert refusals_of(make_line(local_path="data/raw/us/C1/2010/c184d44f298ff622.pdf")) == {
+        "bad_local_path": 1}
 
 
 def test_contradicting_corpus_is_a_refusal():
@@ -82,35 +120,44 @@ def test_document_url_fills_the_column():
     assert row[-1] is None  # no extra
 
 
-def test_legacy_pdf_url_fills_document_url_and_stays_out_of_extra():
-    # Transition (2026-11 rename): manifests not yet migrated still say pdf_url.
-    row = parse_line(make_line(pdf_url="https://x.invalid/old.pdf"),
-                     "f.jsonl", 1, RUN_TS, CORPUS)
-    assert row[DOCUMENT_URL] == "https://x.invalid/old.pdf"
-    assert row[-1] is None  # pdf_url never falls into extra
+def test_a_lone_pdf_url_is_refused_never_written_with_document_url_null():
+    # pdf_url was the name of document_url until 2026-11-19. Written as an
+    # extra, the row's upsert would set document_url NULL over the stored URL.
+    report = RunReport(CORPUS, RUN_TS)
+    assert parse_line(make_line(pdf_url="https://x.invalid/old.pdf"),
+                      "f.jsonl", 1, RUN_TS, CORPUS, report=report) is None
+    assert report.refusals == {"legacy_key": 1}
+    assert report.records[0][5:] == ("legacy_key", "pdf_url", "'https://x.invalid/old.pdf'")
 
 
-def test_document_url_wins_over_legacy_pdf_url():
-    row = parse_line(
-        make_line(document_url="https://x.invalid/new.html", pdf_url="https://x.invalid/old.pdf"),
-        "f.jsonl", 1, RUN_TS, CORPUS,
-    )
-    assert row[DOCUMENT_URL] == "https://x.invalid/new.html"
-    assert row[-1] is None
+def test_document_url_beside_pdf_url_is_refused_as_a_legacy_key():
+    assert refusals_of(make_line(document_url="https://x.invalid/new.html",
+                                 pdf_url="https://x.invalid/old.pdf")) == {"legacy_key": 1}
 
 
-def test_null_document_url_falls_back_to_legacy_pdf_url():
-    # Same rule as source_code / bank_code: an absent or empty new key defers.
-    row = parse_line(make_line(document_url=None, pdf_url="https://x.invalid/old.pdf"),
-                     "f.jsonl", 1, RUN_TS, CORPUS)
-    assert row[DOCUMENT_URL] == "https://x.invalid/old.pdf"
+def test_the_run_summary_says_once_per_old_key_what_to_write_instead():
+    from vault_contract import legacy_key_message
+    report = RunReport(CORPUS, RUN_TS)
+    for n in (1, 2):
+        parse_line(make_line(doc_id=f"d{n}", pdf_url="https://x.invalid/old.pdf"),
+                   "f.jsonl", n, RUN_TS, CORPUS, report=report)
+    parse_line(make_line(doc_id="d3", bank_code="fr"), "f.jsonl", 3, RUN_TS, CORPUS,
+               report=report)
+    lines = report.summary_lines("skipped")
+    assert [line for line in lines if line.startswith("legacy_key: ")] == [
+        f"legacy_key: {legacy_key_message('bank_code')}",
+        f"legacy_key: {legacy_key_message('pdf_url')}"]
 
 
-def test_an_empty_url_under_either_key_is_null():
-    # A manifest's "" under the legacy key must not change meaning when it migrates.
-    for line in (make_line(pdf_url=""), make_line(document_url=""),
-                 make_line(document_url="", pdf_url="")):
-        assert parse_line(line, "f.jsonl", 1, RUN_TS, CORPUS)[DOCUMENT_URL] is None
+def test_the_ingestion_excludes_the_checkers_producer_files():
+    """One list: the checker skips the files the ingestion never reads."""
+    import ingest
+    from vault_contract import check
+    assert ingest.EXCLUDED_BASENAMES is check.EXCLUDED_BASENAMES
+
+
+def test_an_empty_document_url_is_null():
+    assert parse_line(make_line(document_url=""), "f.jsonl", 1, RUN_TS, CORPUS)[DOCUMENT_URL] is None
 
 
 def test_no_url_at_all_leaves_document_url_null():
@@ -229,8 +276,6 @@ def test_lock_keys_are_distinct_per_corpus_and_from_the_ddl_lock():
 # doc_id that is not a non-empty string is therefore refused at parse time:
 # before the contract a skipped line counted `invalid_doc_id`, now a contract
 # refusal (bad_text, missing_doc_id) that skips the sweep and fails the run.
-
-import pytest  # noqa: E402
 
 
 @pytest.mark.parametrize("bad, reason", [

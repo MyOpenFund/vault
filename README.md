@@ -78,12 +78,12 @@ Write contract (`data-orchestrator` is the only writer):
         embedding_version = EXCLUDED.embedding_version,
         chunk_count = EXCLUDED.chunk_count, ingested_at = now();
 
-**Transitional:** the deployed data-orchestrator still writes `ON CONFLICT (doc_id, collection)`
-(the key before the [documents contract](#migration-2026-11-documents-contract)). The unique
-index `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps that form working
-until the orchestrator is updated; it is removed **in code**, by the cleanup PR's DDL train,
-never by hand (a hand-dropped index breaks the old orchestrator still running, and the train
-would not know it is gone). New writers use the key above.
+The pre-contract key `ON CONFLICT (doc_id, collection)` no longer works: the transitional
+unique index `rag_ingestions_doc_collection_transition (doc_id, collection)` that served it
+during the documents-contract deploy is dropped by the DDL train (see
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup)), and such a
+statement now fails with `there is no unique or exclusion constraint matching the ON CONFLICT
+specification`, writing nothing.
 
 "Documents not yet in the RAG" is the anti-join on this table; drift between the vault and Qdrant becomes a SQL query. Cross-model history lives in the collection dimension: each re-embed campaign targets a fresh collection.
 
@@ -207,6 +207,102 @@ with `VAULT_DDL_FORCE=1`. Two services on different code versions against the sa
 alternately, each time the other one has recorded its own — the nightly lock convoy comes back
 until both run the same tree.
 
+### Migration (2026-11 documents contract transition cleanup)
+
+Both corpora are migrated to the [documents contract](contract/README.md) and every reader is
+updated (deploy of 2026-11-20), so the transition code goes. One DDL train re-run:
+
+- `DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition`: the unique index on
+  `rag_ingestions (doc_id, collection)` that kept the pre-contract data-orchestrator's
+  `ON CONFLICT (doc_id, collection)` working. Only the contract's key
+  `(corpus, doc_id, collection)` serves an upsert now. No value is touched, no view changes
+  (the train recreates them as on every train run), and a fresh database never gets the index.
+
+The ingestion checks rows with `check_row(..., transition=False)` (vault-contract 1.1.0): the
+pre-contract forms read during the transition are no longer tolerated with a notice
+(`corpus_missing`, `legacy_alias`, `legacy_data_prefix` are no longer logged by the vault).
+Every one makes the row refused:
+
+| Manifest row | Until this release | Now |
+|---|---|---|
+| no `corpus`, or `""` | the service's `CORPUS` applies, notice `corpus_missing` | refused, `missing_corpus` |
+| `bank_code` (no `source_code`) | read as `source_code`, notice `legacy_alias` | refused, `legacy_key` and `missing_source_code` |
+| `pdf_url` (no `document_url`) | read as `document_url`, notice `legacy_alias` | refused, `legacy_key` |
+| `bank_code` or `pdf_url` beside its contract key (any value, even null) | the old key dropped, no notice | refused, `legacy_key` |
+| `local_path` starting with `data/` | prefix stripped, notice `legacy_data_prefix` | refused, `bad_local_path` |
+
+`legacy_key` (new in vault-contract 1.1.0) refuses an old key by name rather than storing it as
+an `extra`: a row carrying `pdf_url` alone would otherwise be upserted with `document_url` NULL,
+wiping the stored URL. The run summary adds one line per old key seen, naming the contract key
+to write instead and the producer's manifest migration to rerun.
+
+#### Breaking changes (2026-11 transition cleanup)
+
+- **The legacy manifest forms are refused.** A producer still writing `bank_code` or `pdf_url`
+  (even beside `source_code` / `document_url`), `data/` paths, or no `corpus` gets those rows
+  refused (not written, stored in
+  `ingestion_refusals`), and since any refused row skips the soft-delete sweep and makes the
+  run exit 1, its corpus is no longer swept until it writes the contract form. Both producers
+  write it since the 2026-11-20 migration (`migrate-contract` in each producer repo).
+- `ingestion_refusals.reason` (and Metabase card Q7, which groups by it) can hold a new
+  value, `legacy_key`; nothing enumerates the reasons, so no schema or card change.
+- The pre-contract data-orchestrator (before `2695b26`) fails on `rag_ingestions`
+  (`ON CONFLICT (doc_id, collection)`: no matching constraint).
+- Producers checking their manifests with `python -m vault_contract.check` should pass
+  `--no-transition`: that is how the vault ingests (the checker's default stays
+  `transition=True`, see the [contract README](contract/README.md#the-transition-parameter)).
+
+#### Deploy notes (2026-11 transition cleanup)
+
+- **One DDL train re-run**, nothing else: deploy the tree and run each ingestion once as usual;
+  the first run logs `DDL train running: train changed (recorded d96f2c37d33a, code …)` and drops
+  the index. No `.env`, compose, API, MCP or Metabase change.
+- Gates (all met 2026-11-20): the last central-bank and company ingestions logged no
+  `corpus_missing`, `legacy_alias` or `legacy_data_prefix` notice, and no orchestrator older
+  than `2695b26` writes to `rag_ingestions`.
+- **Right before deploying**, re-check the gate on the manifests as they are now, judged as
+  the new ingestion will judge them (`--no-transition`: it also catches a `pdf_url` or
+  `bank_code` left in a row, which no transition notice reveals when the contract key is
+  there too), inside the ingestion containers of the **new** tree (built or bind-mounted, so
+  that the checker is 1.1.0; paths as each container sees them on the NAS, where the
+  central-bank data is mounted at `/cbdata`; with this repo's `compose.yaml` the
+  `ingestion` paths are `/data/manifest` and `/data/vocabulary.json`):
+
+  ```
+  docker compose run --rm --no-deps --entrypoint python ingestion -m vault_contract.check \
+      /cbdata/manifest --corpus central-bank --vocabulary /cbdata/vocabulary.json \
+      --glob '**/*.jsonl' --no-transition
+  docker compose run --rm --no-deps --entrypoint python ingestion-company -m vault_contract.check \
+      /data/manifest --corpus company --vocabulary /data/vocabulary.json --no-transition
+  ```
+
+  Expect `refusals: 0` and exit 0 for both. `--no-deps` keeps Postgres out of it (the checker
+  is read-only and opens no connection). Central bank: `--glob '**/*.jsonl'` reads the
+  subdirectories too, as the ingestion's manifest-directory layout does; it would also match a
+  producer's non-manifest file landing there (`download_errors.jsonl`, ...), which the checker
+  skips, as the ingestion does (`EXCLUDED_BASENAMES`, shared), along with hidden files.
+  Company: `ingestion-company` reads `manifest/*.jsonl` at the top level only
+  (`MANIFEST_GLOBS`), which is the checker's default glob; under a `MANIFEST_GLOBS` override
+  the ingestion does not apply `EXCLUDED_BASENAMES`, so keep only manifests in `manifest/`.
+  This `--no-transition` run is the only sufficient gate: a nightly log without transition
+  notices is not, since an old key beside its contract key raises no notice.
+
+**Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
+ingestion once; its train text differs, so it re-runs and recreates the unique index on
+`rag_ingestions (doc_id, collection)`. Precondition: no collection holds the same `doc_id`
+under two corpora (possible once the index is gone, since the key is
+`(corpus, doc_id, collection)`):
+
+```sql
+SELECT count(*) FROM (
+    SELECT doc_id, collection FROM rag_ingestions
+    GROUP BY doc_id, collection HAVING count(*) > 1
+) twins;
+```
+
+must be 0. Otherwise the old train fails on the index (one transaction: nothing changes) and
+every ingestion run of the old tree exits 1 until those rows are resolved. Nothing else to undo.
+
 ### Migration (2026-11 documents contract)
 
 The ingestion checks every manifest row against the [documents contract](contract/README.md)
@@ -216,11 +312,10 @@ The ingestion checks every manifest row against the [documents contract](contrac
   `UNIQUE (doc_id)` → `UNIQUE (corpus, doc_id)`; a plain index on `doc_id` for lookups by
   `doc_id` alone; an index on `(entity_scheme, entity_value)`.
 - `rag_ingestions`: primary key `(corpus, doc_id, collection)`, foreign key `(corpus, doc_id)`;
-  the backlog views join on both. **Transition:** a unique index
-  `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps the deployed
-  data-orchestrator's `ON CONFLICT (doc_id, collection)` working until its update (valid while
-  collections are per corpus; removed in code by the cleanup PR's train, never by hand — see
-  [Table `rag_ingestions`](#table-rag_ingestions)).
+  the backlog views join on both. Until the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a unique index
+  `rag_ingestions_doc_collection_transition (doc_id, collection)` kept the pre-contract
+  data-orchestrator's `ON CONFLICT (doc_id, collection)` working; the cleanup's train dropped it.
 - New tables `vocabulary` (the corpus vocabulary, full replace per corpus) and
   `ingestion_refusals` (the refused rows of each corpus's last run, replaced every run;
   `value` is the repr of the refused value cut at 200 characters).
@@ -230,21 +325,23 @@ Before deploying, check that no `rag_ingestions` row has another corpus than its
 must be 0. Otherwise the train stops with that count (one transaction: nothing changes) and the
 run fails. Measured: the train takes well under a second on 40k documents.
 
-**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` of another
-corpus, a line that is not a JSON object such as a torn write or a UTF-8 BOM on line 1, an
-`extra` value JSONB cannot hold) is not written, is logged as `file:line reason field=value`
+**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` absent or of
+another corpus, a `bank_code` or `pdf_url` key (`legacy_key`) or a `data/` path since the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup), a line that is
+not a JSON object such as a torn write or a UTF-8 BOM on line 1, an `extra` value JSONB cannot
+hold) is not written, is logged as `file:line reason field=value`
 (the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
 soft-delete sweep and makes the run exit 1** after the cadence, runs and discovery-error passes:
 a refused row is a document "not seen", and a vocabulary mistake on a whole source must not
-soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, transition forms, …) are
-counted in the run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
+soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, …) are counted in the
+run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
 in `extra` until now, move to their columns on the first run.
 
 **Vocabulary file.** The run reads `vocabulary.json` at `DATA_DIR`, or at `VOCABULARY_PATH`
 when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest directory, e.g.
 `/cbdata/manifest`) the file sits one level up, at the data root: set
 `VOCABULARY_PATH=/cbdata/vocabulary.json`, as `CADENCE_PATH` points one level up too.
-- Absent: code membership is not checked (transition); the run logs
+- Absent (a corpus that ships no vocabulary yet): code membership is not checked; the run logs
   `vocabulary: missing (membership not checked)`.
 - Present and valid: it replaces this corpus's `vocabulary` rows (its own transaction, before
   the documents pass) and every row's `source_code`, `doc_type`, `provenance` and
@@ -256,44 +353,16 @@ when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest 
   bug or of codes it does not know; nothing is better than a wrong partial run. Fix the file
   (or deploy the vault that reads the newer MINOR) and run again.
 
-**Rollback to the 2d0457e schema.** With the ingestion stopped, and only while no `doc_id`
-exists under two corpora (`UNIQUE (doc_id)` would fail), run as `docuser` in one transaction
-(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The first
-statement bounds the wait for the table locks (Metabase, the API or the orchestrator reading
-`documents`): if it times out, nothing has changed; re-run it. Preconditions and what stays:
-
-- The data-orchestrator must still write `ON CONFLICT (doc_id, collection)`: the rollback
-  restores that key, and an orchestrator already updated to `(corpus, doc_id, collection)`
-  fails on it, so roll it back too.
-- `date_precision`/`date_kind` come back into `extra` (where the 2d0457e code and the old
-  orchestrator read them) only when the 2d0457e ingestion writes the row again, at its first
-  run, and never for a document no longer in a manifest: the new code moved them to their
-  columns, which the old code ignores.
-- Left behind, ignored by the old code: the columns `date_precision`, `date_kind`,
-  `entity_scheme`, `entity_value` (with their values), the indexes `idx_documents_doc_id` and
-  `idx_documents_entity`, and the tables `vocabulary` and `ingestion_refusals` (with their
-  rows and index). Rolling forward again reuses them.
-- Emptying `vault_schema` makes the old code re-run its train once, which puts the views back
-  on `doc_id` alone.
-
-```sql
--- rollback: documents contract -> 2d0457e
-SET LOCAL lock_timeout = '5s';
-DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
-ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_corpus_doc_id_fkey;
-ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_pkey;
-ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (doc_id, collection);
-ALTER TABLE documents ADD CONSTRAINT documents_doc_id_key UNIQUE (doc_id);
-ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_doc_id_fkey
-    FOREIGN KEY (doc_id) REFERENCES documents (doc_id);
-ALTER TABLE documents DROP CONSTRAINT documents_corpus_doc_id_key;
-DELETE FROM vault_schema;
-```
-
-Tested by `tests/integration/test_documents_contract.py` (the snippet above is read from this
-file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it;
-once on a freshly migrated database, once after an ingestion and orchestrator writes under the
-new code).
+**Rollback to the 2d0457e schema: no longer applicable.** Until the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) this section
+gave a SQL rollback to the pre-contract keys. It is withdrawn: every consumer has moved past
+the contract (data-orchestrator `2695b26` refuses the old schema with `VaultSchemaTooOld`, the
+MCP's vault-query 0.5 reads `vocabulary`, the producers' manifests are migrated and their old
+code must not run on them), and with two corpora live nothing guarantees that
+`UNIQUE (doc_id)` alone still holds. Going back means restoring a
+database backup together with every repository's previous release, not a vault-side script.
+The historical snippet and its preconditions are in the README of master `eff1aec`
+(`git show eff1aec:README.md`).
 
 #### Breaking changes (2026-11 documents contract)
 
@@ -320,8 +389,9 @@ For every consumer of the API, `vaultctl` and `vault-query`, in one place:
 - **MCP server**: vault-query 0.4.0, its current pin, keeps working on the new schema (it reads
   no new table or column), so its bump to 0.5.0 is not urgent; do it after the ingestion has
   run, never before.
-- **data-orchestrator**: its writes keep working (the transitional index serves its
-  `ON CONFLICT (doc_id, collection)`, see [Table `rag_ingestions`](#table-rag_ingestions)).
+- **data-orchestrator**: its writes kept working during the deploy (a transitional index
+  served its `ON CONFLICT (doc_id, collection)`; dropped since by the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup)).
   The real constraint is its reads: after the first new ingestion, `date_precision` and
   `date_kind` leave `extra` for their columns and `local_path` loses its `data/` prefix, both of
   which the old orchestrator relies on. So **no old-orchestrator ingestion and no
@@ -420,11 +490,10 @@ applies it:
   Readers holding the tables (Metabase, the API, the MCP) delay it by at most
   `VAULT_DDL_LOCK_TIMEOUT` per attempt; if they never let go, the run fails and ingests nothing
   (see [Schema migrations](#schema-migrations)). Later runs skip the train.
-- Manifests: a line carrying `document_url` fills the column; a line still carrying the legacy
-  `pdf_url` (a manifest not migrated yet) fills it too, `document_url` winning when both are
-  present. `pdf_url` never lands in `extra`. Transition only: the `pdf_url` fallback in
-  `ingestion/ingest.py` (`KNOWN_FIELDS`, `parse_line`) is removed once every producer writes
-  `document_url`.
+- Manifests: a line carrying `document_url` fills the column. At this release a line still
+  carrying the legacy `pdf_url` filled it too; since the
+  [transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) a line
+  carrying `pdf_url` is refused (`legacy_key`), never written with `document_url` NULL.
 - Readers that name the column must move with it: the API's `Document` model and `vault-query`
   0.3.0 (this release) return `document_url`; a consumer pinned to an older `vault-query` (the
   MCP) selects a column that no longer exists and fails until its pin is bumped. Re-apply the
@@ -432,8 +501,8 @@ applies it:
   built by hand in the Metabase UI are not in `cards.json`: fix any that name `pdf_url` there.
 - **Deploy this before the producers migrate their manifests.** The previous ingestion code does
   not know `document_url`: run on a migrated manifest, it would put the URL in `extra` and set
-  the column to NULL on every row until the new code runs. This version accepts both keys, so
-  the order is: vault, then the MCP pin bump, then the producers' manifest migration.
+  the column to NULL on every row until the new code runs. This version accepted both keys, so
+  the order was: vault, then the MCP pin bump, then the producers' manifest migration.
 
 ### Migration (2026-09 substrate)
 
@@ -565,10 +634,10 @@ Identity is `(corpus, doc_id)` (documents contract): a `doc_id` is unique within
   255 bytes, the whole past 4096); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
   `corpus` is required (400) when the `doc_id` exists in several corpora. `RAW_DATA_DIR` and
   the split on the `raw` path component are gone.
-- **Transition note.** The ingestion now stores `local_path` without the old `data/` prefix
-  (`raw/...`). Rows ingested before the deploy still hold `data/raw/...` and are a 404 (`File
-  not found on disk`) until the first post-deploy ingestion of their corpus rewrites every live
-  row; no compatibility code exists for them, so run the ingestion right after deploying.
+- **`data/` paths.** `local_path` is relative to the corpus data root (`raw/...`); the
+  ingestion refuses a manifest's old `data/raw/...` form (`bad_local_path`). A row still
+  holding `data/...` (written before the documents contract, or by hand) is looked up as stored,
+  with no compatibility code, and is a 404 (`File not found on disk`).
 
 The document and stats routes read through `vault-query` (below); the image installs it from
 the same checkout, which is why `api`'s build context is the repo root (`api/Dockerfile`).
