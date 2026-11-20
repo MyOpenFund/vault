@@ -13,6 +13,7 @@ ALL_COLUMNS = frozenset({
     "date", "year", "language", "provenance", "mime_type", "sha256", "local_path",
     "created_at", "updated_at", "last_seen_at", "deleted_at", "extra",
     "has_text_layer", "page_count",
+    "date_precision", "date_kind", "entity_scheme", "entity_value",   # documents contract 1.0.0
 })
 
 # How search_documents opens its snapshot on an autocommit connection: the

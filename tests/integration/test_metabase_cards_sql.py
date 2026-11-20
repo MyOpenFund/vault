@@ -94,7 +94,7 @@ INSERT INTO rag_ingestions (
     doc_id, collection, corpus, source_code,
     embedding_model, embedding_version, chunk_count
 ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-ON CONFLICT (doc_id, collection) DO NOTHING;
+ON CONFLICT (corpus, doc_id, collection) DO NOTHING;
 """
 
 PROBE_DOC_SQL = """

@@ -13,7 +13,8 @@ ROLES = VAULT_ROLES
 VIEWS = ("runs_sources", "rag_backlog", "rag_backlog_any",
          "sources_without_cadence", "source_health")
 
-TABLES = ("documents", "runs", "rag_ingestions", "cadence", "discovery_errors")
+TABLES = ("documents", "runs", "rag_ingestions", "cadence", "discovery_errors",
+          "vocabulary", "ingestion_refusals")
 
 
 def train(monkeypatch, pg_url, data_dir, orch=ORCH_PW, ro=RO_PW):

@@ -96,7 +96,9 @@ def test_a_pre_rename_database_is_renamed_once_with_data_preserved(
     monkeypatch.setenv("VAULT_READONLY_PASSWORD", RO_PW)
     with caplog.at_level(logging.INFO):
         run_ingest(monkeypatch, clean_db, tmp_path)      # empty data dir: no upsert, no sweep
-    assert "DDL train running: train changed (recorded 4ba299ebe875" in caplog.text
+    # The contract's two tables did not exist yet either: the gate names them
+    # first (missing relations outrank a changed fingerprint).
+    assert "DDL train running: missing relation(s): vocabulary, ingestion_refusals" in caplog.text
     assert fetch_all(clean_db, "SELECT fingerprint FROM vault_schema") == [
         (ingest.TRAIN_FINGERPRINT,)]
 

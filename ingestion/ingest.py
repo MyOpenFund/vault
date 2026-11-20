@@ -112,9 +112,12 @@ DROP VIEW IF EXISTS rag_backlog_any;
 DROP VIEW IF EXISTS rag_backlog;
 DROP VIEW IF EXISTS runs_sources;
 
+-- Identity is (corpus, doc_id) (documents contract 1.0.0, chantier 4): a
+-- doc_id is unique within its corpus only. A database created before the
+-- contract had UNIQUE (doc_id); the identity block below moves it.
 CREATE TABLE IF NOT EXISTS documents (
     id SERIAL PRIMARY KEY,
-    doc_id TEXT UNIQUE NOT NULL,
+    doc_id TEXT NOT NULL,
     corpus TEXT NOT NULL,
     source_code TEXT,
     doc_type TEXT,
@@ -128,11 +131,16 @@ CREATE TABLE IF NOT EXISTS documents (
     mime_type TEXT,
     sha256 TEXT,
     local_path TEXT,
+    date_precision TEXT,
+    date_kind TEXT,
+    entity_scheme TEXT,
+    entity_value TEXT,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     last_seen_at TIMESTAMPTZ,
     deleted_at TIMESTAMPTZ,
-    extra JSONB
+    extra JSONB,
+    CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id)
 );
 
 -- Upgrade path for databases created before deletion tracking existed.
@@ -207,6 +215,34 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS corpus TEXT;
 UPDATE documents SET corpus = 'central-bank' WHERE corpus IS NULL;
 ALTER TABLE documents ALTER COLUMN corpus SET NOT NULL;
 
+-- documents contract 1.0.0 (chantier 4): the four common fields that were not
+-- columns yet. Catalog-only (no default): no table rewrite. Central-bank rows
+-- carried date_precision/date_kind inside `extra`; the next documents pass
+-- lifts them into the columns (vault_contract.split_row) and they leave extra.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_precision TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_kind TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_scheme TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_value TEXT;
+
+-- Identity, part 1: UNIQUE (corpus, doc_id), added when no unique constraint
+-- on exactly those columns exists (a fresh table has it inline). On a
+-- pre-contract database doc_id was unique on its own, so this cannot fail on
+-- existing data. Part 2 (rag_ingestions' keys, then the old UNIQUE (doc_id))
+-- follows the rag_ingestions table, which references this constraint.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id']
+    ) THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id);
+    END IF;
+END $$;
+
 -- One-time upgrade of pre-existing naive TIMESTAMP columns to TIMESTAMPTZ
 -- (values were written as UTC); no-op once migrated or on fresh databases.
 -- Each column is checked on its own: a database where created_at/updated_at
@@ -274,8 +310,10 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
 -- Cross-model history lives in the collection dimension (one fresh collection
 -- per re-embed campaign). The vault owns this DDL; data-orchestrator only needs
 -- INSERT/UPDATE/SELECT rights.
+-- Keyed by (corpus, doc_id, collection) since the documents contract: its
+-- corpus column joins the key and the foreign key (identity part 2 below).
 CREATE TABLE IF NOT EXISTS rag_ingestions (
-    doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
+    doc_id            TEXT NOT NULL,
     collection        TEXT NOT NULL,
     corpus            TEXT NOT NULL,
     source_code       TEXT,
@@ -283,8 +321,89 @@ CREATE TABLE IF NOT EXISTS rag_ingestions (
     embedding_version TEXT,
     chunk_count       INTEGER NOT NULL,
     ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (doc_id, collection)
+    CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection),
+    CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+        REFERENCES documents (corpus, doc_id)
 );
+
+-- Identity, part 2, idempotent (every step checks the catalog by columns,
+-- not by name). On a pre-contract database: the foreign key on doc_id alone is
+-- dropped, the primary key (doc_id, collection) becomes (corpus, doc_id,
+-- collection), the foreign key (corpus, doc_id) is added, and only then the
+-- old UNIQUE (doc_id) it depended on is dropped. Adding the foreign key
+-- checks every existing row: a rag_ingestions row whose corpus is not its
+-- document's would make it fail, so that case is counted first and stops the
+-- train with a message saying what to fix (the train is one transaction:
+-- nothing is left half-done). A plain index on doc_id replaces the old unique
+-- one for the lookups by doc_id alone (vault-query, the API, the
+-- orchestrator's probe UPDATE), which the (corpus, doc_id) index cannot serve.
+DO $$
+DECLARE
+    con      record;
+    orphans  bigint;
+BEGIN
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) <> ARRAY['corpus', 'doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id', 'collection']
+    ) THEN
+        FOR con IN
+            SELECT c.conname FROM pg_constraint c
+             WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+        LOOP
+            EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+        END LOOP;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+    ) THEN
+        SELECT count(*) INTO orphans
+          FROM rag_ingestions r
+         WHERE NOT EXISTS (SELECT 1 FROM documents d
+                            WHERE d.corpus = r.corpus AND d.doc_id = r.doc_id);
+        IF orphans > 0 THEN
+            RAISE EXCEPTION 'rag_ingestions has % row(s) whose (corpus, doc_id) matches no document (a corpus differing from its document''s): fix them before deploying the documents contract (SELECT r.* FROM rag_ingestions r JOIN documents d USING (doc_id) WHERE r.corpus <> d.corpus)', orphans;
+        END IF;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+            REFERENCES documents (corpus, doc_id);
+    END IF;
+
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE documents DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_documents_doc_id ON documents (doc_id);
+-- Documents about one company (contract: entity = the company the document is about).
+CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents (entity_scheme, entity_value);
 
 CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
     ON rag_ingestions(collection);
@@ -401,6 +520,40 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
 CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
     ON discovery_errors (last_run_id);
 
+-- Corpus vocabulary (documents contract, vocabulary.json at the producer's
+-- data root): the codes a corpus declares, one row per (kind, code), kind
+-- being the column the code is for: source_code, doc_type, provenance or
+-- entity_scheme. Full replace per corpus by the documents pass
+-- (ingest_vocabulary.py), before the documents are checked against it.
+CREATE TABLE IF NOT EXISTS vocabulary (
+    corpus TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    code   TEXT NOT NULL,
+    label  TEXT,
+    family TEXT,
+    PRIMARY KEY (corpus, kind, code)
+);
+
+-- Manifest rows the last documents pass of a corpus refused (contract
+-- refusals, plus the vault's own: see ingest.VAULT_REASONS), one row per
+-- refusal: a row with two defects has two. Replaced per corpus at every pass,
+-- so it always shows the last run; empty for a corpus whose last run refused
+-- nothing. `value` is the repr of the refused value, truncated
+-- (ingest.REFUSAL_VALUE_CHARS). Read by Metabase; the vault ingestion writes
+-- no `runs` row of its own.
+CREATE TABLE IF NOT EXISTS ingestion_refusals (
+    corpus      TEXT NOT NULL,
+    run_ts      TIMESTAMPTZ NOT NULL,
+    source_file TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    doc_id      TEXT,
+    reason      TEXT NOT NULL,
+    field       TEXT,
+    value       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ingestion_refusals_corpus_reason
+    ON ingestion_refusals (corpus, reason);
+
 -- ---------------------------------------------------------------------------
 -- Views, recreated at the tail of the train in dependency order (they were
 -- dropped at its head, before the first ALTER — see the block above).
@@ -446,7 +599,8 @@ SELECT c.collection,
        d.updated_at AS document_updated_at
 FROM documents d
 CROSS JOIN collections c
-LEFT JOIN rag_ingestions r ON r.doc_id = d.doc_id AND r.collection = c.collection
+LEFT JOIN rag_ingestions r
+       ON r.corpus = d.corpus AND r.doc_id = d.doc_id AND r.collection = c.collection
 WHERE d.deleted_at IS NULL AND r.doc_id IS NULL;
 
 -- Absolute backlog: live documents in NO collection at all. Correct on a
@@ -459,7 +613,8 @@ SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
        d.updated_at AS document_updated_at
 FROM documents d
 WHERE d.deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r WHERE r.doc_id = d.doc_id);
+  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r
+                   WHERE r.corpus = d.corpus AND r.doc_id = d.doc_id);
 
 -- Sources that produce runs but have no cadence expectation. Empty is
 -- healthy; a non-empty result means source_health cannot see part of the
@@ -581,7 +736,7 @@ INSERT INTO documents (
     date, year, language, provenance, mime_type, sha256, local_path,
     updated_at, last_seen_at, extra
 ) VALUES %s
-ON CONFLICT (doc_id) DO UPDATE SET
+ON CONFLICT (corpus, doc_id) DO UPDATE SET
     corpus = EXCLUDED.corpus,
     source_code = EXCLUDED.source_code,
     doc_type = EXCLUDED.doc_type,

@@ -32,7 +32,8 @@ pytestmark = pytest.mark.integration
 
 FIX = Path(__file__).parent.parent / "fixtures" / "discovery_errors_real.jsonl"
 
-TABLES = ("documents", "rag_ingestions", "cadence", "runs", "discovery_errors", "vault_schema")
+TABLES = ("documents", "rag_ingestions", "cadence", "runs", "discovery_errors",
+          "vocabulary", "ingestion_refusals", "vault_schema")
 VIEWS = ("runs_sources", "rag_backlog", "rag_backlog_any",
          "sources_without_cadence", "source_health")
 
@@ -583,7 +584,9 @@ def test_a_pre_gate_database_is_upgraded_once_then_skipped(
 
     with caplog.at_level(logging.INFO):
         run_ingest(monkeypatch, clean_db, tmp_path)     # empty data dir: no sweep
-    assert "DDL train running: missing relation(s): vault_schema" in caplog.text
+    # The pre-gate train had neither vault_schema nor the contract's two tables.
+    assert ("DDL train running: missing relation(s): vocabulary, ingestion_refusals, "
+            "vault_schema") in caplog.text
     assert fetch_all(clean_db, "SELECT fingerprint FROM vault_schema") == [
         (ingest.TRAIN_FINGERPRINT,)]
     assert data() == before_data
