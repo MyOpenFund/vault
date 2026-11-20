@@ -20,7 +20,7 @@ from .conftest import make_doc, run_ingest, write_manifest
 pytestmark = pytest.mark.integration
 
 # us2 is listed BEFORE us1: insertion order must differ from doc_id order,
-# otherwise the paging walks pass even without the `, doc_id` tie-break.
+# otherwise the paging walks pass even without the `, doc_id, corpus` tie-break.
 SEED = [
     make_doc("us2", source="us", date="2010-01-13", year=2010),  # same date as us1: tie-break
     make_doc("us1", source="us", date="2010-01-13", year=2010),
@@ -88,12 +88,44 @@ def _walk(conn, sort_dir):
 
 
 def test_search_desc_walk_keeps_nulls_last_and_doc_id_ascending(conn):
-    """Under DESC the NULL date still comes last and the tie stays doc_id ascending.
+    """Under DESC the NULL date still comes last and the tie stays doc_id, corpus ascending.
 
-    The tie-break is `doc_id` ascending whatever `sort_dir` is: us1 before us2
-    in both directions.
+    The tie-break is `doc_id, corpus` ascending whatever `sort_dir` is: us1
+    before us2 in both directions.
     """
     assert _walk(conn, "desc") == ["fr1", "us1", "us2", "us3"]
+
+
+def test_search_pages_corpora_sharing_a_doc_id_and_a_date_exactly_once(conn):
+    """A doc_id is unique only within its corpus: the same doc_id under several
+    corpora on the same date must page exactly once each, in corpus order
+    (tie-break `doc_id, corpus`), in both directions. Three twins inserted
+    after the seed: without `corpus` in the tie-break, Postgres returns them in
+    an order that repeats one row and skips another (seen on every run)."""
+    twins = ["company", "fund", "regulator"]
+    with conn.cursor() as cur:
+        for corpus in reversed(twins):
+            cur.execute(
+                "INSERT INTO documents (doc_id, corpus, source_code, title, date, year) "
+                "VALUES ('us1', %s, 'x', 'Twin of us1', '2010-01-13', 2010)", (corpus,))
+    try:
+        def walk(sort_dir):
+            seen, offset = [], 0
+            while True:
+                _, rows = vq.search_documents(conn, {}, sort_by="date", sort_dir=sort_dir,
+                                              limit=1, offset=offset)
+                if not rows:
+                    return seen
+                seen += [(r["doc_id"], r["corpus"]) for r in rows]
+                offset += len(rows)
+
+        same_day = ([("us1", c) for c in ["central-bank"] + twins]
+                    + [("us2", "central-bank")])
+        assert walk("asc") == same_day + [("fr1", "central-bank"), ("us3", "central-bank")]
+        assert walk("desc") == [("fr1", "central-bank")] + same_day + [("us3", "central-bank")]
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM documents WHERE corpus <> 'central-bank'")
 
 
 def test_search_offset_past_the_end_is_empty_with_the_true_total(conn):

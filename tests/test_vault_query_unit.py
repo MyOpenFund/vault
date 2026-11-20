@@ -400,6 +400,16 @@ def test_search_runs_count_and_page_in_one_read_only_snapshot_on_autocommit():
     assert _kinds(conn.log) == ["BEGIN", "SELECT COUNT", "SELECT", "COMMIT"]
 
 
+def test_search_breaks_sort_ties_by_doc_id_then_corpus():
+    """Identity is (corpus, doc_id): a doc_id alone no longer orders two rows
+    of different corpora that share the sort value, so `corpus` follows it in
+    the tie-break (otherwise a pager may repeat one row and skip the other)."""
+    conn = _RecordingConnection(autocommit=True)
+    search_documents(conn, {}, sort_by="date", sort_dir="desc")
+    [page] = [s for s in conn.log if s.startswith("SELECT") and "COUNT(*)" not in s]
+    assert "ORDER BY date desc NULLS LAST, doc_id, corpus LIMIT" in page
+
+
 @pytest.mark.parametrize("autocommit, status", [
     (False, 0),   # psycopg2 will open its own transaction: the caller owns it
     (False, 2),   # already in a transaction
@@ -728,7 +738,7 @@ def test_list_vocabulary_refuses_bad_arguments_before_sql(kwargs, match):
         list_vocabulary(_NoConnection(), **kwargs)
 
 
-def test_package_version_is_0_5_0():
+def test_package_version_is_0_5_1():
     from importlib.metadata import version
 
-    assert version("vault-query") == "0.5.0"
+    assert version("vault-query") == "0.5.1"

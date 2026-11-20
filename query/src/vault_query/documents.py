@@ -37,10 +37,11 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     """Filtered, sorted page of documents and the total of the filtered set.
 
     Returns (total, rows). `total` ignores the window, so a caller can page to
-    the end. `doc_id` breaks ties so pages never overlap or skip under a
-    non-unique sort key (several documents share a date); the tie-break is
-    always `doc_id` ascending, whatever `sort_dir` is. NULL sort keys come last
-    in both directions.
+    the end. `doc_id`, then `corpus`, break ties so pages never overlap or skip
+    under a non-unique sort key (several documents share a date; a doc_id is
+    unique only within its corpus, so the pair is the row's identity); the
+    tie-break is always `doc_id, corpus` ascending, whatever `sort_dir` is. NULL
+    sort keys come last in both directions.
 
     `limit` (>= 1) and `offset` (>= 0) are ints (not bool), at most MAX_BOUND.
     `columns`, when given, is a non-empty subset of ALL_COLUMNS; None means
@@ -97,7 +98,7 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
             total = cur.fetchone()["total"]
             cur.execute(
                 f"SELECT {projection} FROM documents{where_sql} "
-                f"ORDER BY {sort_by} {sort_dir} NULLS LAST, doc_id "
+                f"ORDER BY {sort_by} {sort_dir} NULLS LAST, doc_id, corpus "
                 f"LIMIT %s OFFSET %s",
                 params + [limit, offset],
             )

@@ -601,6 +601,9 @@ takes an open psycopg2 connection that the caller owns (opens, closes, and choos
 `vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
 "idle in transaction" holds locks that block the ingester's DDL train.
 
+Changes in 0.5.1: `search_documents` breaks sort ties by `doc_id, corpus` (was `doc_id`): two
+rows of different corpora sharing a `doc_id` and the sort value now page exactly once each.
+
 Changes in 0.5.0 (breaking — bump the pin together with the vault deploy of the documents
 contract; the MCP server's tools must follow):
 
