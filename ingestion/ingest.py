@@ -1269,10 +1269,11 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
 
     None for a blank line, and for a refused line: not a JSON object
     (not_json), or refused by vault_contract.check_row (transition=False: a
-    row without `corpus`, an old key such as `bank_code` and a `data/` prefix
-    are refused, not tolerated; this service's CORPUS expected; `vocabulary`
-    None = codes not checked; its bad_extra included). A refused line is recorded in `report` (counted, logged,
-    kept for ingestion_refusals); an accepted row's notices are appended to
+    row without `corpus`, `bank_code` without `source_code` and a `data/`
+    prefix are refused, not tolerated; this service's CORPUS expected;
+    `vocabulary` None = codes not checked; its bad_extra included). A refused
+    line is recorded in `report` (counted, logged, kept for
+    ingestion_refusals); an accepted row's notices are appended to
     `report.pending`, counted by commit_notices once the row is known to be
     upserted (after dedupe_rows). Unlike before the contract, a doc_id that
     is not a string, a corpus that contradicts CORPUS or a line that is not

@@ -76,7 +76,7 @@ LEGACY_FORM_CASES = {"cb_legacy_form"}
 
 
 def test_the_legacy_form_cases_are_the_ones_with_a_transition_notice():
-    transition_notices = {"corpus_missing", "legacy_alias"}
+    transition_notices = {"corpus_missing", "legacy_alias", "legacy_data_prefix"}
     assert {n for n, c in golden.accepted().items()
             if transition_notices & set(c["expected_notices"])} == LEGACY_FORM_CASES
 
