@@ -146,7 +146,9 @@ def test_the_company_ingestion_service():
     for var in ("CADENCE_PATH", "RUNS_PATH", "DISCOVERY_ERRORS_PATH"):
         assert f"{var}:" not in block, var
     assert "${MANIFEST_DIR" not in block and "${MANIFEST_GLOBS" not in block
-    assert "\nCOMPANY_MANIFEST_DIR=" in ENV_EXAMPLE
+    # Optional (compose defaults it): commented out, as the other optional ones.
+    assert "\n#COMPANY_MANIFEST_DIR=" in ENV_EXAMPLE
+    assert "\nCOMPANY_MANIFEST_DIR=" not in ENV_EXAMPLE
 
 
 def test_the_repo_holds_no_host_path_for_the_company_corpus():
