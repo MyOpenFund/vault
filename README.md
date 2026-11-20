@@ -264,7 +264,9 @@ to write instead and the producer's manifest migration to rerun.
   the new ingestion will judge them (`--no-transition`: it also catches a `pdf_url` or
   `bank_code` left in a row, which no transition notice reveals when the contract key is
   there too), inside the ingestion containers of the **new** tree (built or bind-mounted, so
-  that the checker is 1.1.0; paths as each container sees them):
+  that the checker is 1.1.0; paths as each container sees them on the NAS, where the
+  central-bank data is mounted at `/cbdata`; with this repo's `compose.yaml` the
+  `ingestion` paths are `/data/manifest` and `/data/vocabulary.json`):
 
   ```
   docker compose run --rm --no-deps --entrypoint python ingestion -m vault_contract.check \
@@ -276,12 +278,14 @@ to write instead and the producer's manifest migration to rerun.
 
   Expect `refusals: 0` and exit 0 for both. `--no-deps` keeps Postgres out of it (the checker
   is read-only and opens no connection). Central bank: `--glob '**/*.jsonl'` reads the
-  subdirectories too, as the ingestion's manifest-directory layout does; it also matches the
-  producer's non-manifest files (`download_errors.jsonl`, ...), which the checker skips, as the
-  ingestion does (`EXCLUDED_BASENAMES`, shared), along with hidden files. Company:
-  `ingestion-company` reads `manifest/*.jsonl` at the top level only (`MANIFEST_GLOBS`), which
-  is the checker's default glob. Alternatively, deploy after a nightly central-bank sync and
-  ingestion whose log shows none of the three notices.
+  subdirectories too, as the ingestion's manifest-directory layout does; it would also match a
+  producer's non-manifest file landing there (`download_errors.jsonl`, ...), which the checker
+  skips, as the ingestion does (`EXCLUDED_BASENAMES`, shared), along with hidden files.
+  Company: `ingestion-company` reads `manifest/*.jsonl` at the top level only
+  (`MANIFEST_GLOBS`), which is the checker's default glob; under a `MANIFEST_GLOBS` override
+  the ingestion does not apply `EXCLUDED_BASENAMES`, so keep only manifests in `manifest/`.
+  This `--no-transition` run is the only sufficient gate: a nightly log without transition
+  notices is not, since an old key beside its contract key raises no notice.
 
 **Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
 ingestion once; its train text differs, so it re-runs and recreates the unique index on
