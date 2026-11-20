@@ -132,7 +132,8 @@ def test_a_pre_rename_database_is_renamed_once_with_data_preserved(
     conn = psycopg2.connect(clean_db)
     conn.autocommit = True
     try:
-        assert vq.get_document(conn, "keep-1")["document_url"] == "https://x.invalid/1.pdf"
+        [kept] = vq.get_document(conn, "keep-1")
+        assert kept["document_url"] == "https://x.invalid/1.pdf"
         _, rows = vq.search_documents(conn, {"source_code": "us"}, columns=vq.SEARCH_COLUMNS)
         assert rows[0]["document_url"] == "https://x.invalid/1.pdf" and "pdf_url" not in rows[0]
     finally:
