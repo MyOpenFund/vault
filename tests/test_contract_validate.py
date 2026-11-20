@@ -508,14 +508,16 @@ def test_an_alias_shadowed_by_its_contract_key_is_not_noticed():
     assert _notices(row) == []
 
 
-def test_after_the_transition_old_keys_are_neither_mapped_nor_noticed():
-    """transition=False: bank_code is an extra, so source_code is missing."""
+def test_after_the_transition_old_keys_are_not_mapped_and_a_data_path_is_refused():
+    """transition=False: bank_code is an extra, so source_code is missing; a
+    `data/` path is no longer stripped, and storing data/raw/... would break
+    every reader, so it is refused, still with its legacy_data_prefix notice."""
     row = _golden("cb_rendered_html")
     row["bank_code"] = row.pop("source_code")
     row["local_path"] = "data/" + row["local_path"]
     assert _reasons(row, expected_corpus="central-bank", transition=False) == [
-        "missing_source_code"]
-    assert _notices(row, transition=False) == []
+        "bad_local_path", "missing_source_code"]
+    assert _notices(row, transition=False) == ["legacy_data_prefix"]
 
 
 def test_a_notice_names_the_field_and_the_value_as_written():
@@ -538,3 +540,66 @@ def test_quality_notices_does_not_modify_its_arguments():
     before_row, before_columns = dict(row), dict(columns)
     quality_notices(columns, row=row)
     assert (row, columns) == (before_row, before_columns)
+
+
+
+# --- second fix wave ------------------------------------------------------------
+
+@pytest.mark.parametrize("doc_id", [" cf0e49e6e176a851", "cf0e49e6e176a851 ", "cf0e\n"])
+def test_a_doc_id_with_surrounding_whitespace_is_bad_text(doc_id):
+    row = _golden("sec_10k")
+    row["doc_id"] = doc_id
+    assert _reasons(row, expected_corpus="company") == ["bad_text"]
+
+
+@pytest.mark.parametrize("field", [
+    "doc_id", "source_code", "doc_type", "title", "date_precision", "date_kind", "language",
+    "provenance", "document_url", "source_url", "mime_type", "local_path", "entity_scheme",
+    "entity_value",
+])
+def test_a_lone_surrogate_in_any_text_column_is_bad_text(field):
+    """json.loads accepts a lone surrogate escape; Postgres (UTF-8) cannot store it."""
+    row = _golden("sec_10k")
+    row[field] = "a\ud800b"
+    columns, _ = split_row(row)
+    assert validate_row(columns, VOCABULARIES["company"], expected_corpus="company") == [
+        Refusal("bad_text", field, "a\ud800b")]
+
+
+def test_a_lone_surrogate_in_corpus_is_bad_text():
+    row = _golden("sec_10k")
+    row["corpus"] = "comp\udfffany"
+    assert _reasons(row, expected_corpus="company") == ["bad_text"]
+
+
+@pytest.mark.parametrize("path", [
+    "raw/ a.pdf", "raw /a.pdf", "raw/a.pdf ", "raw/a\u0085.pdf", "raw/a .pdf",
+    "raw/a .pdf", "raw/a​.pdf", "raw/a‏.pdf", "raw/﻿a.pdf", "raw/a\x9f.pdf",
+])
+def test_local_path_segments_refuse_edge_whitespace_and_invisible_characters(path):
+    row = _golden("sec_10k")
+    row["local_path"] = path
+    assert _reasons(row, expected_corpus="company") == ["bad_local_path"]
+
+
+def test_an_inner_space_in_a_local_path_segment_is_accepted():
+    row = _golden("sec_10k")
+    row["local_path"] = "raw/annual report 2024.pdf"
+    assert _reasons(row, expected_corpus="company") == []
+
+
+def test_a_data_prefix_with_nothing_after_is_refused_not_silently_dropped():
+    row = _golden("sec_10k")
+    row["local_path"] = "data/"
+    assert _reasons(row, expected_corpus="company") == ["bad_local_path"]
+    assert "legacy_data_prefix" in _notices(row)
+
+
+@pytest.mark.parametrize("missing, present", [("entity_value", "entity_scheme"),
+                                              ("entity_scheme", "entity_value")])
+def test_entity_half_names_the_missing_field(missing, present):
+    row = _golden("sec_form4")
+    row[missing] = None
+    columns, _ = split_row(row)
+    assert validate_row(columns, VOCABULARIES["company"], expected_corpus="company") == [
+        Refusal("entity_half", missing, None)]

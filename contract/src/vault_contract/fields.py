@@ -82,9 +82,11 @@ def split_row(row: Mapping, *, transition: bool = True) -> tuple[dict, dict]:
         for name in DATE_DEPENDENT:
             columns[name] = None
 
+    # A bare "data/" is kept as is (nothing would be left): validation refuses it.
     path = columns["local_path"]
-    if transition and isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
-        columns["local_path"] = path[len(TRANSITION_LOCAL_PATH_PREFIX):] or None
+    if transition and isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX) \
+            and len(path) > len(TRANSITION_LOCAL_PATH_PREFIX):
+        columns["local_path"] = path[len(TRANSITION_LOCAL_PATH_PREFIX):]
 
     aliases = TRANSITION_ALIASES if transition else {}
     extra = {k: v for k, v in row.items() if k not in columns and k not in aliases}

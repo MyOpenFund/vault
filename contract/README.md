@@ -125,12 +125,13 @@ notices each time:
 - `bank_code` as `source_code` and `pdf_url` as `document_url`, when the contract key is
   absent or blank; the old key never lands in `extra` (notice `legacy_alias`, `field` = the
   old key);
-- a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`);
+- a `local_path` starting with `data/`, stored without that prefix (`legacy_data_prefix`; a
+  bare `data/` is refused, not emptied);
 - a row without `corpus`: the ingesting service's `CORPUS` applies (`corpus_missing`).
 
 The cleanup release passes `transition=False`: the old keys are then ordinary extras (so a
-row with `bank_code` only is `missing_source_code`), the prefix is kept, and a row without
-`corpus` is `missing_corpus`. Run the checker with `--no-transition` to see that future on
+row with `bank_code` only is `missing_source_code`), a `data/` path is refused
+(`bad_local_path`, still noticed), and a row without `corpus` is `missing_corpus`. Run the checker with `--no-transition` to see that future on
 today's manifests. Independently, a corpus without a vocabulary file is checked without
 membership (`vocabulary=None`).
 
@@ -157,7 +158,7 @@ Both reason lists, in check order, are part of the contract: run reports count r
 | `missing_doc_type` | `doc_type` absent or `""` |
 | `missing_language` | `language` absent or `""` |
 | `missing_provenance` | `provenance` absent or `""` |
-| `bad_text` | a text column set to something else than a non-blank string without NUL: a number (a CIK `320193` has lost its zeros), a list, an object, `"  "`, a NUL; `field` names the column |
+| `bad_text` | a text column set to something else than a non-blank string without NUL or lone surrogate: a number (a CIK `320193` has lost its zeros), a list, an object, `"  "`, a NUL, an escaped `\ud800`; also a `doc_id` with leading or trailing whitespace; `field` names the column |
 | `corpus_conflict` | `corpus` present and not the ingesting service's corpus |
 | `unknown_source_code` | `source_code` not declared in the vocabulary |
 | `unknown_doc_type` | `doc_type` not declared in the vocabulary (a raw form such as `10-K` included) |
@@ -167,9 +168,9 @@ Both reason lists, in check order, are part of the contract: run reports count r
 | `year_mismatch` | `year` not the integer year of `date`, or a `year` without `date` |
 | `bad_date_precision` | `date_precision` of a dated row not `day`, `month` or `year` (`Day` included) |
 | `bad_date_kind` | `date_kind` of a dated row not `publication`, `meeting` or `period` |
-| `bad_local_path` | `local_path` not a plain relative POSIX path: absolute, a `scheme:` or drive prefix (`file:///…`, `C:`), a backslash, an empty, `.` or `..` segment (`raw//a.pdf`, `./a`, trailing `/`), leading or trailing whitespace, a control character, a first segment starting with `~` |
+| `bad_local_path` | `local_path` not a plain relative POSIX path: absolute, a `scheme:` or drive prefix (`file:///…`, `C:`), a backslash, an empty, `.` or `..` segment (`raw//a.pdf`, `./a`, trailing `/`, a bare `data/`), a segment with leading or trailing whitespace, a control, format or line/paragraph separator character (Unicode Cc, Cf, Zl, Zp: U+0085, U+200B, U+2028, U+FEFF, ...), a first segment starting with `~`; after the transition, a `data/` prefix |
 | `bad_sha256` | `sha256` not 64 lowercase hexadecimal characters |
-| `entity_half` | one of `entity_scheme` / `entity_value` without the other |
+| `entity_half` | one of `entity_scheme` / `entity_value` without the other; `field` names the missing one |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
 
 Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every
@@ -187,7 +188,7 @@ value as the producer wrote it.
 |---|---|
 | `corpus_missing` | transition: no `corpus`; the ingesting service's `CORPUS` applies |
 | `legacy_alias` | transition: an old key filled its column (`field` = `bank_code` or `pdf_url`) |
-| `legacy_data_prefix` | transition: `local_path` started with `data/`, stripped |
+| `legacy_data_prefix` | `local_path` starts with `data/`: stripped during the transition, refused (`bad_local_path`) after it; noticed in both modes |
 | `empty_title` | `title` absent, null or blank |
 | `precision_not_stated` | `date` set, `date_precision` absent or null |
 | `date_not_period_start` | `date_precision` `month` and the day is not 1, or `year` and the date is not 1 January |

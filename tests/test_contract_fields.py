@@ -119,6 +119,7 @@ def test_alias_fills_a_blank_contract_value(blank):
     ("raw/data/x.pdf", "raw/data/x.pdf"),     # only a leading data/ component
     ("database/x.pdf", "database/x.pdf"),     # a prefix of a name is not a component
     ("data/data/x.pdf", "data/x.pdf"),        # stripped once, not repeatedly
+    ("data/", "data/"),                       # nothing left: kept for validation to refuse
 ])
 def test_a_leading_data_component_of_local_path_is_dropped(path, expected):
     columns, _ = split_row({"local_path": path})

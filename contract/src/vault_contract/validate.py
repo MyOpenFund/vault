@@ -11,6 +11,7 @@ level only.
 """
 import datetime
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -51,7 +52,10 @@ _LANGUAGE = re.compile(r"[a-z]{2}")                     # ISO 639-1
 _ISO_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")        # file:, https:, C: (a drive)
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_SURROGATE = re.compile("[\ud800-\udfff]")
+# Control (C0, C1 incl. U+0085), format (U+200B..U+200F, U+FEFF, ...) and
+# line/paragraph separators (U+2028/2029): invisible or line-breaking in a path.
+_INVISIBLE = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 @dataclass(frozen=True)
@@ -81,8 +85,10 @@ class CheckedRow:
 
 
 def is_text(value: object) -> bool:
-    """A non-blank string without NUL."""
-    return isinstance(value, str) and bool(value.strip()) and "\x00" not in value
+    """A non-blank string without NUL and without a lone surrogate (json.loads
+    accepts an escaped one; a UTF-8 database cannot store it)."""
+    return (isinstance(value, str) and bool(value.strip()) and "\x00" not in value
+            and not _SURROGATE.search(value))
 
 
 def _parse_day(value: object) -> datetime.date | None:
@@ -94,12 +100,17 @@ def _parse_day(value: object) -> datetime.date | None:
         return None
 
 
-def is_bad_local_path(path: str) -> bool:
-    """Not a plain POSIX path relative to the corpus data root."""
-    if path != path.strip() or _CONTROL.search(path) or "\\" in path or _SCHEME.match(path):
+def is_bad_local_path(path: str, *, transition: bool = True) -> bool:
+    """Not a plain POSIX path relative to the corpus data root. Without the
+    transition, a leading `data/` (no longer stripped) is refused too."""
+    if "\\" in path or _SCHEME.match(path) \
+            or any(unicodedata.category(c) in _INVISIBLE for c in path):
+        return True
+    if not transition and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
         return True
     segments = path.split("/")       # "" segments: leading "/", "//", trailing "/"
-    return any(s in ("", ".", "..") for s in segments) or segments[0].startswith("~")
+    return (any(s in ("", ".", "..") or s != s.strip() for s in segments)
+            or segments[0].startswith("~"))
 
 
 def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
@@ -135,6 +146,8 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
     for name in TEXT_COLUMNS:
         if ok(name) and not is_text(columns[name]):
             refuse("bad_text", name)
+    if ok("doc_id") and columns["doc_id"] != columns["doc_id"].strip():
+        refuse("bad_text", "doc_id")             # an id is compared byte for byte
 
     if ok("corpus") and columns["corpus"] != expected_corpus:
         refuse("corpus_conflict", "corpus")
@@ -165,7 +178,7 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
     if ok("date_kind") and columns["date_kind"] not in DATE_KINDS:
         refuse("bad_date_kind", "date_kind")
 
-    if ok("local_path") and is_bad_local_path(columns["local_path"]):
+    if ok("local_path") and is_bad_local_path(columns["local_path"], transition=transition):
         refuse("bad_local_path", "local_path")
 
     sha = columns.get("sha256")
@@ -174,7 +187,7 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
 
     scheme, value = columns.get("entity_scheme"), columns.get("entity_value")
     if (scheme is None) != (value is None):
-        refuse("entity_half", "entity_scheme" if value is None else "entity_value")
+        refuse("entity_half", "entity_value" if value is None else "entity_scheme")
     elif vocabulary is not None and ok("entity_scheme") \
             and columns["entity_scheme"] not in vocabulary.entity_schemes:
         refuse("unknown_entity_scheme", "entity_scheme")
@@ -203,9 +216,10 @@ def quality_notices(columns: Mapping, *, row: Mapping, transition: bool = True) 
         for alias in TRANSITION_ALIASES:
             if alias_used(row, alias):
                 notices.append(Notice("legacy_alias", alias, row[alias]))
-        path = row.get("local_path")
-        if isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
-            notices.append(Notice("legacy_data_prefix", "local_path", path))
+
+    path = row.get("local_path")
+    if isinstance(path, str) and path.startswith(TRANSITION_LOCAL_PATH_PREFIX):
+        notices.append(Notice("legacy_data_prefix", "local_path", path))   # both modes
 
     if columns.get("title") is None:
         notices.append(Notice("empty_title", "title", row.get("title")))
