@@ -20,6 +20,17 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 - **Read-only mounts**: the ingestion container sees the corpus data read-only;
   the vault can never corrupt a corpus.
 
+## Contract
+
+What a manifest row must hold is the **documents contract**, documented in
+[`contract/README.md`](contract/README.md) (fields, refusal and notice reasons, the
+`vocabulary.json` file, versioning) and shipped as the `vault_contract` package: the
+ingestion checks every row with it, producers pin it to write and test their rows, and
+`python -m vault_contract.check` runs it over a manifest directory. A document is
+`(corpus, doc_id)`: a `doc_id` is unique within its corpus only. Hence, for the RAG: Qdrant
+collections are per corpus today, so a point id derived from `doc_id` alone is unique, but **a
+collection mixing corpora must put `corpus` in its point ids**.
+
 ## Services (`compose.yaml`)
 
 | Service | Role | Port |
@@ -554,7 +565,8 @@ Three dashboards over the vault, defined as code in [`metabase/`](metabase/READM
 (`cards.json` + `dashboards.json`, the source of truth, edited by hand):
 
 - **Vault — Corpus** — what's in the corpus: volume, shape, coverage, document explorer.
-- **Vault — Coverage & QC** — what's missing, late or anomalous.
+- **Vault — Coverage & QC** — what's missing, late or anomalous, and (Q7) the manifest rows
+  the last ingestion of each corpus refused.
 - **Vault — RAG & Runs** — is the machine healthy.
 
 ```bash
