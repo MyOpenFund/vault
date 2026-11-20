@@ -1,14 +1,16 @@
 """Reference rows of the `documents` contract, shipped with the package.
 
-Producers and consumers test against the same rows the vault tests against:
+Producers and consumers test against the same rows the vault tests against,
+two JSON Lines files in this directory, one case per line, `case` naming it:
 
-- accepted(): realistic rows every implementation must accept, one file per
-  case in this directory: `{"description", "expected_corpus", "row",
-  "expected_columns"}` (the 18 columns after split_row) and, when the row
-  carries any, `"expected_notices"` (reasons, one entry per notice);
-- refused(): rows that must be refused with exactly `expected_reasons`
-  (`{"description", "expected_corpus", "row", "expected_reasons"}`, plus
-  `"transition": false` for a case judged as after the cleanup), in refused/;
+- accepted.jsonl, accepted(): the representative rows every implementation
+  must accept, `{"case", "description", "expected_corpus", "row",
+  "expected_columns", "expected_notices"}`: `expected_columns` is the 18
+  columns after split_row, `expected_notices` the notice reasons (one entry
+  per notice, [] for a clean row); together they trigger every notice;
+- refused.jsonl, refused(): exactly one row per refusal reason, `{"case",
+  "description", "expected_corpus", "row", "expected_reasons"}`, plus
+  `"transition": false` for a case judged as after the cleanup;
 - vocabulary(corpus): the vocabulary excerpt the cases are checked against,
   `vocabulary_<corpus with - as _>.json`.
 
@@ -21,22 +23,24 @@ from importlib.resources import files
 _HERE = files(__name__)
 
 
-def _load_dir(directory) -> dict[str, dict]:
-    return {
-        entry.name.removesuffix(".json"): json.loads(entry.read_text(encoding="utf-8"))
-        for entry in sorted(directory.iterdir(), key=lambda e: e.name)
-        if entry.name.endswith(".json") and not entry.name.startswith("vocabulary_")
-    }
+def _load(name: str) -> dict[str, dict]:
+    """Case name -> case (the line without its `case` key), in file order."""
+    cases = {}
+    for line in (_HERE / name).read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            case = json.loads(line)
+            cases[case.pop("case")] = case
+    return cases
 
 
 def accepted() -> dict[str, dict]:
     """Case name -> accepted case."""
-    return _load_dir(_HERE)
+    return _load("accepted.jsonl")
 
 
 def refused() -> dict[str, dict]:
     """Case name -> refused case."""
-    return _load_dir(_HERE / "refused")
+    return _load("refused.jsonl")
 
 
 def vocabulary(corpus: str) -> dict:

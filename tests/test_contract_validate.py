@@ -160,20 +160,27 @@ def test_supported_versions_are_this_major_up_to_this_minor(version, ok):
 
 # --- golden ------------------------------------------------------------------
 
-REFERENCE_ROWS = ("cb_rate_decision", "cb_rendered_html", "cb_undated", "sec_10k", "sec_form4")
+# The clean reference rows; the other accepted rows each carry notices.
+REFERENCE_ROWS = ("cb_rate_decision", "sec_10k")
 
 
-def test_golden_has_the_reference_rows_and_the_notice_rows():
+def test_golden_has_the_representative_rows_only():
     assert sorted(golden.accepted()) == sorted([
-        *REFERENCE_ROWS, "cb_empty_title", "cb_legacy_form", "cb_precision_not_stated",
-        "cb_precision_without_date", "sec_text_without_mime"])
+        "sec_10k", "sec_form4", "cb_rate_decision", "cb_legacy_form", "cb_undated",
+        "cb_rendered_html"])
+
+
+def test_golden_has_exactly_one_refused_case_per_reason():
+    reasons = [r for case in golden.refused().values() for r in case["expected_reasons"]]
+    assert sorted(reasons) == sorted(REASONS)
+    assert all(len(case["expected_reasons"]) == 1 for case in golden.refused().values())
 
 
 @pytest.mark.parametrize("name", sorted(golden.accepted()))
 def test_every_golden_row_is_accepted_with_exactly_its_columns_and_notices(name):
     case = golden.accepted()[name]
-    assert set(case) - {"expected_notices"} == {
-        "description", "expected_corpus", "row", "expected_columns"}
+    assert set(case) == {
+        "description", "expected_corpus", "row", "expected_columns", "expected_notices"}
     corpus = case["expected_corpus"]
     checked = check_row(case["row"], VOCABULARIES[corpus], expected_corpus=corpus)
     assert checked.refusals == ()
@@ -194,7 +201,7 @@ def test_every_notice_reason_has_an_accepted_golden_row():
 
 def test_the_reference_rows_carry_no_notice():
     for name in REFERENCE_ROWS:
-        assert "expected_notices" not in golden.accepted()[name]
+        assert golden.accepted()[name]["expected_notices"] == []
 
 
 @pytest.mark.parametrize("name", sorted(golden.refused()))
@@ -535,6 +542,7 @@ def test_after_the_transition_old_keys_are_not_mapped_and_a_data_path_is_refused
 def test_a_notice_names_the_field_and_the_value_as_written():
     row = _golden("cb_undated")
     row["date_precision"] = "year"
+    del row["date_kind"]
     columns, _ = split_row(row)
     assert quality_notices(columns, row=row) == [
         Notice(reason="precision_without_date", field="date_precision", value="year")]
@@ -740,3 +748,49 @@ def test_an_expected_corpus_that_is_not_a_code_is_a_caller_error(corpus):
 def test_a_row_corpus_that_is_not_a_code_never_matches(corpus):
     reasons = _reasons(dict(_golden("sec_10k"), corpus=corpus), expected_corpus="company")
     assert reasons in (["corpus_conflict"], ["bad_text"]), reasons
+
+
+# --- adversarial variants (golden refused files before the JSONL form) -----------------
+# Each: an accepted golden row, the keys changed (None = removed), the corpus it is
+# checked as, and its exact reasons.
+
+
+@pytest.mark.parametrize("base, change, corpus, reasons", [
+    ("cb_rate_decision", {"date": "2022-02-30"}, "central-bank", ["bad_date"]),
+    ("sec_10k", {"revenue_ratio": float("nan")}, "company", ["bad_extra"]),
+    ("sec_10k", {"note\ud800": "x"}, "company", ["bad_extra"]),
+    ("cb_undated", {"local_path": "./raw/ca/E1/0/57d62f059376ad8e.pdf"}, "central-bank",
+     ["bad_local_path"]),
+    ("sec_10k", {"local_path": "raw/0000320193//A1/2024/cf0e49e6e176a851.pdf"}, "company",
+     ["bad_local_path"]),
+    ("cb_rendered_html", {"local_path": "file:///srv/cb/raw/ecb/C1/2023/e1e6a63950c50d3f.pdf"},
+     "central-bank", ["bad_local_path"]),
+    ("sec_form4", {"local_path": "~/company-corpus-data/raw/a.txt"}, "company",
+     ["bad_local_path"]),
+    ("cb_rendered_html", {"local_path": "raw/../../etc"}, "central-bank", ["bad_local_path"]),
+    ("sec_10k", {"local_path": "/Users/x/raw/a.pdf"}, "company", ["bad_local_path"]),
+    ("cb_rendered_html", {"local_path": "raw/ecb/C1/2023/e1e6a63950c50d3f.pdf "},
+     "central-bank", ["bad_local_path"]),
+    ("cb_rendered_html",
+     {"sha256": "sha256:fdd3a53b21b5fd7b7fe7ef6f4209327854b0383ba3cd93a9f720c7fee8456983"},
+     "central-bank", ["bad_sha256"]),
+    ("cb_rate_decision", {"doc_id": "   "}, "central-bank", ["bad_text"]),
+    ("sec_10k", {"doc_id": "cf0e49e6\u0000e176a851"}, "company", ["bad_text"]),
+    ("cb_rate_decision", {"doc_id": 5}, "central-bank", ["bad_text"]),
+    ("sec_form4", {"document_url": {"href": "https://www.sec.gov/Archives/edgar/data/320193/"
+                                            "000032019324000081/wk-form4_1728081005.xml"}},
+     "company", ["bad_text"]),
+    ("cb_rendered_html", {"title": "Disinflation\u0000 policy"}, "central-bank", ["bad_text"]),
+    ("cb_rendered_html", {"title": 42}, "central-bank", ["bad_text"]),
+    # A company row fed to the central-bank ingestion: its codes are unknown there too.
+    ("sec_10k", {}, "central-bank",
+     ["corpus_conflict", "unknown_entity_scheme", "unknown_provenance", "unknown_source_code"]),
+    ("cb_rate_decision", {"local_path": "raw/ecb/A1/2022/" + "n" * 252 + ".pdf",
+                          "mime_type": "application/pdf"}, "central-bank", ["too_long"]),
+    ("cb_rendered_html", {"doc_type": "G9"}, "central-bank", ["unknown_doc_type"]),
+    ("cb_undated", {"year": 2021}, "central-bank", ["year_mismatch"]),
+])
+def test_adversarial_variants_are_refused_for_exactly_their_reasons(base, change, corpus, reasons):
+    row = _golden(base)
+    row.update(change)
+    assert _reasons(row, expected_corpus=corpus) == sorted(reasons)

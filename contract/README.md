@@ -257,25 +257,24 @@ vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know wha
 
 ## Golden rows
 
-`vault_contract.golden` ships the reference cases every implementation is tested against:
+`vault_contract.golden` ships the reference cases every implementation is tested against, two
+JSON Lines files (one case per line, `case` naming it):
 
-- `accepted()`: each case has its `expected_corpus`, its `row`, the `expected_columns`
-  (`split_row` output) and, when it has any, its `expected_notices`:
-  - five reference rows without notice: `sec_10k` (Apple 10-K FY2024, rendered PDF),
-    `sec_form4` (a Form 4 about Apple, insider as `filer_*` extras, text artefact),
-    `cb_rate_decision` (ECB, `date_kind: meeting`, not downloaded yet), `cb_undated` (no date,
-    no precision), `cb_rendered_html` (ECB speech rendered from HTML: `application/pdf`,
-    `html_path` extra, `sha256` of the HTML);
-  - rows with notices: `cb_legacy_form` (the pre-contract central-bank form: `bank_code`,
-    `pdf_url`, no `corpus`, `data/raw/...`, a RePEc month date on the 12th),
-    `cb_empty_title`, `cb_precision_not_stated`, `cb_precision_without_date` (precision and
-    kind on an undated row), `sec_text_without_mime`;
-- `refused()`: at least one case per refusal reason, each with its `expected_corpus`, exact
-  `expected_reasons` and, for a case judged as after the cleanup, `"transition": false`;
+- `accepted()` (`accepted.jsonl`): one row per real producer form, each with its
+  `expected_corpus`, `row`, `expected_columns` (`split_row` output) and `expected_notices`:
+  `sec_10k` (Apple 10-K FY2024, rendered PDF) and `cb_rate_decision` (ECB, `date_kind:
+  meeting`) without notice; `sec_form4` (a Form 4 about Apple, insider as `filer_*` extras,
+  text artefact without mime_type nor precision); `cb_legacy_form` (the pre-contract
+  central-bank form: `bank_code`, `pdf_url`, no `corpus`, `data/raw/...`, a RePEc month date
+  on the 12th, an empty title); `cb_undated` (no date, a leftover precision and kind);
+  `cb_rendered_html` (ECB speech rendered from HTML: `application/pdf`, `html_path` extra,
+  `sha256` of the HTML);
+- `refused()` (`refused.jsonl`): exactly one case per refusal reason, with its
+  `expected_corpus`, `expected_reasons` and, for a case judged as after the cleanup,
+  `"transition": false`;
 - `vocabulary("company")`, `vocabulary("central-bank")`: the vocabulary excerpts they are
   checked against.
 
-Every notice reason has an accepted case and every refusal reason a refused case (tested).
 Hashes in the golden rows are placeholders, well-formed but not the real files' hashes.
 
 ## Vector stores

@@ -102,8 +102,9 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
     assert Path(file_line).is_relative_to(env_dir), file_line
     assert name_line == "documents 1.0.0"
     assert accepted.split() == sorted(vault_contract.golden.accepted())
-    assert len(accepted.split()) == 10
+    assert len(accepted.split()) == 6
     assert refused.split() == sorted(vault_contract.golden.refused())
+    assert len(refused.split()) == len(vault_contract.REASONS)       # one case per reason
     assert vocabularies == "company central-bank"
 
 
@@ -181,3 +182,12 @@ def test_the_package_source_uses_nothing_newer_than_python_3_10():
     for path in sorted((CONTRACT / "src" / "vault_contract").rglob("*.py")):
         hits = newer.findall(path.read_text(encoding="utf-8"))
         assert not hits, f"{path.name}: {hits}"
+
+
+def test_the_golden_data_is_two_jsonl_files_and_two_vocabularies():
+    """One compact JSON object per line: no per-case files to grow again."""
+    golden_dir = CONTRACT / "src" / "vault_contract" / "golden"
+    data = sorted(p.name for p in golden_dir.iterdir() if p.suffix in (".json", ".jsonl"))
+    assert data == ["accepted.jsonl", "refused.jsonl", "vocabulary_central_bank.json",
+                    "vocabulary_company.json"]
+    assert not (golden_dir / "refused").exists()

@@ -57,7 +57,7 @@ def test_a_refused_row_exits_1_with_its_reason_and_an_example(tmp_path, capsys):
 
 
 def test_notices_alone_exit_0_and_1_under_strict(tmp_path, capsys):
-    _write(tmp_path, "ca.jsonl", [_row("cb_empty_title")])
+    _write(tmp_path, "ca.jsonl", [_row("cb_legacy_form")])
     code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank")
     assert code == 0
     assert "  empty_title: 1" in out

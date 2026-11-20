@@ -16,4 +16,4 @@ where = ["src"]
 
 # The golden reference rows are package data: producers test against them.
 [tool.setuptools.package-data]
-"vault_contract.golden" = ["*.json", "refused/*.json"]
+"vault_contract.golden" = ["*.jsonl", "*.json"]
