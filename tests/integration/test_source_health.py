@@ -213,16 +213,16 @@ def test_bad_content_columns_come_last(clean_db, tmp_path, monkeypatch):
     assert cols[-2:] == ["error_samples", "bad_content"]
 
 
-def test_out_of_range_counters_are_null_not_an_error(clean_db, tmp_path, monkeypatch):
+def test_counters_past_9_digits_or_negative_are_null_not_an_error(clean_db, tmp_path, monkeypatch):
     # One malformed report must not make runs_sources (and every view and reader on it) raise
     # "integer out of range": every counter is bounded to 9 digits, like bad_content. A
     # negative counter is malformed too and reads as NULL: a negative bad_content would
     # otherwise offset a positive one and hide a bank under Q6's `HAVING sum > 0`.
     _setup(monkeypatch, clean_db, tmp_path, [make_entry(bank_code="ecb", doc_type="A1")])
-    ten_digits = 2147483647                 # int max, yet past the 9-digit bound
+    more_than_9_digits = 2147483647         # int max, yet past the 9-digit bound
     _plant_runs(clean_db, [_run_row("r0", 0, "ok", [
-        {"source_code": "ecb", "docs_seen": ten_digits, "docs_new": ten_digits,
-         "docs_failed": ten_digits, "fetch_errors": ten_digits, "bad_content": ten_digits},
+        {"source_code": "ecb", **{k: more_than_9_digits for k in (
+            "docs_seen", "docs_new", "docs_failed", "fetch_errors", "bad_content")}},
         {"source_code": "fed", "docs_seen": 999999999, "docs_new": 999999999,
          "docs_failed": 999999999, "fetch_errors": 999999999, "bad_content": 999999999},
         {"source_code": "neg", "docs_seen": -5, "docs_new": -5, "docs_failed": -5,
