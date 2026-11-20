@@ -123,3 +123,38 @@ def test_the_ingestion_image_builds_from_the_repo_root(as_committed):
     build = as_committed["services"]["ingestion"]["build"]
     assert Path(build["context"]) == ROOT
     assert build["dockerfile"] == "ingestion/Dockerfile"
+
+
+def test_the_api_reads_files_under_corpus_roots(as_committed):
+    api = as_committed["services"]["api"]
+    assert api["environment"]["CORPUS_ROOTS"] == "central-bank=/cbdata"
+    assert "RAW_DATA_DIR" not in api["environment"]
+    mounts = {(v["target"], v.get("read_only", False)) for v in api["volumes"]}
+    assert ("/cbdata", True) in mounts
+
+
+def test_the_company_ingestion_is_off_by_default_and_runs_in_its_profile():
+    """`docker compose up` leaves it out; the `company` profile (or `docker
+    compose run ingestion-company`, which enables it) brings it in, built
+    from the same image as `ingestion`."""
+    if not compose_available():
+        pytest.skip("docker compose unavailable")
+    assert "ingestion-company" not in render(COMPOSE)["services"]
+    out = subprocess.run(
+        ["docker", "compose", "--project-directory", str(ROOT),
+         "--env-file", str(ROOT / ".env.example"), "--profile", "company",
+         "-f", str(COMPOSE), "config", "--format", "json"],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+    )
+    assert out.returncode == 0, out.stderr
+    services = json.loads(out.stdout)["services"]
+    company, ingestion = services["ingestion-company"], services["ingestion"]
+    assert company["build"] == ingestion["build"]
+    env = company["environment"]
+    assert (env["CORPUS"], env["DATA_DIR"], env["MANIFEST_GLOBS"], env["VOCABULARY_PATH"]) == (
+        "company", "/data", "manifest/*.jsonl", "/data/vocabulary.json")
+    assert env["VAULT_READONLY_PASSWORD"] and env["VAULT_ORCHESTRATOR_PASSWORD"]
+    assert company["restart"] == "no"
+    [volume] = company["volumes"]
+    assert (volume["target"], volume["read_only"]) == ("/data", True)
+    assert volume["source"] == "/path/to/company-corpus-copy/data"
