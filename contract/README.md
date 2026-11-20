@@ -8,7 +8,8 @@ become typed columns in the vault; corpus-specific fields travel as extras. The 
 ingestion enforces the contract; producers validate their own rows and vocabulary against it
 in CI; data-orchestrator builds the RAG payload from the same split.
 
-Standard library only, Python 3.12+.
+Standard library only, Python 3.10+ (data-orchestrator imports it at run time; CI runs the
+package's tests and the checker over the golden rows on 3.10, job `contract-py310`).
 
 ## Install
 

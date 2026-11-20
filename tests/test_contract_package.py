@@ -12,15 +12,32 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 import venv
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:     # Python 3.10: the contract's CI job runs these tests there
+    tomllib = None
 
 import vault_contract
 import vault_contract.golden
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "contract"
+
+
+def _project():
+    """pyproject.toml's [project] table; on Python 3.10 (no tomllib) its
+    `key = "value"` lines and `dependencies` list, which is all these tests read."""
+    text = (CONTRACT / "pyproject.toml").read_text()
+    if tomllib is not None:
+        return tomllib.loads(text)["project"]
+    table = text.split("[project]", 1)[1].split("\n[", 1)[0]
+    project = dict(re.findall(r'^([\w-]+) = "([^"]*)"', table, re.M))
+    deps = re.search(r"^dependencies = \[(.*?)\]", table, re.M | re.S)
+    project["dependencies"] = re.findall(r'"([^"]*)"', deps.group(1)) if deps else []
+    return project
 
 
 def test_contract_name_and_version():
@@ -30,16 +47,18 @@ def test_contract_name_and_version():
 
 def test_package_version_is_the_contract_version():
     """One number: the package release IS the contract release (spec §3.3)."""
-    project = tomllib.loads((CONTRACT / "pyproject.toml").read_text())["project"]
+    project = _project()
     assert project["name"] == "vault-contract"
     assert project["version"] == vault_contract.CONTRACT_VERSION
 
 
 def test_package_has_no_dependency_beyond_the_standard_library():
     """Every producer installs it; a dependency would leak into all of them."""
-    project = tomllib.loads((CONTRACT / "pyproject.toml").read_text())["project"]
+    project = _project()
     assert project.get("dependencies", []) == []
-    assert project["requires-python"] == ">=3.12"
+    # data-orchestrator (>=3.10) and company-corpus (>=3.11) import it at run
+    # time; CI's `contract-py310` job runs these tests on 3.10.
+    assert project["requires-python"] == ">=3.10"
 
 
 def test_dev_requirements_install_the_contract_package():
@@ -76,7 +95,8 @@ def test_a_clean_venv_install_imports_the_package_and_its_golden_data(tmp_path):
         "print(c.load_vocabulary(golden.vocabulary('company')).corpus,"
         " c.load_vocabulary(golden.vocabulary('central-bank')).corpus)\n"
     )
-    out = subprocess.run([str(python), "-c", probe], cwd=tmp_path,
+    # -I: no PYTHONPATH, no user site, no script directory: only the venv.
+    out = subprocess.run([str(python), "-I", "-c", probe], cwd=tmp_path,
                          check=True, capture_output=True, text=True, timeout=60)
     file_line, name_line, accepted, refused, vocabularies = out.stdout.splitlines()
     assert Path(file_line).is_relative_to(env_dir), file_line
@@ -149,3 +169,15 @@ def test_the_root_build_context_keeps_the_contract_package():
                if l.strip() and not l.startswith("#")]
     assert not any(p in ("contract", "contract/", "contract/src", "**/golden") for p in ignored)
 
+
+
+def test_the_package_source_uses_nothing_newer_than_python_3_10():
+    """requires-python >=3.10: a 3.11+ module or name would break the
+    orchestrator at import. CI's 3.10 job is the real check; this one fails
+    fast on the usual suspects."""
+    newer = re.compile(r"\b(tomllib|typing\.Self|from typing import .*\bSelf\b|StrEnum|"
+                       r"ExceptionGroup|except\*|itertools\.batched|\bbatched\(|datetime\.UTC|"
+                       r"from datetime import .*\bUTC\b|^type \w+ =|def \w+\[)", re.M)
+    for path in sorted((CONTRACT / "src" / "vault_contract").rglob("*.py")):
+        hits = newer.findall(path.read_text(encoding="utf-8"))
+        assert not hits, f"{path.name}: {hits}"
