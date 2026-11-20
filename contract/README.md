@@ -255,6 +255,28 @@ a release without them.
 A reader accepts its own MAJOR and any MINOR at or below its own (`is_supported_version`): a
 vocabulary declaring `1.1.0` is refused by a 1.0.x reader, which cannot know what 1.1 added.
 
+## Golden examples
+
+Why they exist, and what belongs in them:
+
+1. **They are the executable definition of the contract.** Each case is a manifest row plus
+   what the vault must do with it: the columns it becomes and the notices it raises (accepted
+   rows), or the one reason it is refused for (refused rows). Prose can be read two ways; a
+   case cannot.
+2. **They ship inside the package**, so every producer (central-bank-corpus, company-corpus, a
+   third party) and the data-orchestrator test against the very same cases the vault tests
+   against, and CI runs `python -m vault_contract.check` over them on Python 3.10.
+3. **The rule for what goes in: the minimum that proves the contract works.** One accepted row
+   per real producer form (SEC 10-K, SEC Form 4, central-bank modern row, central-bank legacy
+   on-disk form, central-bank undated row, central-bank rendered-HTML row), every notice
+   triggered at least once by those rows, and exactly one refused case per refusal reason.
+   More variants of a rule (other bad paths, other bad texts, ...) belong in the vault's unit
+   tests (`tests/test_contract_validate.py`), not here.
+4. **A new refusal reason or notice comes with its golden case in the same change**: the
+   coverage tests fail otherwise (every reason has a refused case, every notice an accepted one).
+5. **The URLs are real public addresses on purpose** (a realistic row); the hashes are
+   placeholders, well-formed but not the real files' hashes.
+
 ## Golden rows
 
 `vault_contract.golden` ships the reference cases every implementation is tested against, two
@@ -274,8 +296,6 @@ JSON Lines files (one case per line, `case` naming it):
   `"transition": false`;
 - `vocabulary("company")`, `vocabulary("central-bank")`: the vocabulary excerpts they are
   checked against.
-
-Hashes in the golden rows are placeholders, well-formed but not the real files' hashes.
 
 ## Vector stores
 
