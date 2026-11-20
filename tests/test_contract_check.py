@@ -114,8 +114,8 @@ def test_with_transition_a_legacy_form_prints_one_stderr_hint(tmp_path, capsys, 
     code, _, err = _run(capsys, tmp_path, "--corpus", "central-bank")
     assert code == 0
     hints = [line for line in err.splitlines() if "--no-transition" in line]
-    assert hints == [f"note: {named} noticed: the vault ingests with transition=False and "
-                     "refuses these rows; run with --no-transition to judge as it does"]
+    assert hints == [(f"note: {named} noticed: the vault ingests with transition=False and "
+                      "refuses these rows; run with --no-transition to judge as it does")]
 
 
 def test_the_transition_hint_is_silent_without_legacy_forms_or_with_no_transition(
