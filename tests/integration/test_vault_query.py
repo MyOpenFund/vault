@@ -96,6 +96,37 @@ def test_search_desc_walk_keeps_nulls_last_and_doc_id_ascending(conn):
     assert _walk(conn, "desc") == ["fr1", "us1", "us2", "us3"]
 
 
+def test_search_pages_two_corpora_sharing_a_doc_id_and_a_date_exactly_once(conn):
+    """A doc_id is unique only within its corpus: the same doc_id under two
+    corpora on the same date must still page exactly once each (tie-break
+    `doc_id, corpus`), in both directions. On a table this small Postgres may
+    happen to order the twins stably even without `corpus` in the tie-break
+    (seen locally), so the SQL itself is pinned by the unit test
+    `test_search_breaks_sort_ties_by_doc_id_then_corpus`; this one pins the
+    expected order end to end."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO documents (doc_id, corpus, source_code, title, date, year) "
+            "VALUES ('us1', 'company', 'sec', 'Twin of us1', '2010-01-13', 2010)")
+    try:
+        def walk(sort_dir):
+            seen, offset = [], 0
+            while True:
+                _, rows = vq.search_documents(conn, {}, sort_by="date", sort_dir=sort_dir,
+                                              limit=1, offset=offset)
+                if not rows:
+                    return seen
+                seen += [(r["doc_id"], r["corpus"]) for r in rows]
+                offset += len(rows)
+
+        twins = [("us1", "central-bank"), ("us1", "company"), ("us2", "central-bank")]
+        assert walk("asc") == twins + [("fr1", "central-bank"), ("us3", "central-bank")]
+        assert walk("desc") == [("fr1", "central-bank")] + twins + [("us3", "central-bank")]
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM documents WHERE corpus = 'company'")
+
+
 def test_search_offset_past_the_end_is_empty_with_the_true_total(conn):
     """Paging past the last row returns no rows, and still the full total."""
     assert vq.search_documents(conn, {}, offset=99) == (4, [])
