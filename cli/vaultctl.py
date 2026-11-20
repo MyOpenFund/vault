@@ -132,8 +132,9 @@ def get_document(doc_id: str, corpus: Optional[str] = CORPUS_OPTION):
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                _die(f"Document '{doc_id}' not found")
-            _die(str(e))
+                where = f" in corpus '{corpus}'" if corpus is not None else ""
+                _die(f"Document '{doc_id}' not found{where}")
+            _die(_status_error(e))
         except httpx.HTTPError as e:
             _die(str(e))
 

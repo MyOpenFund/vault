@@ -198,6 +198,14 @@ def test_a_doc_id_in_one_corpus_needs_no_corpus_for_its_file(client, monkeypatch
     assert r.status_code == 200 and r.content == b"%PDF cb"
 
 
+def test_an_unknown_document_of_a_corpus_is_a_404_naming_it(client, monkeypatch):
+    monkeypatch.setattr(main, "vq_get_document", lambda _c, _id, corpus=None: [])
+    r = client.get("/documents/d9/file", params={"corpus": "company"})
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Document d9 not found in corpus company"
+    assert client.get("/documents/d9/file").json()["detail"] == "Document d9 not found"
+
+
 def test_a_corpus_without_a_root_is_a_clear_404(client, lookups, monkeypatch, roots):
     monkeypatch.setattr(main, "CORPUS_ROOTS", {"central-bank": roots / "cbdata"})
     r = client.get("/documents/d1/file", params={"corpus": "company"})

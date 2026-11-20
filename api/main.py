@@ -159,7 +159,8 @@ def download_document_file(doc_id: str, corpus: Optional[str] = CORPUS_QUERY):
         rows = vq_get_document(conn, doc_id, corpus)
 
     if not rows:
-        raise HTTPException(404, f"Document {doc_id} not found")
+        where = f" in corpus {corpus}" if corpus is not None else ""
+        raise HTTPException(404, f"Document {doc_id} not found{where}")
     if len(rows) > 1:
         corpora = ", ".join(r["corpus"] for r in rows)
         raise HTTPException(
@@ -179,6 +180,13 @@ def download_document_file(doc_id: str, corpus: Optional[str] = CORPUS_QUERY):
         raise HTTPException(404, "Invalid file path")
     if not is_file(file_path):
         raise HTTPException(404, f"File not found on disk: {row['local_path']}")
+
+    # Accepted TOCTOU window: between the check above and FileResponse opening
+    # the file, the corpus share could swap a component for a symlink leaving
+    # the root, or delete the file. The mounts are read-only to this container
+    # and written only by the corpus producer (trusted, and not adversarial);
+    # closing it would need an O_NOFOLLOW walk from an opened root fd. A file
+    # deleted in between surfaces as an error of that one request.
 
     return FileResponse(
         path=file_path,

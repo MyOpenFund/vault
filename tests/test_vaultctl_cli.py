@@ -161,6 +161,20 @@ def test_get_unknown_doc_id(api):
     assert "Document 'nope' not found" in result.output
 
 
+def test_get_error_shows_the_api_detail(api):
+    api(lambda r: httpx.Response(400, json={"detail": "doc_id must not contain NUL"}))
+    result = invoke("get", "ab12")
+    assert result.exit_code == 1
+    assert "400" in result.output and "doc_id must not contain NUL" in " ".join(result.output.split())
+
+
+def test_get_unknown_doc_id_in_a_corpus_names_it(api):
+    api(lambda r: httpx.Response(404, json={"detail": "Document x not found in corpus company"}))
+    result = invoke("get", "nope", "--corpus", "company")
+    assert result.exit_code == 1
+    assert "Document 'nope' not found in corpus 'company'" in result.output
+
+
 def test_get_server_error(api):
     api(lambda r: httpx.Response(500, text="boom"))
     result = invoke("get", "hh88")
