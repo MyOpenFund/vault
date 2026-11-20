@@ -80,7 +80,9 @@ from collections import Counter
 
 import psycopg2
 from psycopg2.extras import execute_values
-from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row
+from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row, legacy_key_message
+from vault_contract.check import EXCLUDED_BASENAMES
+from vault_contract.validate import LEGACY_KEY
 import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
@@ -997,12 +999,8 @@ MANIFEST_DIR_LAYOUT_GLOBS = ("**/*.jsonl",)
 # with the pre-allowlist scan); MANIFEST_GLOBS is taken literally:
 # the cadence snapshot and the watchdog's private state (ingest_cadence.py),
 # the runs telemetry (ingest_runs.py), the discovery-error trail
-# (ingest_discovery_errors.py), and three producer audit files.
-EXCLUDED_BASENAMES = frozenset({
-    "cadence.jsonl", "cadence_state.jsonl", "runs.jsonl",
-    "discovery_errors.jsonl", "download_errors.jsonl",
-    "download_quarantine.jsonl", "wp_dates_index.jsonl",
-})
+# (ingest_discovery_errors.py), and three producer audit files. The set lives
+# in vault_contract.check, so the manifest checker skips the same files.
 
 
 def parse_manifest_globs(raw):
@@ -1192,6 +1190,7 @@ class RunReport:
         self.records = []           # ingestion_refusals rows
         self.unlogged = 0
         self.pending = []           # notices of each row parse_line returned, in order
+        self.legacy_keys = set()    # old keys refused legacy_key: one hint each
 
     def source_name(self, source_file):
         """The file as stored in ingestion_refusals: relative to DATA_DIR when under it."""
@@ -1210,6 +1209,8 @@ class RunReport:
         name = self.source_name(source_file)
         for r in refusals:
             self.refusals[r.reason] += 1
+            if r.reason == LEGACY_KEY:
+                self.legacy_keys.add(r.field)
             if r.reason == NOT_JSON:          # the raw line, not a value
                 # Sliced first: a torn line can be megabytes long, and its
                 # repr would be built in full only to be cut.
@@ -1257,6 +1258,8 @@ class RunReport:
             + (f" ({by_reason(self.notices)})" if self.notices else ""),
             f"sweep: {sweep}",
         ]
+        # What the producer must write instead, once per old key.
+        lines[1:1] = [f"{LEGACY_KEY}: {legacy_key_message(k)}" for k in sorted(self.legacy_keys)]
         if self.unlogged:
             lines.insert(1, f"refusals: {self.unlogged} more not logged one by one "
                             f"(REFUSAL_LOG_LIMIT={REFUSAL_LOG_LIMIT}); all are in ingestion_refusals")
@@ -1269,8 +1272,8 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
 
     None for a blank line, and for a refused line: not a JSON object
     (not_json), or refused by vault_contract.check_row (transition=False: a
-    row without `corpus`, `bank_code` without `source_code` and a `data/`
-    prefix are refused, not tolerated; this service's CORPUS expected;
+    row without `corpus`, a `bank_code` or `pdf_url` key (legacy_key) and a
+    `data/` prefix are refused, not tolerated; this service's CORPUS expected;
     `vocabulary` None = codes not checked; its bad_extra included). A refused
     line is recorded in `report` (counted, logged, kept for
     ingestion_refusals); an accepted row's notices are appended to

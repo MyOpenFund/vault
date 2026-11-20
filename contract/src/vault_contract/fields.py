@@ -1,4 +1,4 @@
-"""The common fields of a `documents` row and `split_row` (contract 1.0.0).
+"""The common fields of a `documents` row and `split_row` (contract 1.1.0).
 
 Every manifest line is one JSON object. The keys named in COLUMNS have one
 name and one meaning in every corpus and become typed columns in the vault;
@@ -29,8 +29,8 @@ DATE_KINDS: tuple[str, ...] = ("publication", "meeting", "period")
 # Old key -> contract column. Transition only: with split_row(transition=True)
 # (the default, kept for the whole 1.x line) the old key fills the column when
 # the contract key is absent or blank and never lands in `extra`; with
-# transition=False (how the vault ingests since 2026-11-20) it is an ordinary
-# extra.
+# transition=False (how the vault ingests since 2026-11-20) it stays in
+# `extra`, where extra_refusals refuses it (legacy_key, since 1.1.0).
 TRANSITION_ALIASES: dict[str, str] = {"bank_code": "source_code", "pdf_url": "document_url"}
 
 # Transition only: central-bank manifests stored local_path relative to the

@@ -239,7 +239,7 @@ def test_the_golden_legacy_form_row_is_refused_and_blocks_the_sweep(
     clean_db, tmp_path, monkeypatch, caplog
 ):
     """Transition over (PR 6): a producer still writing the pre-contract form
-    (no corpus, bank_code, a data/ path) gets its row refused, and the sweep
+    (no corpus, bank_code, pdf_url, a data/ path) gets its row refused, and the sweep
     is skipped so the live rows it no longer lists survive."""
     write_vocabulary(tmp_path, golden.vocabulary(CB))
     write_manifest(tmp_path / "manifest", "jp.jsonl",
@@ -257,8 +257,10 @@ def test_the_golden_legacy_form_row_is_refused_and_blocks_the_sweep(
     assert _rows(clean_db, "SELECT count(*) FROM documents WHERE doc_id = %s",
                  (legacy["doc_id"],)) == [(0,)]
     assert fetch_all(clean_db, "SELECT source_file, line, doc_id, reason, field FROM "
-                               "ingestion_refusals ORDER BY reason") == [
+                               "ingestion_refusals ORDER BY reason, field") == [
         ("manifest/jp.jsonl", 2, legacy["doc_id"], "bad_local_path", "local_path"),
+        ("manifest/jp.jsonl", 2, legacy["doc_id"], "legacy_key", "bank_code"),
+        ("manifest/jp.jsonl", 2, legacy["doc_id"], "legacy_key", "pdf_url"),
         ("manifest/jp.jsonl", 2, legacy["doc_id"], "missing_corpus", "corpus"),
         ("manifest/jp.jsonl", 2, legacy["doc_id"], "missing_source_code", "source_code"),
     ]

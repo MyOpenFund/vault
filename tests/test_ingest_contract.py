@@ -71,7 +71,8 @@ def test_upsert_conflicts_on_corpus_and_doc_id():
 
 # Golden cases that describe the pre-contract manifest form, accepted by the
 # contract only with transition=True. The vault ingests with transition=False:
-# they are refused (missing_corpus, missing_source_code, bad_local_path).
+# they are refused (missing_corpus, missing_source_code, bad_local_path,
+# legacy_key).
 LEGACY_FORM_CASES = {"cb_legacy_form"}
 
 
@@ -103,7 +104,7 @@ def test_the_golden_legacy_form_row_is_refused():
     assert parse(golden.accepted()["cb_legacy_form"]["row"], report=report,
                  vocabulary=cb_vocabulary()) is None
     assert report.refusals == {"missing_corpus": 1, "missing_source_code": 1,
-                               "bad_local_path": 1}
+                               "bad_local_path": 1, "legacy_key": 2}   # bank_code, pdf_url
     assert report.refused_rows == 1
     report.commit_notices()
     assert report.notices == Counter()

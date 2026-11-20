@@ -94,7 +94,7 @@ def _broken(**changes):
 @pytest.mark.parametrize("doc, fragment", [
     (_broken(contract="dataset"), "contract"),
     (_broken(contract_version="2.0.0"), "contract_version"),
-    (_broken(contract_version="1.1.0"), "contract_version"),   # newer MINOR than this package
+    (_broken(contract_version="1.2.0"), "contract_version"),   # newer MINOR than this package
     (_broken(contract_version="1.0"), "contract_version"),
     (_broken(contract_version=1), "contract_version"),
     (_broken(corpus=""), "corpus"),
@@ -150,7 +150,7 @@ def test_unknown_top_level_keys_are_allowed():
 
 
 @pytest.mark.parametrize("version, ok", [
-    ("1.0.0", True), ("1.0.7", True), ("1.1.0", False), ("2.0.0", False),
+    ("1.0.0", True), ("1.0.7", True), ("1.1.0", True), ("1.2.0", False), ("2.0.0", False),
     ("0.9.0", False), ("1.0", False), ("v1.0.0", False), (None, False),
 ])
 def test_supported_versions_are_this_major_up_to_this_minor(version, ok):
@@ -224,7 +224,7 @@ def test_reasons_are_the_decided_list():
         "missing_language", "missing_provenance", "bad_text", "too_long", "corpus_conflict",
         "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
         "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
-        "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
+        "bad_sha256", "entity_half", "unknown_entity_scheme", "legacy_key", "bad_extra",
     )
 
 
@@ -528,15 +528,66 @@ def test_an_alias_shadowed_by_its_contract_key_is_not_noticed():
 
 
 def test_after_the_transition_old_keys_are_not_mapped_and_a_data_path_is_refused():
-    """transition=False: bank_code is an extra, so source_code is missing; a
-    `data/` path is no longer stripped, and storing data/raw/... would break
-    every reader, so it is refused, still with its legacy_data_prefix notice."""
+    """transition=False: bank_code is not mapped, so source_code is missing,
+    and the old key itself is legacy_key; a `data/` path is no longer
+    stripped, and storing data/raw/... would break every reader, so it is
+    refused, still with its legacy_data_prefix notice."""
     row = _golden("cb_rendered_html")
     row["bank_code"] = row.pop("source_code")
     row["local_path"] = "data/" + row["local_path"]
     assert _reasons(row, expected_corpus="central-bank", transition=False) == [
-        "bad_local_path", "missing_source_code"]
+        "bad_local_path", "legacy_key", "missing_source_code"]
     assert _notices(row, transition=False) == ["legacy_data_prefix"]
+
+
+# --- legacy_key: an old key once the transition is over ------------------------
+
+def _refusals(row, *, transition):
+    return check_row(row, VOCABULARIES["central-bank"], expected_corpus="central-bank",
+                     transition=transition).refusals
+
+
+def test_a_lone_pdf_url_is_refused_after_the_transition_not_silently_dropped():
+    """Mapped during the transition; after it, a row carrying only pdf_url
+    would be written with document_url NULL, wiping the stored URL on upsert:
+    refused by name instead."""
+    row = _golden("cb_rendered_html")
+    url = row.pop("document_url")
+    row["pdf_url"] = url
+    assert _refusals(row, transition=False) == (Refusal("legacy_key", "pdf_url", url),)
+    checked = check_row(row, VOCABULARIES["central-bank"], expected_corpus="central-bank")
+    assert checked.accepted and checked.columns["document_url"] == url
+    assert [n.reason for n in checked.notices] == ["legacy_alias"]
+
+
+@pytest.mark.parametrize("old, new", [("bank_code", "source_code"),
+                                      ("pdf_url", "document_url")])
+@pytest.mark.parametrize("value", ["https://a/old", "", None])
+def test_an_old_key_beside_its_contract_key_is_refused_after_the_transition(old, new, value):
+    """Any value, even blank or null: the producer still writes the old schema."""
+    row = _golden("cb_rendered_html")
+    row[old] = value
+    assert _refusals(row, transition=False) == (Refusal("legacy_key", old, value),)
+    # transition=True: unchanged, the contract key wins and the old key is dropped
+    assert _refusals(row, transition=True) == ()
+
+
+def test_one_legacy_key_refusal_per_old_key_in_row_order():
+    row = {"pdf_url": "https://a/b.pdf", "x": 1, "bank_code": "ecb"}
+    assert [(r.reason, r.field) for r in extra_refusals(split_row(row, transition=False)[1])] == [
+        ("legacy_key", "pdf_url"), ("legacy_key", "bank_code")]
+
+
+def test_an_old_key_is_legacy_key_not_also_bad_extra():
+    assert [r.reason for r in extra_refusals({"pdf_url": "a\u0000b"})] == ["legacy_key"]
+
+
+def test_the_legacy_key_message_names_both_keys_and_the_migration():
+    from vault_contract import legacy_key_message
+    for old, new in (("bank_code", "source_code"), ("pdf_url", "document_url")):
+        message = legacy_key_message(old)
+        assert f"'{old}'" in message and f"'{new}'" in message
+        assert "migrat" in message and "--no-transition" in message
 
 
 def test_a_notice_names_the_field_and_the_value_as_written():

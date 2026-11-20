@@ -6,7 +6,8 @@ provisioned, rows carrying URLs. The first run of the new code re-runs the
 train once (its text changed), renames the column in place without touching a
 value, recreates the views on the new name and re-issues the grants; the next
 run skips the train. Since the transition cleanup (PR 6) a manifest's
-`pdf_url` is no longer read as document_url: it is an ordinary extra.
+`pdf_url` is no longer read as document_url: the row is refused (legacy_key),
+never written with document_url NULL over the stored URL.
 """
 
 import logging
@@ -168,9 +169,13 @@ def test_a_fresh_database_has_document_url_only(clean_db, tmp_path, monkeypatch)
         ("https://x.invalid/d1.pdf", None)]
 
 
-def test_a_manifest_pdf_url_is_an_extra_not_document_url(clean_db, tmp_path, monkeypatch):
+def test_a_manifest_pdf_url_is_refused_and_the_stored_url_survives(
+    clean_db, tmp_path, monkeypatch, caplog
+):
     """Ingested onto a renamed pre-rename database: the old key is no longer
-    mapped (transition over), so it lands in `extra` like any unknown key."""
+    mapped (transition over). Written as an extra, keep-1's upsert would set
+    document_url NULL over its stored URL; the row is refused (legacy_key)
+    instead, the stored row is untouched and the sweep is skipped."""
     _build_pre_rename_database(clean_db)
     write_manifest(tmp_path, "m.jsonl", [
         make_doc("keep-1", pdf_url="https://x.invalid/1-moved.pdf"),            # old key only
@@ -179,15 +184,21 @@ def test_a_manifest_pdf_url_is_an_extra_not_document_url(clean_db, tmp_path, mon
         make_doc("keep-3", document_url="https://x.invalid/3.pdf"),            # contract row
         make_doc("new-1"),                                                     # no URL at all
     ])
-    run_ingest(monkeypatch, clean_db, tmp_path)
+    with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert exc.value.code == 1
 
     assert fetch_all(clean_db, "SELECT doc_id, document_url, extra FROM documents "
                                "ORDER BY doc_id") == [
-        ("keep-1", None, {"pdf_url": "https://x.invalid/1-moved.pdf"}),
-        ("keep-2", "https://x.invalid/2.html", {"pdf_url": "https://x.invalid/2-stale.pdf"}),
+        ("keep-1", "https://x.invalid/1.pdf", None),       # the stored URL survives
+        ("keep-2", None, None),                            # not overwritten either
         ("keep-3", "https://x.invalid/3.pdf", None),
         ("new-1", None, None),
     ]
+    assert fetch_all(clean_db, "SELECT doc_id, reason, field FROM ingestion_refusals "
+                               "ORDER BY doc_id") == [
+        ("keep-1", "legacy_key", "pdf_url"), ("keep-2", "legacy_key", "pdf_url")]
+    assert "legacy_key: 'pdf_url'" in caplog.text            # the run summary's hint
 
 
 def test_both_url_columns_backfill_and_keep_pdf_url(clean_db, tmp_path, monkeypatch, caplog):

@@ -79,13 +79,11 @@ def test_a_whitespace_corpus_is_refused():
 
 def test_bank_code_is_no_longer_read_as_source_code():
     assert refusals_of(legacy_line(source_code=None, bank_code="us")) == {
-        "missing_source_code": 1}
+        "missing_source_code": 1, "legacy_key": 1}
 
 
-def test_bank_code_beside_source_code_is_a_plain_extra():
-    row = parse_line(make_line(bank_code="fr"), "f.jsonl", 1, RUN_TS, CORPUS)
-    assert row[2] == "us"
-    assert json.loads(row[-1]) == {"bank_code": "fr"}
+def test_bank_code_beside_source_code_is_refused_as_a_legacy_key():
+    assert refusals_of(make_line(bank_code="fr")) == {"legacy_key": 1}
 
 
 def test_a_data_prefixed_local_path_is_refused():
@@ -122,21 +120,40 @@ def test_document_url_fills_the_column():
     assert row[-1] is None  # no extra
 
 
-def test_pdf_url_is_a_plain_extra_and_never_fills_document_url():
-    # pdf_url was the name of document_url until 2026-11-19; no longer read.
-    row = parse_line(make_line(pdf_url="https://x.invalid/old.pdf"),
-                     "f.jsonl", 1, RUN_TS, CORPUS)
-    assert row[DOCUMENT_URL] is None
-    assert json.loads(row[-1]) == {"pdf_url": "https://x.invalid/old.pdf"}
+def test_a_lone_pdf_url_is_refused_never_written_with_document_url_null():
+    # pdf_url was the name of document_url until 2026-11-19. Written as an
+    # extra, the row's upsert would set document_url NULL over the stored URL.
+    report = RunReport(CORPUS, RUN_TS)
+    assert parse_line(make_line(pdf_url="https://x.invalid/old.pdf"),
+                      "f.jsonl", 1, RUN_TS, CORPUS, report=report) is None
+    assert report.refusals == {"legacy_key": 1}
+    assert report.records[0][5:] == ("legacy_key", "pdf_url", "'https://x.invalid/old.pdf'")
 
 
-def test_document_url_beside_pdf_url_keeps_its_own_value():
-    row = parse_line(
-        make_line(document_url="https://x.invalid/new.html", pdf_url="https://x.invalid/old.pdf"),
-        "f.jsonl", 1, RUN_TS, CORPUS,
-    )
-    assert row[DOCUMENT_URL] == "https://x.invalid/new.html"
-    assert json.loads(row[-1]) == {"pdf_url": "https://x.invalid/old.pdf"}
+def test_document_url_beside_pdf_url_is_refused_as_a_legacy_key():
+    assert refusals_of(make_line(document_url="https://x.invalid/new.html",
+                                 pdf_url="https://x.invalid/old.pdf")) == {"legacy_key": 1}
+
+
+def test_the_run_summary_says_once_per_old_key_what_to_write_instead():
+    from vault_contract import legacy_key_message
+    report = RunReport(CORPUS, RUN_TS)
+    for n in (1, 2):
+        parse_line(make_line(doc_id=f"d{n}", pdf_url="https://x.invalid/old.pdf"),
+                   "f.jsonl", n, RUN_TS, CORPUS, report=report)
+    parse_line(make_line(doc_id="d3", bank_code="fr"), "f.jsonl", 3, RUN_TS, CORPUS,
+               report=report)
+    lines = report.summary_lines("skipped")
+    assert [line for line in lines if line.startswith("legacy_key: ")] == [
+        f"legacy_key: {legacy_key_message('bank_code')}",
+        f"legacy_key: {legacy_key_message('pdf_url')}"]
+
+
+def test_the_ingestion_excludes_the_checkers_producer_files():
+    """One list: the checker skips the files the ingestion never reads."""
+    import ingest
+    from vault_contract import check
+    assert ingest.EXCLUDED_BASENAMES is check.EXCLUDED_BASENAMES
 
 
 def test_an_empty_document_url_is_null():

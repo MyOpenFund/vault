@@ -1,4 +1,4 @@
-"""Two levels of checks on a manifest row (contract 1.0.0).
+"""Two levels of checks on a manifest row (contract 1.1.0).
 
 - Refusals (validate_row on the columns, extra_refusals on `extra`):
   structure, identity, and what a database cannot store. A refused row is not
@@ -30,8 +30,15 @@ REASONS: tuple[str, ...] = (
     "missing_language", "missing_provenance", "bad_text", "too_long", "corpus_conflict",
     "unknown_source_code", "unknown_doc_type", "unknown_provenance", "bad_language",
     "bad_date", "year_mismatch", "bad_date_precision", "bad_date_kind", "bad_local_path",
-    "bad_sha256", "entity_half", "unknown_entity_scheme", "bad_extra",
+    "bad_sha256", "entity_half", "unknown_entity_scheme", "legacy_key", "bad_extra",
 )
+
+# legacy_key (1.1.0): the old keys of TRANSITION_ALIASES are refused by name
+# once the transition is over (transition=False, how the vault ingests). Read
+# as a plain extra, a row carrying `pdf_url` alone would be written with
+# document_url NULL, wiping a stored URL on upsert; never refused with
+# transition=True, where split_row maps or drops them.
+LEGACY_KEY = "legacy_key"
 
 # Every reason quality_notices can give, in check order. Counted by run
 # reports too; the row is written all the same.
@@ -270,15 +277,30 @@ def _storable(value: object) -> bool:
     return True
 
 
+def legacy_key_message(key: str) -> str:
+    """What to tell the producer of a row refused legacy_key for `key`."""
+    return (f"{key!r} is a pre-contract key, refused since the transition ended: write "
+            f"{TRANSITION_ALIASES[key]!r} instead. Rerun the producer's manifest migration "
+            "(its contract-migration command) to rewrite existing manifests, then check them "
+            "with --no-transition")
+
+
 def extra_refusals(extra: Mapping) -> list[Refusal]:
-    """One bad_extra refusal per top-level `extra` key whose key or value a
-    JSON database cannot store (see _storable), in row order ([] = fine).
+    """One refusal per bad top-level `extra` key, in row order ([] = fine):
+    legacy_key for an old key of TRANSITION_ALIASES (only split_row with
+    transition=False leaves one in `extra`), else bad_extra when the key or
+    its value is something a JSON database cannot store (see _storable).
 
     `field` is the top-level key as written (it may itself be the unstorable
     part: a consumer storing it shows its repr), `value` its value.
     """
-    return [Refusal("bad_extra", key, value) for key, value in extra.items()
-            if not (isinstance(key, str) and _storable_text(key) and _storable(value))]
+    refusals = []
+    for key, value in extra.items():
+        if key in TRANSITION_ALIASES:
+            refusals.append(Refusal(LEGACY_KEY, key, value))
+        elif not (isinstance(key, str) and _storable_text(key) and _storable(value)):
+            refusals.append(Refusal("bad_extra", key, value))
+    return refusals
 
 
 def _not_period_start(day: datetime.date, precision: object) -> bool:
