@@ -75,6 +75,11 @@ UTF-8 or starts with a UTF-8 BOM (the ingestion would refuse its first line as `
 no line that is a JSON object at all, an unreadable or invalid vocabulary, a vocabulary of
 another corpus.
 
+With the default `transition=True`, a run that notices `corpus_missing`, `legacy_alias` or
+`legacy_data_prefix` also prints one line on stderr: the vault refuses those rows (it ingests
+with `transition=False`); run again with `--no-transition` to judge as it does. Exit code and
+stdout are unchanged.
+
 ## Fields
 
 A manifest line is one JSON object. These 18 keys are the common fields. "When absent"

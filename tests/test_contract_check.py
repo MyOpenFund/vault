@@ -98,6 +98,39 @@ def test_without_transition_a_legacy_row_is_refused(tmp_path, capsys):
     assert "missing_corpus" in out and "missing_source_code" in out
 
 
+@pytest.mark.parametrize("change, named", [
+    (lambda r: None, "corpus_missing, legacy_alias, legacy_data_prefix"),
+    (lambda r: r.update(corpus="central-bank", source_code=r.pop("bank_code"),
+                        document_url=r.pop("pdf_url")), "legacy_data_prefix"),
+    (lambda r: r.update(local_path=r["local_path"].removeprefix("data/")),
+     "corpus_missing, legacy_alias"),
+])
+def test_with_transition_a_legacy_form_prints_one_stderr_hint(tmp_path, capsys, change, named):
+    """The default (transition=True) accepts the pre-contract forms the vault
+    refuses: one stderr line says so; stdout and the exit code are unchanged."""
+    row = _row("cb_legacy_form")
+    change(row)
+    _write(tmp_path, "jp.jsonl", [row])
+    code, _, err = _run(capsys, tmp_path, "--corpus", "central-bank")
+    assert code == 0
+    hints = [line for line in err.splitlines() if "--no-transition" in line]
+    assert hints == [f"note: {named} noticed: the vault ingests with transition=False and "
+                     "refuses these rows; run with --no-transition to judge as it does"]
+
+
+def test_the_transition_hint_is_silent_without_legacy_forms_or_with_no_transition(
+        tmp_path, capsys):
+    _write(tmp_path / "clean", "ecb.jsonl", [_row("cb_rate_decision")])
+    code, _, err = _run(capsys, tmp_path / "clean", "--corpus", "central-bank")
+    assert code == 0 and err == ""
+    _write(tmp_path / "legacy", "jp.jsonl", [_row("cb_legacy_form")])
+    code, out, err = _run(capsys, tmp_path / "legacy", "--corpus", "central-bank",
+                          "--no-transition")
+    assert code == 1
+    assert "  legacy_data_prefix: 1" in out      # noticed in both modes
+    assert "--no-transition" not in err
+
+
 def test_the_vocabulary_checks_codes(tmp_path, capsys):
     row = _row("sec_10k")
     row["doc_type"] = "10-K"

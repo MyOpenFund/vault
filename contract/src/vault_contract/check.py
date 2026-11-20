@@ -9,7 +9,8 @@ JSON object (unparsable, deep nesting and oversized integers included, or
 valid JSON of another type) is refused as not_json, as the ingestion refuses
 it; every other line goes through check_row as the ingestion will (the vault
 ingests with transition=False: pass --no-transition to judge exactly as it
-does; the default, transition=True, also reads the pre-contract forms).
+does; the default, transition=True, also reads the pre-contract forms, and
+then prints one stderr line when it noticed one of them).
 doc_ids are then resolved as the vault resolves them: the last valid line of a
 doc_id wins (dedupe_rows within a file, upserts in file order across files),
 so every earlier valid occurrence is refused as duplicate_doc_id, pointing at
@@ -38,6 +39,9 @@ DUPLICATE_DOC_ID = "duplicate_doc_id"
 # duplicate_doc_id, not a contract reason: such a line is not a row at all).
 NOT_JSON = "not_json"
 EXAMPLES = 3
+# The notices of the pre-contract forms transition=True reads: the vault,
+# ingesting with transition=False, refuses the rows that carry them.
+TRANSITION_NOTICES = ("corpus_missing", "legacy_alias", "legacy_data_prefix")
 VALUE_CHARS = 80
 
 
@@ -191,6 +195,11 @@ def main(argv=None):
     print(f"rows: {rows} (refused {refused_rows}, with notices {noticed_rows})")
     refusals.print("refusals")
     notices.print("notices")
+    legacy = [r for r in TRANSITION_NOTICES if notices.counts[r]]
+    if args.transition and legacy:
+        print(f"note: {', '.join(legacy)} noticed: the vault ingests with transition=False and "
+              "refuses these rows; run with --no-transition to judge as it does",
+              file=sys.stderr)
 
     if unreadable:
         return 2
