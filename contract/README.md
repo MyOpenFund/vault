@@ -60,11 +60,14 @@ python -m vault_contract.check <manifest_dir> --corpus central-bank \
     [--vocabulary vocabulary.json] [--glob '*.jsonl'] [--no-transition] [--strict]
 ```
 
-It prints the count of refusals and notices per reason with up to 3 examples each, and also
-refuses every repeated `doc_id` after its first occurrence (`duplicate_doc_id`: identity is
-(`corpus`, `doc_id`)). Exit 0: nothing refused. 1: a row refused, or under `--strict` a
-notice or a line that is not a JSON object. 2: usage error, no matching file, a file that
-is not UTF-8, an unreadable or invalid vocabulary, a vocabulary of another corpus.
+It reads files as the vault ingestion does (UTF-8; lines ended by `\n`, `\r\n` or `\r` only)
+and prints the count of refusals and notices per reason with up to 3 examples each. It also
+resolves `doc_id`s as the vault does: the last valid line of a `doc_id` wins, so every earlier
+valid occurrence is refused as `duplicate_doc_id`, pointing at the kept one. Exit 0: nothing
+refused. 1: a row refused, or under `--strict` a notice or a line that is not a JSON object.
+2: usage error (empty `--corpus`, bad `--glob`), no matching file, a file that cannot be
+read, is not UTF-8 or starts with a UTF-8 BOM (the ingestion would skip its first line), no
+row at all, an unreadable or invalid vocabulary, a vocabulary of another corpus.
 
 ## Fields
 
@@ -173,8 +176,8 @@ Both reason lists, in check order, are part of the contract: run reports count r
 | `entity_half` | one of `entity_scheme` / `entity_value` without the other; `field` names the missing one |
 | `unknown_entity_scheme` | `entity_scheme` not declared in the vocabulary |
 
-Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every
-occurrence of a `doc_id` after its first within the corpus.
+Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every valid
+occurrence of a `doc_id` before the last one within the corpus (the vault keeps the last).
 
 A field refused for presence or type is not judged further (a numeric `source_code` is
 `bad_text`, not also `unknown_source_code`).

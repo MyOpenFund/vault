@@ -3,19 +3,25 @@
     python -m vault_contract.check <manifest_dir> --corpus central-bank \
         [--vocabulary vocabulary.json] [--glob '*.jsonl'] [--no-transition] [--strict]
 
-Every line goes through check_row exactly as the vault ingestion will, and
-doc_ids are checked for uniqueness across all the files (identity is
-(corpus, doc_id)): every occurrence after the first is refused as
-duplicate_doc_id. Prints the counts of refusals and notices per reason with up
-to 3 examples each.
+Files are read as the vault ingestion reads them: UTF-8, lines ended by \n,
+\r\n or \r only, each line stripped. Every line goes through check_row
+exactly as the ingestion will. doc_ids are then resolved as the vault resolves
+them: the last valid line of a doc_id wins (dedupe_rows within a file, upserts
+in file order across files), so every earlier valid occurrence is refused as
+duplicate_doc_id, pointing at the kept one. Prints the counts of refusals and
+notices per reason with up to 3 examples each.
 
 Exit 0: no row refused. 1: at least one row refused, or under --strict at
-least one notice or one line that is not a JSON object. 2: usage error, no
-file matching the glob, a file that is not UTF-8, an unreadable or invalid
-vocabulary, or a vocabulary of another corpus. Lines that are not a JSON
-object are counted apart: the ingestion skips them before the contract applies.
+least one notice or one line that is not a JSON object. 2: usage error (an
+empty --corpus, a bad --glob), no file matching the glob, a file that cannot
+be read, is not UTF-8 or starts with a UTF-8 BOM (the ingestion would skip its
+first line), no row at all, an unreadable or invalid vocabulary, or a
+vocabulary of another corpus. Lines that are not a JSON object (deep nesting
+and oversized integers included) are counted apart: the ingestion skips them
+before the contract applies.
 """
 import argparse
+import io
 import json
 import sys
 from collections import Counter, defaultdict
@@ -78,6 +84,8 @@ def main(argv=None):
                         help="exit 1 on any notice or line that is not a JSON object")
     args = parser.parse_args(argv)
 
+    if not args.corpus:
+        parser.error("--corpus must not be empty")
     if not args.manifest_dir.is_dir():
         parser.error(f"not a directory: {args.manifest_dir}")
     vocabulary = None
@@ -86,29 +94,47 @@ def main(argv=None):
         if error:
             print(error, file=sys.stderr)
             return 2
-    files = sorted(p for p in args.manifest_dir.glob(args.glob) if p.is_file())
+    try:
+        files = sorted(p for p in args.manifest_dir.glob(args.glob) if p.is_file())
+    except (ValueError, NotImplementedError) as e:
+        print(f"bad --glob {args.glob!r}: {e}", file=sys.stderr)
+        return 2
     if not files:
         print(f"no file matches {args.glob!r} under {args.manifest_dir}", file=sys.stderr)
         return 2
 
     rows = refused_rows = noticed_rows = not_objects = 0
-    not_utf8 = []
+    unreadable = []
     refusals, notices = _Tally(), _Tally()
-    first_seen = {}
+    valid = {}          # doc_id -> [location of each valid line], in vault order
 
     for path in files:
         try:
-            text = path.read_bytes().decode("utf-8")
+            data = path.read_bytes()
+        except OSError as e:
+            unreadable.append(path)
+            print(f"{path.name}: cannot be read ({e}), not checked", file=sys.stderr)
+            continue
+        if data.startswith(b"\xef\xbb\xbf"):
+            unreadable.append(path)
+            print(f"{path.name}: starts with a UTF-8 BOM; the ingestion would skip its "
+                  "first line, not checked", file=sys.stderr)
+            continue
+        try:
+            text = data.decode("utf-8")
         except UnicodeDecodeError as e:
-            not_utf8.append(path)
+            unreadable.append(path)
             print(f"{path.name}: not UTF-8 ({e}), not checked", file=sys.stderr)
             continue
-        for line_num, line in enumerate(text.splitlines(), 1):
-            if not line.strip():
+        # A text-mode file object, as open(..., encoding="utf-8") in the
+        # ingestion: universal newlines, no split on U+2028, U+0085, ...
+        for line_num, line in enumerate(io.StringIO(text, newline=None), 1):
+            line = line.strip()
+            if not line:
                 continue
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):   # JSONDecodeError; an int past 4300 digits
                 row = None
             if not isinstance(row, dict):
                 not_objects += 1
@@ -116,33 +142,37 @@ def main(argv=None):
             rows += 1
             checked = check_row(row, vocabulary, expected_corpus=args.corpus,
                                 transition=args.transition)
-            here = f"{path.name}:{line_num}"
-            where = f"{here} doc_id={_shown(checked.columns['doc_id'])}"
-            refused = bool(checked.refusals)
+            where = f"{path.name}:{line_num} doc_id={_shown(checked.columns['doc_id'])}"
+            if checked.refusals:
+                refused_rows += 1
+            elif is_text(checked.columns["doc_id"]):
+                valid.setdefault(checked.columns["doc_id"], []).append(
+                    (f"{path.name}:{line_num}", where))
             for r in checked.refusals:
                 refusals.add(r.reason, f"{where} {r.field}={_shown(r.value)}")
-            doc_id = checked.columns["doc_id"]
-            if is_text(doc_id):
-                if doc_id in first_seen:
-                    refusals.add(DUPLICATE_DOC_ID, f"{where} first at {first_seen[doc_id]}")
-                    refused = True
-                else:
-                    first_seen[doc_id] = here
-            refused_rows += refused
             noticed_rows += bool(checked.notices)
             for n in checked.notices:
                 notices.add(n.reason, f"{where} {n.field}={_shown(n.value)}")
 
+    for occurrences in valid.values():
+        kept = occurrences[-1][0]
+        for _, where in occurrences[:-1]:
+            refusals.add(DUPLICATE_DOC_ID, f"{where} superseded by {kept}")
+            refused_rows += 1
+
     print(f"corpus: {args.corpus}")
     print(f"vocabulary: {args.vocabulary if vocabulary else 'none (membership not checked)'}")
     print(f"transition: {'on' if args.transition else 'off'}")
-    print(f"files: {len(files)}" + (f" ({len(not_utf8)} not UTF-8, not checked)" if not_utf8 else ""))
+    print(f"files: {len(files)}" + (f" ({len(unreadable)} not checked)" if unreadable else ""))
     print(f"rows: {rows} (refused {refused_rows}, with notices {noticed_rows})")
     print(f"lines that are not a JSON object: {not_objects}")
     refusals.print("refusals")
     notices.print("notices")
 
-    if not_utf8:
+    if unreadable:
+        return 2
+    if not rows:
+        print("no rows: no line of the matching files is a JSON object", file=sys.stderr)
         return 2
     if refused_rows or (args.strict and (noticed_rows or not_objects)):
         return 1
