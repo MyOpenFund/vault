@@ -306,8 +306,8 @@ CREATE INDEX IF NOT EXISTS idx_documents_extra_gin
     ON documents USING GIN (extra jsonb_path_ops);
 
 -- Facts feeding the RAG OCR policy. Filled by data-orchestrator's probe pass
--- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
--- from the manifest upsert: manifests never carry them, and upserting them
+-- (its UPDATE is their only writer). Deliberately absent from the contract's
+-- columns and from the manifest upsert: manifests never carry them, and upserting them
 -- would null probed values on every nightly run.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
@@ -921,9 +921,11 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
     CardinalityViolation (ON CONFLICT DO UPDATE cannot affect a row twice) and
     kill the run; in different pages they went through silently. Last wins is
     what two upserts issued in line order would have stored. The kept rows are
-    returned in the order of their (last) occurrence. doc_ids are compared
-    exactly, as the UNIQUE constraint does (parse_line only lets non-empty
-    strings through, so Python and Postgres equality agree). A WARNING gives
+    returned in the order of their (last) occurrence. One file holds one
+    corpus's rows, so doc_id alone is the (corpus, doc_id) key here; doc_ids
+    are compared exactly, as the UNIQUE (corpus, doc_id) constraint does
+    (parse_line only lets text doc_ids through, so Python and Postgres
+    equality agree). A WARNING gives
     the number of dropped lines, the number of doc_ids concerned and up to
     `sample_size` of them (first-seen order).
     """
@@ -948,6 +950,14 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
         f"of each wins (e.g. {sample}{more})"
     )
     return kept
+
+
+def kept_indexes(rows):
+    """Indexes of the rows dedupe_rows keeps (the last line of each doc_id)."""
+    last = {}
+    for i, row in enumerate(rows):
+        last[row[0]] = i
+    return sorted(last.values())
 
 
 # Which .jsonl files the documents pass reads (Spec W5). Two layouts exist:
@@ -1085,10 +1095,15 @@ def find_manifest_files(data_dir, env):
 #   UTF-16 surrogate, a NaN or an infinity, at any depth (`field` is the
 #   top-level extra key). Without it, one such line made the whole upsert
 #   page, hence the run, fail.
-# - bad_text (the contract's reason, given here for a case the contract does
-#   not check): a common text column holding a lone surrogate, which no UTF-8
-#   database can store.
-VAULT_REASONS = ("bad_extra",)
+#   An extra KEY that cannot be stored is shown as its repr in `field`.
+# - not_json: a non-blank line that is not a JSON object (a torn write, a
+#   UTF-8 BOM on line 1, a JSON array). It cannot be a row, but its document
+#   is "not seen" all the same, so it must skip the sweep like any refusal
+#   rather than get that document soft-deleted. `field` is NULL and `value`
+#   the line's first REFUSAL_VALUE_CHARS characters (its repr when it holds a
+#   character TEXT cannot store).
+VAULT_REASONS = ("bad_extra", "not_json")
+NOT_JSON = "not_json"
 
 # ingestion_refusals.value: the repr of the refused value, cut to this many
 # characters (then "…"); a producer can put a huge list or object anywhere.
@@ -1142,14 +1157,18 @@ def jsonb_storable(value):
     return True
 
 
+def stored_text(value):
+    """`value` when it is text Postgres can store, else its repr (shown_value)."""
+    return value if isinstance(value, str) and _storable_text(value) else shown_value(value)
+
+
 def vault_refusals(checked):
-    """The vault's own refusals of a checked row (see VAULT_REASONS)."""
-    refused_fields = {r.field for r in checked.refusals}
-    refusals = [
-        Refusal("bad_text", name, value)
-        for name, value in checked.columns.items()
-        if name not in refused_fields and isinstance(value, str) and not _utf8(value)
-    ]
+    """The vault's bad_extra refusals of a checked row (see VAULT_REASONS).
+
+    Text columns need nothing here: the contract refuses NUL and lone
+    surrogates in them itself (bad_text).
+    """
+    refusals = []
     for key, value in checked.extra.items():
         if not (_storable_text(key) and jsonb_storable(value)):
             refusals.append(Refusal("bad_extra", key, value))
@@ -1170,8 +1189,7 @@ class RunReport:
         self.corpus = corpus
         self.run_ts = run_ts
         self.data_dir = data_dir
-        self.rows_read = 0          # lines holding a JSON object
-        self.unparsed = 0           # other non-blank lines (not JSON, not an object)
+        self.rows_read = 0          # non-blank lines
         self.refused_rows = 0
         self.duplicates = 0         # lines dropped by dedupe_rows
         self.upserted = 0
@@ -1179,6 +1197,7 @@ class RunReport:
         self.notices = Counter()
         self.records = []           # ingestion_refusals rows
         self.unlogged = 0
+        self.pending = []           # notices of each row parse_line returned, in order
 
     def source_name(self, source_file):
         """The file as stored in ingestion_refusals: relative to DATA_DIR when under it."""
@@ -1194,16 +1213,32 @@ class RunReport:
         name = self.source_name(source_file)
         for r in refusals:
             self.refusals[r.reason] += 1
+            if r.reason == NOT_JSON:          # the raw line, not a value
+                field, value = None, stored_text(r.value[:REFUSAL_VALUE_CHARS])
+                shown = f"line={shown_value(r.value)}"
+            else:
+                field, value = stored_text(r.field), shown_value(r.value)
+                shown = f"{field}={value}"
             self.records.append((self.corpus, self.run_ts, name, line_num, stored_id,
-                                 r.reason, r.field, shown_value(r.value)))
+                                 r.reason, field, value))
             if len(self.records) <= REFUSAL_LOG_LIMIT:
-                log.warning(f"{source_file}:{line_num} {r.reason} {r.field}={shown_value(r.value)}")
+                log.warning(f"{source_file}:{line_num} {r.reason} {shown}")
             else:
                 self.unlogged += 1
 
-    def note(self, notices):
-        for n in notices:
-            self.notices[n.reason] += 1
+    def commit_notices(self, kept=None):
+        """Count the pending notices of the rows actually upserted.
+
+        `kept` holds the indexes (into the rows parse_line returned since the
+        last commit) that dedupe_rows kept; None = all of them. A line
+        superseded by a later one of the same doc_id is not written, so its
+        notices are not counted.
+        """
+        pending, self.pending = self.pending, []
+        indexes = range(len(pending)) if kept is None else kept
+        for i in indexes:
+            for n in pending[i]:
+                self.notices[n.reason] += 1
 
     def summary_lines(self, sweep):
         """The run summary: rows, refusals and notices by reason, the sweep."""
@@ -1215,7 +1250,7 @@ class RunReport:
             refused += f" ({by_reason(self.refusals)})"
         lines = [
             f"documents: {self.rows_read} rows read, {self.upserted} upserted, {refused}, "
-            f"{self.duplicates} duplicate line(s) dropped, {self.unparsed} unparsed line(s)",
+            f"{self.duplicates} duplicate line(s) dropped",
             f"notices: {sum(self.notices.values())}"
             + (f" ({by_reason(self.notices)})" if self.notices else ""),
             f"sweep: {sweep}",
@@ -1230,44 +1265,39 @@ def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=N
                report=None):
     """One manifest line -> an upsert row (UPSERT_COLUMNS order), or None.
 
-    None for a blank line; for a line that is not a JSON object (WARNING,
-    counted `unparsed`: the contract applies to rows, not to bytes); and for
-    a refused row: vault_contract.check_row (transition on, this service's
-    CORPUS expected, `vocabulary` None = codes not checked) plus
-    vault_refusals. A refused row is recorded in `report` (counted, logged,
-    kept for ingestion_refusals); an accepted row's notices are counted there.
-    Unlike before the contract, a doc_id that is not a string or a corpus
-    that contradicts CORPUS is a refusal, not a silent skip.
+    None for a blank line, and for a refused line: not a JSON object
+    (not_json), or refused by vault_contract.check_row (transition on, this
+    service's CORPUS expected, `vocabulary` None = codes not checked) or by
+    vault_refusals. A refused line is recorded in `report` (counted, logged,
+    kept for ingestion_refusals); an accepted row's notices are appended to
+    `report.pending`, counted by commit_notices once the row is known to be
+    upserted (after dedupe_rows). Unlike before the contract, a doc_id that
+    is not a string, a corpus that contradicts CORPUS or a line that is not
+    JSON is a refusal, not a silent skip.
     """
     if report is None:
         report = RunReport(default_corpus, run_ts)
     line = line.strip()
     if not line:
         return None
+    report.rows_read += 1
     try:
         obj = json.loads(line)
-    except (ValueError, RecursionError) as e:   # JSONDecodeError; an int past 4300 digits
-        log.warning(f"Skipping invalid line ({source_file}:{line_num}): {e}")
-        report.unparsed += 1
-        return None
+    except (ValueError, RecursionError):   # JSONDecodeError; an int past 4300 digits
+        obj = None
     if not isinstance(obj, dict):
-        log.warning(
-            f"Skipping line ({source_file}:{line_num}): a JSON "
-            f"{type(obj).__name__}, not an object"
-        )
-        report.unparsed += 1
+        report.refuse(source_file, line_num, None, [Refusal(NOT_JSON, None, line)])
         return None
-    report.rows_read += 1
 
     checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=True)
     refusals = list(checked.refusals) + vault_refusals(checked)
     if refusals:
         report.refuse(source_file, line_num, checked.columns.get("doc_id"), refusals)
         return None
-    report.note(checked.notices)
+    report.pending.append(checked.notices)
 
     columns = dict(checked.columns)
-    if columns["corpus"] is None:       # transition: corpus_missing, CORPUS applies
+    if not columns["corpus"]:           # transition: absent or "", corpus_missing, CORPUS applies
         columns["corpus"] = default_corpus
     extra = json.dumps(checked.extra) if checked.extra else None
     return tuple(columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
@@ -1449,6 +1479,7 @@ def main(*, corpus=None, data_dir=None):
                         rows.append(row)
             kept = dedupe_rows(rows, filepath)
             report.duplicates += len(rows) - len(kept)
+            report.commit_notices(kept_indexes(rows))
             rows = kept
 
             if not rows:

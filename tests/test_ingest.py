@@ -130,7 +130,7 @@ def test_missing_doc_id_is_skipped():
     assert parse_line(json.dumps(obj), "f.jsonl", 1, RUN_TS, CORPUS) is None
 
 
-def test_invalid_json_is_skipped():
+def test_invalid_json_is_not_written():
     assert parse_line("{not json", "f.jsonl", 1, RUN_TS, CORPUS) is None
 
 
@@ -237,6 +237,7 @@ import pytest  # noqa: E402
     (5, "bad_text"), (0, "bad_text"), (1.5, "bad_text"), (True, "bad_text"),
     (False, "bad_text"), ([1], "bad_text"), ({"a": 1}, "bad_text"),
     ("", "missing_doc_id"), ("a\x00b", "bad_text"), ("  ", "bad_text"),
+    (" padded ", "bad_text"),        # the contract refuses padding since 45d8b63
 ])
 def test_non_string_or_empty_doc_id_is_refused_and_logged(bad, reason, caplog):
     import logging
@@ -261,17 +262,19 @@ def test_missing_doc_id_is_refused_too(missing):
     assert report.refusals == {"missing_doc_id": 1}
 
 
-@pytest.mark.parametrize("ok", ["5", " padded ", "ünïcode-ид", "a" * 500])
+@pytest.mark.parametrize("ok", ["5", "ünïcode-ид", "a" * 500])
 def test_any_non_empty_string_doc_id_is_kept_verbatim(ok):
     assert parse_line(make_line(doc_id=ok), "f.jsonl", 1, RUN_TS, CORPUS)[0] == ok
 
 
 @pytest.mark.parametrize("line", ['"just a string"', "[1, 2]", "5", "null", "true"])
-def test_valid_json_that_is_not_an_object_is_skipped(line, caplog):
+def test_valid_json_that_is_not_an_object_is_refused(line, caplog):
     import logging
+    report = RunReport(CORPUS, RUN_TS)
     with caplog.at_level(logging.WARNING, logger="ingest"):
-        assert parse_line(line, "f.jsonl", 2, RUN_TS, CORPUS) is None
-    assert "f.jsonl:2" in caplog.records[0].getMessage()
+        assert parse_line(line, "f.jsonl", 2, RUN_TS, CORPUS, report=report) is None
+    assert caplog.records[0].getMessage().startswith("f.jsonl:2 not_json")
+    assert report.refusals == {"not_json": 1}
 
 
 def test_a_huge_invalid_doc_id_is_logged_truncated(caplog):

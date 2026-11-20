@@ -84,7 +84,10 @@ def test_last_valid_line_wins_when_last_copy_is_invalid_json(clean_db, tmp_path,
         + '{"doc_id": "dup", "title": "broken"\n',
         encoding="utf-8",
     )
-    run_ingest(monkeypatch, clean_db, tmp_path)
+    # The broken line is a not_json refusal (the run exits 1, no sweep); the
+    # last VALID line of the doc_id is the one written.
+    with pytest.raises(SystemExit):
+        run_ingest(monkeypatch, clean_db, tmp_path)
     assert _titles(clean_db) == {"dup": "good-2"}
 
 

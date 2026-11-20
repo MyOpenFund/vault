@@ -455,3 +455,51 @@ def test_the_vocabulary_is_replaced_per_corpus(clean_db, tmp_path, monkeypatch):
     run_ingest(monkeypatch, clean_db, tmp_path / "cb", corpus=CB)
     assert fetch_all(clean_db, "SELECT count(*) FROM vocabulary WHERE corpus = 'central-bank' "
                                "AND kind = 'doc_type'") == [(1,)]
+
+
+# --- fix wave after review -------------------------------------------------------
+
+
+def test_a_blank_corpus_is_written_under_the_service_corpus(clean_db, tmp_path, monkeypatch):
+    write_manifest(tmp_path, "m.jsonl", [make_doc("d1", corpus="")])
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    assert fetch_all(clean_db, "SELECT corpus, doc_id FROM documents") == [(CB, "d1")]
+
+
+@pytest.mark.parametrize("key", ["k\u0000", "\ud800"])
+def test_a_bad_extra_key_is_stored_as_its_repr_not_a_crash(clean_db, tmp_path, monkeypatch, key):
+    write_manifest(tmp_path, "m.jsonl", [make_doc("ok"), make_doc("bad", **{key: 1})])
+    with pytest.raises(SystemExit):
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert fetch_all(clean_db, "SELECT doc_id FROM documents") == [("ok",)]
+    assert fetch_all(clean_db, "SELECT doc_id, reason, field FROM ingestion_refusals") == [
+        ("bad", "bad_extra", repr(key))]
+
+
+def test_one_torn_line_among_ten_soft_deletes_nothing(clean_db, tmp_path, monkeypatch):
+    docs = [make_doc(f"d{i}") for i in range(10)]
+    write_manifest(tmp_path / "manifest", "us.jsonl", docs)
+    run_ingest(monkeypatch, clean_db, tmp_path)
+
+    lines = [json.dumps(d) for d in docs[:9]] + [json.dumps(docs[9])[:25]]   # torn write
+    (tmp_path / "manifest" / "us.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert exc.value.code == 1
+    assert len(_live(clean_db)) == 10
+    assert fetch_all(clean_db, "SELECT line, doc_id, reason, field, value FROM ingestion_refusals") == [
+        (10, None, "not_json", None, json.dumps(docs[9])[:25])]
+
+
+def test_a_bom_on_the_first_line_is_refused_and_soft_deletes_nothing(
+    clean_db, tmp_path, monkeypatch
+):
+    docs = [make_doc(f"d{i}") for i in range(3)]
+    write_manifest(tmp_path / "manifest", "us.jsonl", docs)
+    run_ingest(monkeypatch, clean_db, tmp_path)
+    path = tmp_path / "manifest" / "us.jsonl"
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    with pytest.raises(SystemExit):
+        run_ingest(monkeypatch, clean_db, tmp_path)
+    assert len(_live(clean_db)) == 3
+    assert fetch_all(clean_db, "SELECT line, reason FROM ingestion_refusals") == [(1, "not_json")]

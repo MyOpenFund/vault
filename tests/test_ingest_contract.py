@@ -81,6 +81,7 @@ def test_every_golden_accepted_row_is_upserted_with_its_columns(name, case):
     if expected["corpus"] is None:          # transition: the service's CORPUS applies
         expected["corpus"] = case["expected_corpus"]
     assert {k: got[k] for k in COLUMNS} == expected
+    report.commit_notices()
     assert report.notices == Counter(case.get("expected_notices", []))
     assert report.refused_rows == 0
     extra = json.loads(got["extra"]) if got["extra"] else {}
@@ -97,6 +98,7 @@ def test_every_golden_refused_row_is_refused_with_its_reasons(name, case):
     assert row is None
     assert report.refusals == Counter(case["expected_reasons"])
     assert report.refused_rows == 1
+    report.commit_notices()
     assert report.notices == Counter()   # a refused row is not written: no notice
 
 
@@ -141,7 +143,7 @@ def test_unknown_doc_type_is_refused_only_with_a_vocabulary():
 
 def test_vault_reasons_are_not_contract_reasons():
     from vault_contract import REASONS
-    assert VAULT_REASONS == ("bad_extra",)
+    assert VAULT_REASONS == ("bad_extra", "not_json")
     assert not set(VAULT_REASONS) & set(REASONS)
 
 
@@ -159,7 +161,9 @@ def test_an_extra_jsonb_cannot_hold_is_a_bad_extra_refusal(extra):
     assert parse(line, report=report) is None
     assert report.refusals == {"bad_extra": 1}
     (record,) = report.records
-    assert record[5] == "bad_extra" and record[6] == next(iter(extra))
+    key = next(iter(extra))
+    assert record[5] == "bad_extra"
+    assert record[6] == (key if "\x00" not in key else repr(key))   # a NUL key: its repr
 
 
 def test_a_harmless_escaped_backslash_u0000_text_is_not_refused():
@@ -168,11 +172,41 @@ def test_a_harmless_escaped_backslash_u0000_text_is_not_refused():
     assert json.loads(as_dict(row)["extra"]) == {"note": "\\u0000"}
 
 
-def test_a_lone_surrogate_in_a_text_column_is_bad_text():
+def test_a_lone_surrogate_in_a_text_column_is_the_contracts_bad_text():
+    # The contract refuses it itself since 45d8b63; the vault adds nothing.
     report = RunReport(CB, RUN_TS)
     assert parse(json.dumps(cb_row(title="a\ud800")), report=report) is None
     assert report.refusals == {"bad_text": 1}
-    assert report.records[0][6] == "title"
+    assert len(report.records) == 1 and report.records[0][6] == "title"
+
+
+@pytest.mark.parametrize("key", ["k\u0000", "\ud800"])
+def test_a_bad_extra_key_is_stored_and_logged_as_its_repr(key, caplog):
+    report = RunReport(CB, RUN_TS)
+    with caplog.at_level(logging.WARNING, logger="ingest"):
+        assert parse(json.dumps(cb_row(**{key: 1})), report=report) is None
+    (record,) = report.records
+    assert record[5] == "bad_extra"
+    assert record[6] == repr(key)                     # storable text, unlike the key
+    assert "\x00" not in record[6] and record[6].encode("utf-8")
+    message = caplog.records[0].getMessage()
+    assert message.startswith(f"manifest/ecb.jsonl:1 bad_extra {repr(key)}=")
+    message.encode("utf-8")                           # a lone surrogate would raise here
+
+
+def test_a_blank_corpus_takes_the_service_corpus():
+    for blank in ("",):
+        report = RunReport(CB, RUN_TS)
+        row = parse(cb_row(corpus=blank), report=report)
+        assert as_dict(row)["corpus"] == CB
+        report.commit_notices()
+        assert report.notices["corpus_missing"] == 1
+
+
+def test_a_whitespace_corpus_is_refused_by_the_contract():
+    report = RunReport(CB, RUN_TS)
+    assert parse(cb_row(corpus="  "), report=report) is None
+    assert report.refusals == {"bad_text": 1}
 
 
 def test_one_row_with_two_defects_counts_both_reasons_and_one_row():
@@ -183,20 +217,36 @@ def test_one_row_with_two_defects_counts_both_reasons_and_one_row():
     assert len(report.records) == 2
 
 
-# --- unparsed lines are not refusals ------------------------------------------------
+# --- lines that are not a JSON object are refusals (not_json) ---------------------------
 
 
-@pytest.mark.parametrize("line", ["{not json", '"a string"', "[1]", '{"doc_id": ' + "9" * 5000 + "}"])
-def test_a_line_that_is_not_a_json_object_is_unparsed_not_refused(line):
+@pytest.mark.parametrize("line", ["{not json", '"a string"', "[1]", '{"doc_id": ' + "9" * 5000 + "}",
+                                  '{"doc_id": "torn", "title": "half a li'])
+def test_a_line_that_is_not_a_json_object_is_a_not_json_refusal(line):
     report = RunReport(CB, RUN_TS)
-    assert parse(line, report=report) is None
-    assert report.unparsed == 1 and report.refused_rows == 0 and report.rows_read == 0
+    assert parse(line, report=report, line_num=4) is None
+    assert report.refusals == {"not_json": 1} and report.refused_rows == 1
+    (record,) = report.records
+    assert record[3:7] == (4, None, "not_json", None)
+    assert record[7] == line[:REFUSAL_VALUE_CHARS]
+
+
+def test_a_utf8_bom_on_the_first_line_is_a_not_json_refusal():
+    report = RunReport(CB, RUN_TS)
+    assert parse("\ufeff" + json.dumps(cb_row()), report=report) is None
+    assert report.refusals == {"not_json": 1}
+
+
+def test_a_not_json_line_holding_nul_is_stored_as_its_repr():
+    report = RunReport(CB, RUN_TS)
+    parse("{bad\x00line", report=report)
+    assert report.records[0][7] == repr("{bad\x00line")
 
 
 def test_blank_lines_count_nowhere():
     report = RunReport(CB, RUN_TS)
     assert parse("   ", report=report) is None
-    assert (report.rows_read, report.unparsed, report.refused_rows) == (0, 0, 0)
+    assert (report.rows_read, report.refused_rows) == (0, 0)
 
 
 # --- refusal rows and logs -----------------------------------------------------------
@@ -253,25 +303,31 @@ def test_refusal_logs_are_capped_but_every_refusal_is_kept(caplog):
     assert any("7 more not logged" in line for line in report.summary_lines("x"))
 
 
-def test_notices_are_counted_for_written_rows():
+def test_notices_are_counted_for_upserted_rows_only():
+    # Two lines of d1: dedupe_rows keeps the last, so only its notice counts.
     report = RunReport(CB, RUN_TS)
     parse(cb_row(date_precision=None), report=report)
     parse(cb_row(doc_id="d2", title=""), report=report)
-    assert report.notices == {"precision_not_stated": 1, "empty_title": 1}
+    parse(cb_row(), report=report)                       # d1 again, no notice
+    assert report.notices == Counter()                   # pending until upserted
+    report.commit_notices(kept=[1, 2])
+    assert report.notices == {"empty_title": 1}
+    report.commit_notices()                              # pending was consumed
+    assert report.notices == {"empty_title": 1}
 
 
 def test_summary_lines_show_rows_refusals_notices_and_the_sweep():
     report = RunReport(CB, RUN_TS)
-    report.rows_read, report.upserted, report.duplicates, report.unparsed = 10, 8, 1, 2
-    report.refused_rows = 1
-    report.refusals.update({"unknown_doc_type": 1})
+    report.rows_read, report.upserted, report.duplicates = 12, 8, 1
+    report.refused_rows = 3
+    report.refusals.update({"unknown_doc_type": 1, "not_json": 2})
     report.notices.update({"corpus_missing": 9, "empty_title": 1})
-    lines = report.summary_lines("skipped (1 refused rows)")
+    lines = report.summary_lines("skipped (3 refused rows)")
     assert lines == [
-        "documents: 10 rows read, 8 upserted, 1 refused (unknown_doc_type=1), "
-        "1 duplicate line(s) dropped, 2 unparsed line(s)",
+        "documents: 12 rows read, 8 upserted, 3 refused (not_json=2, unknown_doc_type=1), "
+        "1 duplicate line(s) dropped",
         "notices: 10 (corpus_missing=9, empty_title=1)",
-        "sweep: skipped (1 refused rows)",
+        "sweep: skipped (3 refused rows)",
     ]
 
 
@@ -467,3 +523,25 @@ def test_every_row_refused_soft_deletes_nothing(fake_run):
     assert fake_run["upserted"] == []
     assert len(fake_run["refusals"]) == 5
     assert ingest.SWEEP_SQL not in fake_run["conn"].statements
+
+
+def test_one_torn_line_among_ten_skips_the_sweep_and_exits_1(fake_run):
+    manifest = fake_run["dir"] / "manifest"
+    manifest.mkdir(exist_ok=True)
+    lines = [json.dumps(cb_row(doc_id=f"d{i}")) for i in range(9)]
+    lines.append('{"doc_id": "d9", "corpus": "central-ba')          # torn write
+    (manifest / "ecb.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ingest.main(corpus=CB, data_dir=str(fake_run["dir"]))
+    assert exc.value.code == 1
+    assert len(fake_run["upserted"]) == 9
+    assert [r[5] for r in fake_run["refusals"]] == ["not_json"]
+    assert ingest.SWEEP_SQL not in fake_run["conn"].statements
+
+
+def test_main_counts_the_notices_of_the_kept_duplicate_only(fake_run, caplog):
+    rows = [cb_row(date_precision=None), cb_row(doc_id="d2"), cb_row()]   # d1 twice
+    with caplog.at_level(logging.INFO, logger="ingest"):
+        fake_run["run"](rows)
+    assert len(fake_run["upserted"]) == 2
+    assert "notices: 0" in caplog.text
