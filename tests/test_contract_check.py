@@ -276,3 +276,16 @@ def test_bad_extra_is_reported_and_an_unprintable_key_shown_as_its_repr(tmp_path
     assert "  bad_extra: 2" in out
     assert "a.jsonl:1 doc_id='a' note=nan" in out
     assert "a.jsonl:2 doc_id='b' 'k\\udfff'=1" in out
+
+
+def test_files_are_read_in_the_ingestions_order_plain_string_sort(tmp_path, capsys):
+    """The ingestion sorts the file paths as strings: "a-b/x" before "a/x"
+    ('-' < '/'), where Path ordering (by parts) puts "a/x" first. The last
+    valid line of a doc_id wins, so the order decides which one is kept."""
+    _write(tmp_path / "a", "x.jsonl", [_row("cb_rendered_html")])
+    _write(tmp_path / "a-b", "x.jsonl", [_row("cb_rendered_html")])
+    code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank", "--glob", "**/*.jsonl")
+    assert code == 1
+    assert "  duplicate_doc_id: 1" in out
+    (example,) = [l for l in out.splitlines() if "superseded by" in l]
+    assert example.strip().startswith("a-b/x.jsonl:1") and example.endswith("superseded by a/x.jsonl:1")

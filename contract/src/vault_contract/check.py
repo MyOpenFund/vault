@@ -106,7 +106,10 @@ def main(argv=None):
             print(error, file=sys.stderr)
             return 2
     try:
-        files = sorted(p for p in args.manifest_dir.glob(args.glob) if p.is_file())
+        # Sorted as strings, as the ingestion sorts its paths: the order
+        # decides which line of a doc_id is kept, and Path ordering (by
+        # parts) differs ("a/x" < "a-b/x", while "a-b/x" < "a/x" as strings).
+        files = sorted((p for p in args.manifest_dir.glob(args.glob) if p.is_file()), key=str)
     except (ValueError, NotImplementedError) as e:
         print(f"bad --glob {args.glob!r}: {e}", file=sys.stderr)
         return 2
@@ -120,22 +123,23 @@ def main(argv=None):
     valid = {}          # doc_id -> [location of each valid line], in vault order
 
     for path in files:
+        name = path.relative_to(args.manifest_dir).as_posix()   # unique, unlike the basename
         try:
             data = path.read_bytes()
         except OSError as e:
             unreadable.append(path)
-            print(f"{path.name}: cannot be read ({e}), not checked", file=sys.stderr)
+            print(f"{name}: cannot be read ({e}), not checked", file=sys.stderr)
             continue
         if data.startswith(b"\xef\xbb\xbf"):
             unreadable.append(path)
-            print(f"{path.name}: starts with a UTF-8 BOM; the ingestion would skip its "
-                  "first line, not checked", file=sys.stderr)
+            print(f"{name}: starts with a UTF-8 BOM; the ingestion would refuse its "
+                  "first line as not_json, not checked", file=sys.stderr)
             continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError as e:
             unreadable.append(path)
-            print(f"{path.name}: not UTF-8 ({e}), not checked", file=sys.stderr)
+            print(f"{name}: not UTF-8 ({e}), not checked", file=sys.stderr)
             continue
         # A text-mode file object, as open(..., encoding="utf-8") in the
         # ingestion: universal newlines, no split on U+2028, U+0085, ...
@@ -151,17 +155,17 @@ def main(argv=None):
             if not isinstance(row, dict):
                 refused_rows += 1
                 # Sliced before repr: a torn line can be megabytes long.
-                refusals.add(NOT_JSON, f"{path.name}:{line_num} line={_shown(line[:VALUE_CHARS])}")
+                refusals.add(NOT_JSON, f"{name}:{line_num} line={_shown(line[:VALUE_CHARS])}")
                 continue
             objects += 1
             checked = check_row(row, vocabulary, expected_corpus=args.corpus,
                                 transition=args.transition)
-            where = f"{path.name}:{line_num} doc_id={_shown(checked.columns['doc_id'])}"
+            where = f"{name}:{line_num} doc_id={_shown(checked.columns['doc_id'])}"
             if checked.refusals:
                 refused_rows += 1
             elif is_text(checked.columns["doc_id"]):
                 valid.setdefault(checked.columns["doc_id"], []).append(
-                    (f"{path.name}:{line_num}", where))
+                    (f"{name}:{line_num}", where))
             for r in checked.refusals:
                 refusals.add(r.reason, f"{where} {_field(r.field)}={_shown(r.value)}")
             noticed_rows += bool(checked.notices)
