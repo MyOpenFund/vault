@@ -118,7 +118,7 @@
   },
   {
     "name": "Vault — Coverage & QC",
-    "description": "What is missing, late or wrong: overdue series, publication anomalies, RAG backlog and open fetching problems.",
+    "description": "What is missing, late or wrong: overdue series, publication anomalies, RAG backlog, open fetching problems and the rows the last ingestion refused.",
     "filters": [
       {
         "slug": "corpus",
@@ -207,6 +207,14 @@
           "corpus": "corpus",
           "bank": "bank"
         }
+      },
+      {
+        "code": "Q7",
+        "row": 32,
+        "col": 0,
+        "size_x": 24,
+        "size_y": 6,
+        "mappings": {}
       }
     ]
   },

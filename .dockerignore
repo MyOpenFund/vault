@@ -1,5 +1,5 @@
-# The repo root is a build context (api/Dockerfile): keep secrets, history and
-# local build state out of it.
+# The repo root is a build context (api/Dockerfile, ingestion/Dockerfile): keep
+# secrets, history and local build state out of it.
 .git
 .env
 .env.*
@@ -9,5 +9,6 @@
 **/*.egg-info
 **/.pytest_cache
 query/build
+contract/build
 tests
 metabase

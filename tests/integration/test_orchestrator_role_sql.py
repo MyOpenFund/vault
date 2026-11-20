@@ -32,7 +32,8 @@ RO_PW = "ro-pw-B"
 CORPUS = "central-bank"
 COLLECTION = "c1"
 
-TABLES = ("documents", "runs", "rag_ingestions", "cadence", "discovery_errors")
+TABLES = ("documents", "runs", "rag_ingestions", "cadence", "discovery_errors",
+          "vocabulary", "ingestion_refusals")
 VIEWS = ("runs_sources", "rag_backlog", "rag_backlog_any",
          "sources_without_cadence", "source_health")
 
@@ -48,13 +49,17 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (run_id) DO NOTHING
 """
 
-# data_orchestrator/vault.py — VaultLedger.mark
+# data_orchestrator/vault.py — VaultLedger.mark, with the conflict target of
+# the documents contract (chantier 4, data-orchestrator PR "O2"): the primary
+# key of rag_ingestions is (corpus, doc_id, collection) since this train, so
+# the orchestrator's former `ON CONFLICT (doc_id, collection)` no longer
+# matches a constraint. The orchestrator must deploy with the vault.
 UPSERT_INGESTION_SQL = """
 INSERT INTO rag_ingestions (
     doc_id, collection, corpus, source_code,
     embedding_model, embedding_version, chunk_count
 ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-ON CONFLICT (doc_id, collection) DO UPDATE SET
+ON CONFLICT (corpus, doc_id, collection) DO UPDATE SET
     corpus = EXCLUDED.corpus,
     source_code = EXCLUDED.source_code,
     embedding_model = EXCLUDED.embedding_model,
@@ -105,6 +110,11 @@ FORBIDDEN = [
     "DELETE FROM rag_ingestions",
     "DELETE FROM cadence",
     "UPDATE discovery_errors SET resolved_at = now()",
+    "DELETE FROM vocabulary",
+    "INSERT INTO vocabulary (corpus, kind, code) VALUES ('c', 'doc_type', 'X')",
+    "DELETE FROM ingestion_refusals",
+    "INSERT INTO ingestion_refusals (corpus, run_ts, source_file, line, reason) "
+    "VALUES ('c', now(), 'f', 1, 'r')",
     "CREATE TABLE t_evil (x int)",
     "DROP VIEW source_health",
     "DROP TABLE runs",

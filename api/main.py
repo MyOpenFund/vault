@@ -1,7 +1,6 @@
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -9,15 +8,25 @@ from fastapi.responses import FileResponse
 from vault_query import InvalidQuery, corpus_stats, get_document as vq_get_document, search_documents
 from vault_query.filters import check_text
 
-from db import get_conn, verify_connection, SORTABLE_FIELDS
-from models import Document, DocumentList, StatsSummary, CountItem
+from db import get_conn, log, verify_connection, SORTABLE_FIELDS
+from files import (
+    ENV_NAME as CORPUS_ROOTS_ENV, is_file, missing_roots, parse_corpus_roots, resolve_under_root,
+)
+from models import CorpusCountItem, Document, DocumentList, StatsSummary, CountItem
 
-RAW_DATA_DIR = Path(os.environ.get("RAW_DATA_DIR", "/data/raw")).resolve()
+# {corpus: root directory} for file downloads, read from CORPUS_ROOTS at
+# startup (lifespan). A corpus absent here has no downloadable files.
+CORPUS_ROOTS = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Refuse to serve a corpus this process cannot read.
+
+    CORPUS_ROOTS is read first: a malformed value (files.parse_corpus_roots)
+    stops the process before it touches the database, with the reason logged.
+    Unset or empty: the API serves metadata, and every file download is a 404
+    naming the variable.
 
     The API connects as `vault_readonly`, a role the ingestion service's DDL
     train creates -- so on a brand-new cluster it does not exist yet and every
@@ -25,6 +34,23 @@ async def lifespan(app: FastAPI):
     container restarts, and its logs say what to run. Serving 500s behind a
     green /health would hide exactly the same problem.
     """
+    global CORPUS_ROOTS
+    try:
+        CORPUS_ROOTS = parse_corpus_roots(os.environ.get(CORPUS_ROOTS_ENV, ""))
+    except ValueError as exc:
+        reason = str(exc)
+    else:
+        reason = None
+    if reason is not None:
+        log.error("vault API: invalid %s: %s", CORPUS_ROOTS_ENV, reason)
+        raise RuntimeError(f"invalid {CORPUS_ROOTS_ENV}: {reason}")
+    if not CORPUS_ROOTS:
+        log.warning("vault API: %s is empty, file downloads are disabled", CORPUS_ROOTS_ENV)
+    # Not fatal: a mount can come up after the API, and metadata is still
+    # served. But until it does, every download of that corpus is a 404.
+    for name, root in missing_roots(CORPUS_ROOTS).items():
+        log.warning("vault API: %s root of %r, %s, is not an existing directory: its "
+                    "file downloads are 404 until it is mounted", CORPUS_ROOTS_ENV, name, root)
     verify_connection()
     yield
 
@@ -37,22 +63,11 @@ app = FastAPI(
 )
 
 
-def resolve_raw_relative(local_path: str) -> Optional[PurePosixPath]:
-    """Resolve the path relative to raw/ from a manifest local_path.
-
-    Takes the components after the first exact "raw" path component (not a
-    substring: ".../rawdata/..." does not match). Relies on the corpus
-    builder's convention that local_path looks like "data/raw/<...>".
-    Returns None when there is no "raw" component, nothing after it, or a
-    ".." traversal component in the remainder.
-    """
-    parts = PurePosixPath(local_path).parts
-    if "raw" not in parts:
-        return None
-    remainder = parts[parts.index("raw") + 1:]
-    if not remainder or ".." in remainder:
-        return None
-    return PurePosixPath(*remainder)
+def _check_text(name, value):
+    try:
+        check_text(name, value)
+    except InvalidQuery as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @app.get("/health")
@@ -113,48 +128,65 @@ def list_documents(
     return DocumentList(total=total, limit=limit, offset=offset, items=rows)
 
 
-@app.get("/documents/{doc_id}", response_model=Document)
-def get_document(doc_id: str):
-    try:
-        check_text("doc_id", doc_id)
-    except InvalidQuery as exc:
-        raise HTTPException(400, str(exc)) from None
-    with get_conn() as conn:
-        row = vq_get_document(conn, doc_id)
+CORPUS_QUERY = Query(
+    None, description="The document's corpus: a doc_id is unique within its corpus only")
 
-    if not row:
-        raise HTTPException(404, f"Document {doc_id} not found")
-    return row
+
+@app.get("/documents/{doc_id}", response_model=Union[Document, list[Document]])
+def get_document(doc_id: str, corpus: Optional[str] = CORPUS_QUERY):
+    """One document with `corpus`; without it, the list of every corpus's
+    document with this doc_id (identity is (corpus, doc_id)). 404 when none."""
+    _check_text("doc_id", doc_id)
+    _check_text("corpus", corpus)
+    with get_conn() as conn:
+        rows = vq_get_document(conn, doc_id, corpus)
+
+    if not rows:
+        where = f" in corpus {corpus}" if corpus is not None else ""
+        raise HTTPException(404, f"Document {doc_id} not found{where}")
+    return rows[0] if corpus is not None else rows
 
 
 @app.get("/documents/{doc_id}/file")
-def download_document_file(doc_id: str):
-    """Download the actual file (PDF...) matching the document."""
-    try:
-        check_text("doc_id", doc_id)
-    except InvalidQuery as exc:
-        raise HTTPException(400, str(exc)) from None
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT local_path, title FROM documents WHERE doc_id = %s", (doc_id,))
-            row = cur.fetchone()
+def download_document_file(doc_id: str, corpus: Optional[str] = CORPUS_QUERY):
+    """Download the document's file: its corpus root (CORPUS_ROOTS) / local_path.
 
-    if not row:
-        raise HTTPException(404, f"Document {doc_id} not found")
+    `corpus` is required when the doc_id exists in more than one corpus (400).
+    """
+    _check_text("doc_id", doc_id)
+    _check_text("corpus", corpus)
+    with get_conn() as conn:
+        rows = vq_get_document(conn, doc_id, corpus)
+
+    if not rows:
+        where = f" in corpus {corpus}" if corpus is not None else ""
+        raise HTTPException(404, f"Document {doc_id} not found{where}")
+    if len(rows) > 1:
+        corpora = ", ".join(r["corpus"] for r in rows)
+        raise HTTPException(
+            400, f"Document {doc_id} exists in several corpora ({corpora}): pass ?corpus=")
+    row = rows[0]
     if not row["local_path"]:
         raise HTTPException(404, "No file path recorded for this document")
 
-    raw_relative = resolve_raw_relative(row["local_path"])
-    if raw_relative is None:
-        raise HTTPException(400, "Invalid file path")
-    file_path = (RAW_DATA_DIR / raw_relative).resolve()
+    root = CORPUS_ROOTS.get(row["corpus"])
+    if root is None:
+        raise HTTPException(
+            404, f"No file root configured for corpus {row['corpus']!r} ({CORPUS_ROOTS_ENV})")
+    # A path leaving the root (`..`, absolute, a symlink out) is a 404 like a
+    # missing file: nothing outside a corpus root is ever looked at.
+    file_path = resolve_under_root(root, row["local_path"])
+    if file_path is None:
+        raise HTTPException(404, "Invalid file path")
+    if not is_file(file_path):
+        raise HTTPException(404, f"File not found on disk: {row['local_path']}")
 
-    # Security: prevent any escape from the allowed directory (path traversal)
-    if RAW_DATA_DIR not in file_path.parents and file_path != RAW_DATA_DIR:
-        raise HTTPException(400, "Invalid file path")
-
-    if not file_path.is_file():
-        raise HTTPException(404, f"File not found on disk: {raw_relative}")
+    # Accepted TOCTOU window: between the check above and FileResponse opening
+    # the file, the corpus share could swap a component for a symlink leaving
+    # the root, or delete the file. The mounts are read-only to this container
+    # and written only by the corpus producer (trusted, and not adversarial);
+    # closing it would need an O_NOFOLLOW walk from an opened root fd. A file
+    # deleted in between surfaces as an error of that one request.
 
     return FileResponse(
         path=file_path,
@@ -181,7 +213,13 @@ def stats_summary():
 
         by_corpus = counts(corpus)
         by_source_code = top_counts(conn, "source_code")
-        by_doc_type = top_counts(conn, "doc_type")
+        # A doc_type code means something only within its corpus: counted
+        # per corpus (top 20 each), never summed across corpora.
+        by_doc_type = [
+            CorpusCountItem(corpus=c.key, **g)
+            for c in by_corpus
+            for g in corpus_stats(conn, "doc_type", corpus=c.key, limit=20)["groups"]
+        ]
         by_language = top_counts(conn, "language")
         by_year = top_counts(conn, "year", limit=200)
         by_provenance = top_counts(conn, "provenance")

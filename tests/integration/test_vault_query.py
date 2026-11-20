@@ -136,14 +136,16 @@ def test_search_excludes_tombstones_unless_asked(conn):
 
 
 def test_get_document_known_unknown_and_tombstoned(conn):
-    """Lookup by doc_id returns the stored row, None when unknown, tombstones too.
+    """Lookup by doc_id returns the stored rows, [] when unknown, tombstones too.
 
     A citation to a document that was later swept must still resolve: the
     lookup ignores `deleted_at` and lets the caller see it.
     """
-    assert vq.get_document(conn, "us2")["year"] == 2010
-    assert vq.get_document(conn, "nope") is None
-    assert vq.get_document(conn, "de1")["deleted_at"] is not None
+    [us2] = vq.get_document(conn, "us2")
+    assert us2["year"] == 2010 and us2["corpus"] == "central-bank"
+    assert vq.get_document(conn, "nope") == []
+    [de1] = vq.get_document(conn, "de1")
+    assert de1["deleted_at"] is not None
 
 
 def test_null_date_row_is_stored_with_no_date(conn):
@@ -152,7 +154,7 @@ def test_null_date_row_is_stored_with_no_date(conn):
     Guards the paging test above: if the ingester ever coerced a missing date
     into a value, that test would stop exercising NULLS LAST without failing.
     """
-    doc = vq.get_document(conn, "us3")
+    [doc] = vq.get_document(conn, "us3")
     assert doc["date"] is None and doc["year"] is None
 
 
@@ -741,3 +743,99 @@ def test_since_grammar_sweep_agrees_with_postgres(conn):
     for since in ["0001-01-01T00:00+15:59", "9999-12-31T23:59-15:59", "2026-10-01T09:59:59-00:00"]:
         assert since in ours
         assert isinstance(vq.recent_runs(conn, since=since), list)
+
+
+# --- 0.5.0: identity (corpus, doc_id), doc_type scoped by corpus ---------------
+
+def _write_vocabulary(directory, doc):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "vocabulary.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.fixture()
+def corpora_conn(clean_db, tmp_path, monkeypatch):
+    """Three corpora through the real ingester: central-bank and company both
+    declare `A1` (a rate decision, a 10-K), both hold a document `shared`;
+    `third` ships no vocabulary (transition), so only its codes in use exist."""
+    from vault_contract import golden
+
+    cb, co, third = tmp_path / "cb", tmp_path / "co", tmp_path / "third"
+    _write_vocabulary(cb, golden.vocabulary("central-bank"))
+    write_manifest(cb / "manifest", "ecb.jsonl", [
+        make_doc("cb1", source="ecb", doc_type="A1", date_precision="day", date_kind="meeting"),
+        make_doc("shared", source="ecb", doc_type="C1"),
+    ])
+    _write_vocabulary(co, golden.vocabulary("company"))
+    company = dict(corpus="company", source="sec", provenance="edgar_index",
+                   entity_scheme="cik", entity_value="0000320193",
+                   date_precision="day", date_kind="publication")
+    write_manifest(co / "manifest", "0000320193.jsonl", [
+        make_doc("co1", doc_type="A1", local_path="raw/0000320193/A1/2010/co1.pdf", **company),
+        make_doc("shared", doc_type="C1", local_path="raw/0000320193/C1/2010/s.pdf", **company),
+    ])
+    write_manifest(third / "manifest", "x.jsonl", [
+        make_doc("t1", corpus="third", source="zz", doc_type="X9", local_path="raw/t1.pdf"),
+    ])
+    run_ingest(monkeypatch, clean_db, cb, corpus="central-bank")
+    run_ingest(monkeypatch, clean_db, co, corpus="company")
+    run_ingest(monkeypatch, clean_db, third, corpus="third")
+    c = psycopg2.connect(clean_db)
+    c.autocommit = True
+    yield c
+    c.close()
+
+
+def test_get_document_without_corpus_returns_one_row_per_corpus(corpora_conn):
+    rows = vq.get_document(corpora_conn, "shared")
+    assert [(r["corpus"], r["doc_id"], r["source_code"]) for r in rows] == [
+        ("central-bank", "shared", "ecb"), ("company", "shared", "sec")]
+
+
+def test_get_document_with_corpus_returns_that_corpus_only(corpora_conn):
+    [row] = vq.get_document(corpora_conn, "shared", corpus="company")
+    assert row["corpus"] == "company"
+    assert vq.get_document(corpora_conn, "shared", corpus="nowhere") == []
+    assert vq.get_document(corpora_conn, "cb1", corpus="company") == []
+
+
+def test_document_rows_carry_the_contract_columns(corpora_conn):
+    [row] = vq.get_document(corpora_conn, "co1", corpus="company")
+    assert (row["entity_scheme"], row["entity_value"]) == ("cik", "0000320193")
+    assert (row["date_precision"], row["date_kind"]) == ("day", "publication")
+    _, rows = vq.search_documents(corpora_conn, {"corpus": "central-bank", "doc_type": "A1"})
+    assert [(r["doc_id"], r["date_precision"], r["date_kind"]) for r in rows] == [
+        ("cb1", "day", "meeting")]
+
+
+def test_doc_type_with_corpus_reads_that_corpus_only(corpora_conn):
+    total, rows = vq.search_documents(corpora_conn, {"corpus": "company", "doc_type": "A1"})
+    assert total == 1 and [r["doc_id"] for r in rows] == ["co1"]
+
+
+def test_doc_type_without_corpus_names_every_corpus_code_and_label(corpora_conn):
+    with pytest.raises(vq.DocTypeNeedsCorpus) as exc:
+        vq.search_documents(corpora_conn, {"doc_type": "A1"})
+    message = str(exc.value)
+    assert message.startswith("doc_type needs corpus")
+    assert ("central-bank: A1 = Rate-decision press release, "
+            "A3 = Meeting minutes / accounts / summary of deliberations") in message
+    assert "company: A1 = Annual report (10-K), A2 = Quarterly report (10-Q)" in message
+    assert "third (no vocabulary loaded, codes in use): X9" in message
+    # The connection is left idle and usable (no snapshot was opened).
+    assert vq.search_documents(corpora_conn, {"corpus": "third"})[0] == 1
+
+
+def test_corpus_stats_by_doc_type_needs_corpus(corpora_conn):
+    with pytest.raises(vq.DocTypeNeedsCorpus, match="company: A1 = Annual report"):
+        vq.corpus_stats(corpora_conn, "doc_type")
+    stats = vq.corpus_stats(corpora_conn, "doc_type", corpus="company")
+    assert {g["key"]: g["count"] for g in stats["groups"]} == {"A1": 1, "C1": 1}
+
+
+def test_list_vocabulary_reads_the_loaded_vocabularies(corpora_conn):
+    rows = vq.list_vocabulary(corpora_conn, corpus="company", kind="doc_type")
+    assert rows[0] == {"corpus": "company", "kind": "doc_type", "code": "A1",
+                       "label": "Annual report (10-K)", "family": "A"}
+    assert {r["corpus"] for r in vq.list_vocabulary(corpora_conn)} == {"central-bank", "company"}
+    assert vq.list_vocabulary(corpora_conn, corpus="third") == []
+    assert len(vq.list_vocabulary(corpora_conn, limit=2)) == 2

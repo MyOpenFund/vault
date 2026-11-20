@@ -138,7 +138,7 @@
   {
     "code": "C4",
     "name": "C4 · Document explorer (with RAG state)",
-    "description": "Browsable document table with the official link and RAG state (inventory #3, #5, #2); rag_state any/in/out replaces the Streamlit \"only in the RAG\" toggle. Keep the LIMIT — the file download stays `vaultctl download <doc_id>`.",
+    "description": "Browsable document table with the official link and RAG state (inventory #3, #5, #2); rag_state any/in/out replaces the Streamlit \"only in the RAG\" toggle. Keep the LIMIT — the file download stays `vaultctl download <doc_id>`. `date_precision` / `date_kind` say how far `date` can be trusted (a year-precision date is 1 January) and `entity_value` names the entity the document is about (a CIK for `company`).",
     "display": "table",
     "visualization_settings": {
       "table.pivot": false,
@@ -148,7 +148,7 @@
         }
       }
     },
-    "sql": "-- Documents with RAG state\nSELECT d.doc_id,\n       d.source_code   AS bank,\n       d.doc_type      AS type,\n       d.date,\n       d.title,\n       (r.doc_id IS NOT NULL) AS in_rag,\n       r.chunk_count   AS n_chunks,\n       r.embedding_model,\n       r.ingested_at   AS rag_ingested_at,\n       coalesce(d.document_url, d.source_url) AS official_link,\n       d.page_count,\n       d.has_text_layer\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND ({{rag_state}} = 'any'\n       OR ({{rag_state}} = 'in'  AND r.doc_id IS NOT NULL)\n       OR ({{rag_state}} = 'out' AND r.doc_id IS NULL))]]\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\nORDER BY d.date DESC NULLS LAST, d.doc_id\nLIMIT 2000;\n",
+    "sql": "-- Documents with RAG state\nSELECT d.doc_id,\n       d.source_code   AS bank,\n       d.doc_type      AS type,\n       d.date,\n       d.date_precision,\n       d.date_kind,\n       d.entity_value,\n       d.title,\n       (r.doc_id IS NOT NULL) AS in_rag,\n       r.chunk_count   AS n_chunks,\n       r.embedding_model,\n       r.ingested_at   AS rag_ingested_at,\n       coalesce(d.document_url, d.source_url) AS official_link,\n       d.page_count,\n       d.has_text_layer\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.corpus = d.corpus\n      AND r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND ({{rag_state}} = 'any'\n       OR ({{rag_state}} = 'in'  AND r.doc_id IS NOT NULL)\n       OR ({{rag_state}} = 'out' AND r.doc_id IS NULL))]]\n  [[AND (d.date IS NULL OR d.date <= {{as_of}})]]\n  [[AND d.source_code = {{bank}}]]\n  [[AND d.doc_type = {{doc_type}}]]\nORDER BY d.date DESC NULLS LAST, d.doc_id\nLIMIT 2000;\n",
     "tags": {
       "corpus": {
         "type": "text",
@@ -461,6 +461,17 @@
     }
   },
   {
+    "code": "Q7",
+    "name": "Q7 · Refused rows by corpus and reason",
+    "description": "Manifest rows the vault ingestion refused at its last run of each corpus, per reason, read from `ingestion_refusals` (replaced at every run, so it always shows the last one; a corpus whose last run refused nothing has no row). Every corpus at once, so the dashboard's corpus filter does not apply. `refusals` counts one per defect, `refused_lines` one per line (a line with two defects counts under both reasons); `sample` is the first refusal in file order. Any row here means that run skipped its soft-delete sweep and exited 1.",
+    "display": "table",
+    "visualization_settings": {
+      "table.pivot": false
+    },
+    "sql": "-- Refused manifest rows at the last ingestion of each corpus\nSELECT f.corpus,\n       f.reason,\n       count(*)                                         AS refusals,\n       count(DISTINCT (f.source_file, f.line))          AS refused_lines,\n       count(DISTINCT f.source_file)                    AS files,\n       max(f.run_ts)                                    AS last_run_ts,\n       (array_agg(f.source_file || ':' || f.line\n                  || coalesce(' ' || f.field, '')\n                  || coalesce('=' || f.value, '')\n                  ORDER BY f.source_file, f.line))[1]  AS sample\nFROM ingestion_refusals f\nGROUP BY 1, 2\nORDER BY 1, refusals DESC, 2;\n",
+    "tags": {}
+  },
+  {
     "code": "R1",
     "name": "R1 · Chunks by collection",
     "description": "Documents and chunks recorded as ingested per collection and embedding model (inventory #1). Accepted loss: this is the vault's belief, not live Qdrant state.",
@@ -486,7 +497,7 @@
     "visualization_settings": {
       "table.pivot": false
     },
-    "sql": "-- RAG coverage per bank x type\nSELECT d.source_code AS bank,\n       d.doc_type    AS type,\n       count(*)                                     AS documents,\n       count(r.doc_id)                              AS in_rag,\n       count(*) - count(r.doc_id)                   AS missing_from_rag,\n       round(100.0 * count(r.doc_id) / count(*), 1) AS pct_in_rag,\n       coalesce(sum(r.chunk_count), 0)              AS chunks\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND d.source_code = {{bank}}]]\nGROUP BY 1, 2\nORDER BY pct_in_rag ASC, documents DESC;\n",
+    "sql": "-- RAG coverage per bank x type\nSELECT d.source_code AS bank,\n       d.doc_type    AS type,\n       count(*)                                     AS documents,\n       count(r.doc_id)                              AS in_rag,\n       count(*) - count(r.doc_id)                   AS missing_from_rag,\n       round(100.0 * count(r.doc_id) / count(*), 1) AS pct_in_rag,\n       coalesce(sum(r.chunk_count), 0)              AS chunks\nFROM documents d\nLEFT JOIN rag_ingestions r\n       ON r.corpus = d.corpus\n      AND r.doc_id = d.doc_id\n      AND r.collection = {{collection}}\nWHERE d.deleted_at IS NULL\n  AND d.corpus = {{corpus}}\n  [[AND d.source_code = {{bank}}]]\nGROUP BY 1, 2\nORDER BY pct_in_rag ASC, documents DESC;\n",
     "tags": {
       "corpus": {
         "type": "text",

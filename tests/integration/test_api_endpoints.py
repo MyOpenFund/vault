@@ -11,6 +11,7 @@ The app is pointed at the throwaway Postgres by patching `db.DATABASE_URL`
 (read inside `get_conn` on every call) rather than by mocking the driver.
 """
 
+import psycopg2
 import pytest
 
 from .conftest import make_doc, run_ingest, write_manifest
@@ -60,13 +61,21 @@ def api_db(clean_db, tmp_path, monkeypatch):
 
 @pytest.fixture()
 def download_db(clean_db, tmp_path, monkeypatch):
-    """Corpus of engineered local_paths, plus a real RAW_DATA_DIR on disk."""
-    import db
-    import main as api_main
+    """Corpus of engineered local_paths, plus real corpus roots on disk.
 
-    raw_dir = tmp_path / "raw"
+    Two corpora with their own roots (CORPUS_ROOTS, read by the app at
+    startup): `twin` exists in both, each with its own file.
+    """
+    import db
+
+    root = tmp_path / "cbdata"
+    raw_dir = root / "raw"
     (raw_dir / "us" / "C1" / "2010").mkdir(parents=True)
     (raw_dir / "us" / "C1" / "2010" / "good.pdf").write_bytes(b"%PDF-1.4 fixture\n")
+    (raw_dir / "us" / "C1" / "2010" / "twin.pdf").write_bytes(b"%PDF cb twin\n")
+    company_root = tmp_path / "companydata"
+    (company_root / "raw" / "0000320193").mkdir(parents=True)
+    (company_root / "raw" / "0000320193" / "twin.pdf").write_bytes(b"%PDF company twin\n")
 
     # A directory symlink INSIDE the raw tree pointing out of it: the relative
     # path holds no ".." at all, so only resolving it against the filesystem
@@ -81,16 +90,37 @@ def download_db(clean_db, tmp_path, monkeypatch):
         manifests,
         "corpus.jsonl",
         [
-            make_doc("good", local_path="data/raw/us/C1/2010/good.pdf"),
-            make_doc("traversal", local_path="data/raw/../../etc/passwd"),
-            make_doc("absolute", local_path="/etc/passwd"),
-            make_doc("symlinked", local_path="data/raw/link/secret.txt"),
+            make_doc("good", local_path="raw/us/C1/2010/good.pdf"),
+            make_doc("twin", local_path="raw/us/C1/2010/twin.pdf"),
+            make_doc("symlinked", local_path="raw/link/secret.txt"),
+            # Transition: a pre-contract `data/` path, stored without the prefix.
+            make_doc("legacy", local_path="data/raw/us/C1/2010/good.pdf"),
         ],
     )
     run_ingest(monkeypatch, clean_db, manifests)
+    write_manifest(tmp_path / "company", "m.jsonl", [
+        make_doc("twin", corpus="company", local_path="raw/0000320193/twin.pdf"),
+        make_doc("nofile", corpus="company", local_path="raw/0000320193/absent.pdf"),
+    ])
+    run_ingest(monkeypatch, clean_db, tmp_path / "company", corpus="company")
+    # The documents contract refuses these two at ingestion (bad_local_path),
+    # so they are written by hand: the API must stay safe against a stored
+    # row the ingestion would refuse today (a row written before the
+    # contract, or by hand).
+    conn = psycopg2.connect(clean_db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO documents (doc_id, corpus, title, local_path) VALUES "
+                "('traversal', 'central-bank', 'doc traversal', 'raw/../../etc/passwd'), "
+                "('absolute', 'central-bank', 'doc absolute', '/etc/passwd'), "
+                "('prefixed', 'central-bank', 'doc prefixed', 'data/raw/us/C1/2010/good.pdf')")
+        conn.commit()
+    finally:
+        conn.close()
 
     monkeypatch.setattr(db, "DATABASE_URL", clean_db)
-    monkeypatch.setattr(api_main, "RAW_DATA_DIR", raw_dir.resolve())
+    monkeypatch.setenv("CORPUS_ROOTS", f"central-bank={root},company={company_root}")
     return clean_db
 
 
@@ -135,8 +165,13 @@ def test_list_documents_rejects_a_sort_field_outside_the_allowlist(api_db, clien
 
 
 def test_get_document_returns_the_stored_row(api_db, client):
-    """A known doc_id returns that document's own stored metadata."""
-    response = client.get("/documents/us2")
+    """A known doc_id returns that document's own stored metadata: one
+    document with ?corpus=, the list of every corpus's document without."""
+    listed = client.get("/documents/us2")
+    assert listed.status_code == 200
+    assert [d["corpus"] for d in listed.json()] == ["central-bank"]
+
+    response = client.get("/documents/us2", params={"corpus": "central-bank"})
 
     assert response.status_code == 200
     body = response.json()
@@ -161,7 +196,7 @@ def test_the_probe_facts_reach_the_api(api_db, client):
     finally:
         conn.close()
 
-    body = client.get("/documents/us2").json()
+    [body] = client.get("/documents/us2").json()
     assert (body["has_text_layer"], body["page_count"]) == (False, 7)
     items = {i["doc_id"]: i for i in client.get("/documents").json()["items"]}
     assert (items["us2"]["has_text_layer"], items["us2"]["page_count"]) == (False, 7)
@@ -196,24 +231,23 @@ def test_stats_summary_counts_only_live_documents(api_db, client):
 def test_download_document_file_rejects_path_traversal_through_the_endpoint(
     download_db, client, doc_id
 ):
-    """A local_path that escapes RAW_DATA_DIR must be refused, not served.
+    """A local_path that escapes its corpus root must be refused, not served.
 
     local_path comes from a manifest written by an upstream corpus builder,
-    so it is untrusted input reaching a filesystem read. Each case must stop
-    with 400 — a 404 would mean the path had been resolved against the
-    filesystem and merely missed. The three cases fall to different guards
-    on purpose: the relative escape and the absolute path are rejected by
-    resolve_raw_relative, while the symlinked one carries no ".." and is
-    only caught by the containment check on the resolved path — the one
-    guard the other two never reach.
+    so it is untrusted input reaching a filesystem read. Each case stops with
+    404 "Invalid file path" (not "File not found on disk": the escape is
+    caught, nothing outside the root is looked at). The relative escape and
+    the absolute path are refused on their text, while the symlinked one
+    carries no ".." and is only caught by the containment check on the
+    resolved path.
     """
     response = client.get(f"/documents/{doc_id}/file")
 
-    assert response.status_code == 400
+    assert response.status_code == 404
     assert response.json()["detail"] == "Invalid file path"
 
 
-def test_download_document_file_serves_a_file_under_the_raw_data_dir(
+def test_download_document_file_serves_a_file_under_its_corpus_root(
     download_db, client
 ):
     """The guard must not break the happy path: a legitimate file downloads."""
@@ -222,6 +256,65 @@ def test_download_document_file_serves_a_file_under_the_raw_data_dir(
     assert response.status_code == 200
     assert response.content == b"%PDF-1.4 fixture\n"
     assert "good.pdf" in response.headers["content-disposition"]
+
+
+def test_download_reads_each_corpus_under_its_own_root(download_db, client):
+    """`twin` exists in both corpora: corpus is required, and each corpus's
+    file comes from its own root."""
+    ambiguous = client.get("/documents/twin/file")
+    assert ambiguous.status_code == 400
+    assert "central-bank, company" in ambiguous.json()["detail"]
+
+    cb = client.get("/documents/twin/file", params={"corpus": "central-bank"})
+    co = client.get("/documents/twin/file", params={"corpus": "company"})
+    assert (cb.status_code, cb.content) == (200, b"%PDF cb twin\n")
+    assert (co.status_code, co.content) == (200, b"%PDF company twin\n")
+
+
+def test_download_of_a_transition_row(download_db, client):
+    """The ingestion stores a manifest's `data/raw/...` as `raw/...`, so such a
+    row is served; a row still holding `data/...` (ingested before the
+    deploy, until the first post-deploy run rewrites it) is not found."""
+    assert client.get("/documents/legacy/file").content == b"%PDF-1.4 fixture\n"
+    prefixed = client.get("/documents/prefixed/file")
+    assert prefixed.status_code == 404
+    assert prefixed.json()["detail"] == "File not found on disk: data/raw/us/C1/2010/good.pdf"
+
+
+def test_download_of_a_corpus_without_a_root(download_db, client, monkeypatch):
+    monkeypatch.setenv("CORPUS_ROOTS", "central-bank=/nonexistent")
+    from fastapi.testclient import TestClient
+
+    import main as api_main
+
+    with TestClient(api_main.app) as other:
+        r = other.get("/documents/nofile/file")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "No file root configured for corpus 'company' (CORPUS_ROOTS)"
+
+
+def test_get_document_and_doc_type_across_two_corpora(download_db, client):
+    """Identity is (corpus, doc_id), and a doc_type filter needs corpus."""
+    assert [d["corpus"] for d in client.get("/documents/twin").json()] == [
+        "central-bank", "company"]
+    assert client.get("/documents/twin", params={"corpus": "company"}).json()["corpus"] == "company"
+    assert client.get("/documents/good", params={"corpus": "company"}).status_code == 404
+
+    refused = client.get("/documents", params={"doc_type": "C1"})
+    assert refused.status_code == 400
+    detail = refused.json()["detail"]
+    assert detail.startswith("doc_type needs corpus")
+    # No vocabulary loaded in this fixture: the codes in use, per corpus.
+    assert "central-bank (no vocabulary loaded, codes in use): C1" in detail
+    assert "company (no vocabulary loaded, codes in use): C1" in detail
+
+    body = client.get("/documents", params={"doc_type": "C1", "corpus": "company"}).json()
+    assert sorted(i["doc_id"] for i in body["items"]) == ["nofile", "twin"]
+
+    by_doc_type = client.get("/stats/summary").json()["by_doc_type"]
+    # The hand-written rows have no doc_type: their NULL group is kept.
+    assert {(i["corpus"], i["key"]): i["count"] for i in by_doc_type} == {
+        ("central-bank", "C1"): 4, ("central-bank", None): 3, ("company", "C1"): 2}
 
 
 def test_the_app_refuses_to_start_when_its_role_does_not_exist(clean_db, monkeypatch):

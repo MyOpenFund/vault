@@ -31,8 +31,8 @@ def client(monkeypatch):
     {"has_text_layer": None, "page_count": None},   # not probed yet
 ])
 def test_get_document_returns_the_probe_facts(client, monkeypatch, facts):
-    monkeypatch.setattr(main, "vq_get_document", lambda _c, _id: {**ROW, **facts})
-    body = client.get("/documents/d1").json()
+    monkeypatch.setattr(main, "vq_get_document", lambda _c, _id, _corpus: [{**ROW, **facts}])
+    [body] = client.get("/documents/d1").json()
     assert {k: body[k] for k in facts} == facts
 
 
@@ -55,7 +55,7 @@ def test_get_document_returns_document_url(client, monkeypatch):
     # 2026-11 rename: the field is document_url; pydantic would silently drop
     # a key the model does not declare.
     monkeypatch.setattr(main, "vq_get_document",
-                        lambda _c, _id: {**ROW, "document_url": "https://x.invalid/d1.pdf"})
-    body = client.get("/documents/d1").json()
+                        lambda _c, _id, _corpus: [{**ROW, "document_url": "https://x.invalid/d1.pdf"}])
+    body = client.get("/documents/d1", params={"corpus": "central-bank"}).json()
     assert body["document_url"] == "https://x.invalid/d1.pdf"
     assert "pdf_url" not in body

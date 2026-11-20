@@ -9,12 +9,16 @@ non-autocommit connection leaves it "idle in transaction", holding ACCESS SHARE 
 block the vault's DDL train.
 """
 from .documents import ALL_COLUMNS, SEARCH_COLUMNS, get_document, search_documents
-from .filters import FILTERABLE_FIELDS, SORTABLE_FIELDS, InvalidQuery, build_where_clause
+from .filters import (
+    FILTERABLE_FIELDS, SORTABLE_FIELDS, DocTypeNeedsCorpus, InvalidQuery, build_where_clause,
+)
 from .health import freshness, open_discovery_errors, recent_runs, runs_status, source_health
 from .stats import GROUPABLE_FIELDS, corpus_stats
+from .vocabulary import VOCABULARY_KINDS, list_vocabulary
 
 __all__ = [
     "ALL_COLUMNS", "FILTERABLE_FIELDS", "GROUPABLE_FIELDS", "SEARCH_COLUMNS", "SORTABLE_FIELDS",
-    "InvalidQuery", "build_where_clause", "corpus_stats", "freshness", "get_document",
-    "open_discovery_errors", "recent_runs", "runs_status", "search_documents", "source_health",
+    "VOCABULARY_KINDS", "DocTypeNeedsCorpus", "InvalidQuery", "build_where_clause",
+    "corpus_stats", "freshness", "get_document", "list_vocabulary", "open_discovery_errors",
+    "recent_runs", "runs_status", "search_documents", "source_health",
 ]

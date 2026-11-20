@@ -501,3 +501,234 @@ def test_run_columns_end_with_bad_content():
         "truncated", "error_samples",
     )
 
+
+
+# --- 0.5.0: identity (corpus, doc_id) and corpus-scoped doc_type --------------
+
+class _ScriptedCursor:
+    """Records (sql, params) and answers every fetch with the scripted rows."""
+
+    def __init__(self, log, rows):
+        self.log, self.rows = log, rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.log.append((sql, params))
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _ScriptedConnection:
+    def __init__(self, rows=()):
+        self.rows, self.log = list(rows), []
+        self.autocommit = True
+
+    def cursor(self, *a, **k):
+        return _ScriptedCursor(self.log, self.rows)
+
+    def get_transaction_status(self):
+        return 0
+
+
+# What the doc_type message query returns: (corpus, code, label, declared).
+CODES = [
+    {"corpus": "central-bank", "code": "A1", "label": "Monetary policy decision", "declared": True},
+    {"corpus": "central-bank", "code": "E3", "label": "Annual report", "declared": True},
+    {"corpus": "company", "code": "A1", "label": "Annual report (10-K)", "declared": True},
+    {"corpus": "third", "code": "X9", "label": None, "declared": False},
+]
+
+
+def test_get_document_returns_every_row_of_the_doc_id_as_a_list():
+    rows = [{"doc_id": "d1", "corpus": "central-bank"}, {"doc_id": "d1", "corpus": "company"}]
+    conn = _ScriptedConnection(rows)
+    assert get_document(conn, "d1") == rows
+    (sql, params), = conn.log
+    assert "doc_id = %s" in sql and "corpus = %s" not in sql
+    assert "ORDER BY corpus" in sql
+    assert params == ("d1",)
+
+
+def test_get_document_with_corpus_filters_on_both_keys():
+    conn = _ScriptedConnection([{"doc_id": "d1", "corpus": "company"}])
+    assert get_document(conn, "d1", corpus="company") == [{"doc_id": "d1", "corpus": "company"}]
+    (sql, params), = conn.log
+    assert "doc_id = %s" in sql and "corpus = %s" in sql
+    assert params == ("d1", "company")
+
+
+def test_get_document_unknown_is_an_empty_list():
+    assert get_document(_ScriptedConnection([]), "nope") == []
+
+
+@pytest.mark.parametrize("corpus, match", [(NUL, "NUL"), ("\ud800", "UTF-8")])
+def test_get_document_checks_the_corpus_before_sql(corpus, match):
+    with pytest.raises(InvalidQuery, match=match):
+        get_document(_NoConnection(), "d1", corpus=corpus)
+
+
+def test_doc_type_needs_corpus_is_an_invalid_query():
+    from vault_query import DocTypeNeedsCorpus
+
+    assert issubclass(DocTypeNeedsCorpus, InvalidQuery)
+    assert issubclass(DocTypeNeedsCorpus, ValueError)
+
+
+@pytest.mark.parametrize("filters", [{"doc_type": "A1"}, {"doc_type": "A1", "source_code": "ecb"},
+                                     {"doc_type": ""}])
+def test_build_where_clause_refuses_doc_type_without_corpus(filters):
+    from vault_query import DocTypeNeedsCorpus
+
+    with pytest.raises(DocTypeNeedsCorpus, match=r"^doc_type needs corpus"):
+        build_where_clause(filters)
+
+
+def test_build_where_clause_takes_doc_type_with_corpus():
+    where_sql, params = build_where_clause({"doc_type": "A1", "corpus": "company"})
+    assert "doc_type = %s" in where_sql and "corpus = %s" in where_sql
+    assert sorted(params) == ["A1", "company"]
+
+
+def test_a_bad_value_wins_over_the_missing_corpus():
+    """Values are checked first: a NUL doc_type or a bad date is still InvalidQuery
+    for that value, before the corpus rule (which needs SQL to word its message)."""
+    with pytest.raises(InvalidQuery, match="NUL"):
+        build_where_clause({"doc_type": "\x00"})
+    with pytest.raises(InvalidQuery, match="date_from"):
+        search_documents(_NoConnection(), {"doc_type": "A1", "date_from": "garbage"})
+
+
+def test_search_documents_doc_type_without_corpus_lists_the_codes_per_corpus():
+    from vault_query import DocTypeNeedsCorpus
+
+    conn = _ScriptedConnection(CODES)
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        search_documents(conn, {"doc_type": "A1"})
+    message = str(exc.value)
+    assert message.startswith("doc_type needs corpus")
+    assert "central-bank: A1 = Monetary policy decision, E3 = Annual report" in message
+    assert "company: A1 = Annual report (10-K)" in message
+    # A corpus with no vocabulary yet: the codes in use, said as such, no label.
+    assert "third (no vocabulary loaded, codes in use): X9" in message
+    # One read only, the code listing: no snapshot, no COUNT, no page.
+    assert len(conn.log) == 1
+    sql, params = conn.log[0]
+    assert "FROM vocabulary" in sql and "FROM documents" in sql
+    assert "LIMIT %s" in sql
+
+
+def test_the_code_list_is_cut_past_max_message_codes():
+    from vault_query import DocTypeNeedsCorpus
+    from vault_query.vocabulary import MAX_MESSAGE_CODES
+
+    rows = [{"corpus": "big", "code": f"C{i:04d}", "label": None, "declared": True}
+            for i in range(MAX_MESSAGE_CODES + 1)]      # the SQL fetches one more than kept
+    conn = _ScriptedConnection(rows)
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        search_documents(conn, {"doc_type": "A1"})
+    message = str(exc.value)
+    assert message.endswith(" (list cut: see vault_query.list_vocabulary)")
+    assert f"C{MAX_MESSAGE_CODES - 1:04d}" in message and f"C{MAX_MESSAGE_CODES:04d}" not in message
+    assert conn.log[0][1] == (MAX_MESSAGE_CODES + 1,)
+
+
+def test_each_label_is_cut_to_max_label_chars():
+    from vault_query import DocTypeNeedsCorpus
+    from vault_query.vocabulary import MAX_LABEL_CHARS, MAX_MESSAGE_CODES
+
+    rows = [{"corpus": "big", "code": f"C{i:04d}", "label": "é" * 10_000, "declared": True}
+            for i in range(MAX_MESSAGE_CODES + 1)]
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        search_documents(_ScriptedConnection(rows), {"doc_type": "A1"})
+    message = str(exc.value)
+    assert f"C0000 = {'é' * MAX_LABEL_CHARS}…," in message
+    # Bounded whatever the labels: every code with a cut label, plus the head.
+    per_code = len(f"C0000 = {'é' * MAX_LABEL_CHARS}…, ".encode("utf-8"))
+    assert len(message.encode("utf-8")) < MAX_MESSAGE_CODES * per_code + 1000
+
+
+def test_the_codes_in_use_are_read_only_for_corpora_without_a_vocabulary():
+    from vault_query.vocabulary import _CODES_SQL
+
+    in_use = _CODES_SQL.split("UNION ALL", 1)[1]
+    assert "NOT EXISTS (SELECT 1 FROM vocabulary v WHERE v.corpus = d.corpus)" in " ".join(
+        in_use.split())
+
+
+def test_the_message_says_so_when_no_corpus_has_codes():
+    from vault_query import DocTypeNeedsCorpus
+
+    with pytest.raises(DocTypeNeedsCorpus, match="no corpus declares or uses a doc_type yet"):
+        search_documents(_ScriptedConnection([]), {"doc_type": "A1"})
+
+
+def test_corpus_stats_by_doc_type_needs_corpus():
+    from vault_query import DocTypeNeedsCorpus
+
+    conn = _ScriptedConnection(CODES)
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        corpus_stats(conn, "doc_type")
+    assert str(exc.value).startswith("doc_type needs corpus")
+    assert "company: A1 = Annual report (10-K)" in str(exc.value)
+
+
+def test_corpus_stats_by_doc_type_with_corpus_runs():
+    conn = _ScriptedConnection([])
+    assert corpus_stats(conn, "doc_type", corpus="company")["total"] == 0
+    (sql, params), = conn.log
+    assert "GROUP BY doc_type" in sql and params == ["company", 200]
+
+
+def test_corpus_stats_checks_arguments_before_the_doc_type_rule():
+    with pytest.raises(InvalidQuery, match="limit"):
+        corpus_stats(_NoConnection(), "doc_type", limit=0)
+
+
+def test_list_vocabulary_reads_the_table_ordered_and_bounded():
+    from vault_query import list_vocabulary
+
+    rows = [{"corpus": "company", "kind": "doc_type", "code": "A1",
+             "label": "Annual report (10-K)", "family": "A"}]
+    conn = _ScriptedConnection(rows)
+    assert list_vocabulary(conn) == rows
+    (sql, params), = conn.log
+    assert "FROM vocabulary" in sql and "ORDER BY corpus, kind, code" in sql
+    assert params == [1000]
+
+
+def test_list_vocabulary_filters_by_corpus_and_kind():
+    from vault_query import list_vocabulary
+
+    conn = _ScriptedConnection([])
+    list_vocabulary(conn, corpus="company", kind="doc_type", limit=10)
+    (sql, params), = conn.log
+    assert "corpus = %s" in sql and "kind = %s" in sql
+    assert params == ["company", "doc_type", 10]
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"kind": "password"}, "kind must be one of"),
+    ({"corpus": NUL}, "NUL"),
+    ({"limit": 0}, "limit"),
+    ({"limit": True}, "limit"),
+])
+def test_list_vocabulary_refuses_bad_arguments_before_sql(kwargs, match):
+    from vault_query import list_vocabulary
+
+    with pytest.raises(InvalidQuery, match=match):
+        list_vocabulary(_NoConnection(), **kwargs)
+
+
+def test_package_version_is_0_5_0():
+    from importlib.metadata import version
+
+    assert version("vault-query") == "0.5.0"

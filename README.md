@@ -12,20 +12,33 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 ## Design
 
 - **Multi-corpus by construction**: every document is identified by
-  `(corpus, source_code)` — e.g. `(central-bank, ecb)` — so a second corpus
-  (companies, news, …) is one more ingestion service block, zero schema change.
+  `(corpus, doc_id)` (a `doc_id` is unique within its corpus only) and carries its
+  `source_code` (e.g. `ecb`), so a second corpus (companies, news, …) is one more
+  ingestion service block, zero schema change.
 - **Manifests are the source of truth**: ingestion is idempotent (upserts) and mirrors
   deletions as **soft-deletes** (`deleted_at`), guarded by `SWEEP_MAX_DELETE_FRACTION`
   so a torn/unmounted share can never mass-delete rows.
 - **Read-only mounts**: the ingestion container sees the corpus data read-only;
   the vault can never corrupt a corpus.
 
+## Contract
+
+What a manifest row must hold is the **documents contract**, documented in
+[`contract/README.md`](contract/README.md) (fields, refusal and notice reasons, the
+`vocabulary.json` file, versioning) and shipped as the `vault_contract` package: the
+ingestion checks every row with it, producers pin it to write and test their rows, and
+`python -m vault_contract.check` runs it over a manifest directory. A document is
+`(corpus, doc_id)`: a `doc_id` is unique within its corpus only. Hence, for the RAG: Qdrant
+collections are per corpus today, so a point id derived from `doc_id` alone is unique, but **a
+collection mixing corpora must put `corpus` in its point ids**.
+
 ## Services (`compose.yaml`)
 
 | Service | Role | Port |
 |---|---|---|
 | `postgres` | the vault itself (PostgreSQL 16) | internal only (publishable on one interface — see [Access & roles](#access--roles)) |
-| `ingestion` | one-shot manifest → Postgres sync (run per corpus) | — |
+| `ingestion` | one-shot manifest → Postgres sync, central-bank corpus | — |
+| `ingestion-company` | the same image, `CORPUS=company`, over a copy of the company data root (profile `company`: `docker compose run --rm ingestion-company`, or `COMPOSE_PROFILES=company` — see [Deploy notes](#deploy-notes-2026-11-documents-contract)) | — |
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
 
@@ -33,7 +46,7 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 
 ### Table `documents`
 
-Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); upsert key is `doc_id` (TEXT UNIQUE NOT NULL, the ON CONFLICT target). Columns: `id` (PK), `doc_id` (unique, upsert key), `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `document_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB). `document_url` is the document's own URL (a PDF or any other format); it was named `pdf_url` before 2026-11 (see [Migration (2026-11 document_url rename)](#migration-2026-11-document_url-rename)).
+Central registry of documents across all ingested corpora. One row per document sourced from the manifest `.jsonl` files. Surrogate primary key is `id` (SERIAL PRIMARY KEY); identity and upsert key is `(corpus, doc_id)` (`UNIQUE (corpus, doc_id)`, the ON CONFLICT target, since the documents contract: a `doc_id` is unique within its corpus only). Columns: `id` (PK), `doc_id`, `corpus`, `source_code` (e.g. `ecb`, `fed`), `doc_type`, `title`, `document_url`, `source_url`, `date`, `year`, `language`, `provenance`, `mime_type`, `sha256`, `local_path`, `date_precision`, `date_kind`, `entity_scheme`, `entity_value` (the 18 common fields of the [documents contract](contract/README.md)), plus timestamps (`created_at`, `updated_at`, `last_seen_at`) and deletion tracking (`deleted_at`). Unknown manifest fields fall into `extra` (JSONB). `document_url` is the document's own URL (a PDF or any other format); it was named `pdf_url` before 2026-11 (see [Migration (2026-11 document_url rename)](#migration-2026-11-document_url-rename)).
 
 Write contract (the ingestion service is the only writer):
 
@@ -52,18 +65,25 @@ A `doc_id` repeated inside one manifest file keeps its **last valid line** (what
 
 ### Table `rag_ingestions`
 
-Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(doc_id, collection)`, upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` (FK to `documents`), `collection`, `corpus`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
+Current-state registry of what the RAG has ingested into which Qdrant collection: one row per `(corpus, doc_id, collection)` (the primary key), upserted by `data-orchestrator` over plain SQL. Columns: `doc_id` and `corpus` (foreign key `(corpus, doc_id)` to `documents`), `collection`, `source_code`, `embedding_model`, `embedding_version`, `chunk_count`, `ingested_at`.
 
 Write contract (`data-orchestrator` is the only writer):
 
     INSERT INTO rag_ingestions (doc_id, collection, corpus, source_code,
         embedding_model, embedding_version, chunk_count)
     VALUES (...)
-    ON CONFLICT (doc_id, collection) DO UPDATE SET
+    ON CONFLICT (corpus, doc_id, collection) DO UPDATE SET
         corpus = EXCLUDED.corpus, source_code = EXCLUDED.source_code,
         embedding_model = EXCLUDED.embedding_model,
         embedding_version = EXCLUDED.embedding_version,
         chunk_count = EXCLUDED.chunk_count, ingested_at = now();
+
+**Transitional:** the deployed data-orchestrator still writes `ON CONFLICT (doc_id, collection)`
+(the key before the [documents contract](#migration-2026-11-documents-contract)). The unique
+index `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps that form working
+until the orchestrator is updated; it is removed **in code**, by the cleanup PR's DDL train,
+never by hand (a hand-dropped index breaks the old orchestrator still running, and the train
+would not know it is gone). New writers use the key above.
 
 "Documents not yet in the RAG" is the anti-join on this table; drift between the vault and Qdrant becomes a SQL query. Cross-model history lives in the collection dimension: each re-embed campaign targets a fresh collection.
 
@@ -186,6 +206,155 @@ with `VAULT_DDL_FORCE=1`. Two services on different code versions against the sa
 (e.g. two corpora deployed at different times) see different fingerprints and re-run the train
 alternately, each time the other one has recorded its own — the nightly lock convoy comes back
 until both run the same tree.
+
+### Migration (2026-11 documents contract)
+
+The ingestion checks every manifest row against the [documents contract](contract/README.md)
+(`vault_contract.check_row`) and the schema follows it. One DDL train re-run:
+
+- `documents`: columns `date_precision`, `date_kind`, `entity_scheme`, `entity_value`; identity
+  `UNIQUE (doc_id)` → `UNIQUE (corpus, doc_id)`; a plain index on `doc_id` for lookups by
+  `doc_id` alone; an index on `(entity_scheme, entity_value)`.
+- `rag_ingestions`: primary key `(corpus, doc_id, collection)`, foreign key `(corpus, doc_id)`;
+  the backlog views join on both. **Transition:** a unique index
+  `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps the deployed
+  data-orchestrator's `ON CONFLICT (doc_id, collection)` working until its update (valid while
+  collections are per corpus; removed in code by the cleanup PR's train, never by hand — see
+  [Table `rag_ingestions`](#table-rag_ingestions)).
+- New tables `vocabulary` (the corpus vocabulary, full replace per corpus) and
+  `ingestion_refusals` (the refused rows of each corpus's last run, replaced every run;
+  `value` is the repr of the refused value cut at 200 characters).
+
+Before deploying, check that no `rag_ingestions` row has another corpus than its document:
+`SELECT count(*) FROM rag_ingestions r JOIN documents d USING (doc_id) WHERE r.corpus <> d.corpus;`
+must be 0. Otherwise the train stops with that count (one transaction: nothing changes) and the
+run fails. Measured: the train takes well under a second on 40k documents.
+
+**Refused rows.** A row the contract refuses (unknown code, bad format, `corpus` of another
+corpus, a line that is not a JSON object such as a torn write or a UTF-8 BOM on line 1, an
+`extra` value JSONB cannot hold) is not written, is logged as `file:line reason field=value`
+(the first 100 per run) and lands in `ingestion_refusals`. **Any refused row skips the
+soft-delete sweep and makes the run exit 1** after the cadence, runs and discovery-error passes:
+a refused row is a document "not seen", and a vocabulary mistake on a whole source must not
+soft-delete it. Quality notices (`empty_title`, `precision_not_stated`, transition forms, …) are
+counted in the run summary; the row is written. Central-bank `date_precision`/`date_kind`, kept
+in `extra` until now, move to their columns on the first run.
+
+**Vocabulary file.** The run reads `vocabulary.json` at `DATA_DIR`, or at `VOCABULARY_PATH`
+when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest directory, e.g.
+`/cbdata/manifest`) the file sits one level up, at the data root: set
+`VOCABULARY_PATH=/cbdata/vocabulary.json`, as `CADENCE_PATH` points one level up too.
+- Absent: code membership is not checked (transition); the run logs
+  `vocabulary: missing (membership not checked)`.
+- Present and valid: it replaces this corpus's `vocabulary` rows (its own transaction, before
+  the documents pass) and every row's `source_code`, `doc_type`, `provenance` and
+  `entity_scheme` are checked against it.
+- Present but unreadable, invalid, of another corpus, or declaring a newer MINOR contract
+  version than this vault reads: **the whole run stops before connecting (exit 1)**: no DDL
+  train, no documents, no cadence, runs or discovery-error pass. Checking rows against a
+  vocabulary the vault cannot read would refuse or accept them on the strength of a producer
+  bug or of codes it does not know; nothing is better than a wrong partial run. Fix the file
+  (or deploy the vault that reads the newer MINOR) and run again.
+
+**Rollback to the 2d0457e schema.** With the ingestion stopped, and only while no `doc_id`
+exists under two corpora (`UNIQUE (doc_id)` would fail), run as `docuser` in one transaction
+(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The first
+statement bounds the wait for the table locks (Metabase, the API or the orchestrator reading
+`documents`): if it times out, nothing has changed; re-run it. Preconditions and what stays:
+
+- The data-orchestrator must still write `ON CONFLICT (doc_id, collection)`: the rollback
+  restores that key, and an orchestrator already updated to `(corpus, doc_id, collection)`
+  fails on it, so roll it back too.
+- `date_precision`/`date_kind` come back into `extra` (where the 2d0457e code and the old
+  orchestrator read them) only when the 2d0457e ingestion writes the row again, at its first
+  run, and never for a document no longer in a manifest: the new code moved them to their
+  columns, which the old code ignores.
+- Left behind, ignored by the old code: the columns `date_precision`, `date_kind`,
+  `entity_scheme`, `entity_value` (with their values), the indexes `idx_documents_doc_id` and
+  `idx_documents_entity`, and the tables `vocabulary` and `ingestion_refusals` (with their
+  rows and index). Rolling forward again reuses them.
+- Emptying `vault_schema` makes the old code re-run its train once, which puts the views back
+  on `doc_id` alone.
+
+```sql
+-- rollback: documents contract -> 2d0457e
+SET LOCAL lock_timeout = '5s';
+DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
+ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_corpus_doc_id_fkey;
+ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_pkey;
+ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (doc_id, collection);
+ALTER TABLE documents ADD CONSTRAINT documents_doc_id_key UNIQUE (doc_id);
+ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_doc_id_fkey
+    FOREIGN KEY (doc_id) REFERENCES documents (doc_id);
+ALTER TABLE documents DROP CONSTRAINT documents_corpus_doc_id_key;
+DELETE FROM vault_schema;
+```
+
+Tested by `tests/integration/test_documents_contract.py` (the snippet above is read from this
+file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it;
+once on a freshly migrated database, once after an ingestion and orchestrator writes under the
+new code).
+
+#### Breaking changes (2026-11 documents contract)
+
+For every consumer of the API, `vaultctl` and `vault-query`, in one place:
+
+- HTTP `GET /documents?doc_type=X` without `corpus` → **400** (`doc_type needs corpus: …`, with
+  each corpus's codes). Pass `corpus` with `doc_type`.
+- HTTP `GET /documents/{doc_id}` without `corpus` → **a list** (one document per corpus holding
+  the `doc_id`), not an object; with `corpus`, one object as before.
+- An older `vaultctl` against the new API crashes on `get` (it expects an object): upgrade
+  `vaultctl` with the API.
+- `/stats/summary.by_doc_type` is now a **top 20 per corpus**, each item carrying its `corpus`
+  (it was a top 20 over every corpus summed).
+- `GET /documents/{doc_id}/file` reads `CORPUS_ROOTS` + `local_path`; `RAW_DATA_DIR` is gone (see
+  the deploy notes for the NAS).
+- vault-query 0.5.0 (`get_document` returns a list, `DocTypeNeedsCorpus`, the four new columns)
+  needs the new schema (the `vocabulary` table, the new columns).
+
+#### Deploy notes (2026-11 documents contract)
+
+- **Order**: deploy the tree and run the ingestion first (it applies the train: `vocabulary`,
+  the new columns and keys), then restart the API. vault-query 0.5.0 (the API's) needs the new
+  schema: on the old one it fails on the missing table/columns.
+- **MCP server**: vault-query 0.4.0, its current pin, keeps working on the new schema (it reads
+  no new table or column), so its bump to 0.5.0 is not urgent; do it after the ingestion has
+  run, never before.
+- **data-orchestrator**: its writes keep working (the transitional index serves its
+  `ON CONFLICT (doc_id, collection)`, see [Table `rag_ingestions`](#table-rag_ingestions)).
+  The real constraint is its reads: after the first new ingestion, `date_precision` and
+  `date_kind` leave `extra` for their columns and `local_path` loses its `data/` prefix, both of
+  which the old orchestrator relies on. So **no old-orchestrator ingestion and no
+  `sync-metadata`** between the vault deploy and the orchestrator's update.
+- **NAS ingestion**: the ingestion imports the `vault_contract` package, which the NAS (code
+  bind-mounted, no image build) must provide on both ingestion services: a read-only bind
+  `${VAULT_SRC}/contract/src:/contract:ro` and `PYTHONPATH=/contract`. Extend the deploy's
+  `cmp` check to `contract/src/vault_contract/*.py` and `ingestion/ingest_vocabulary.py`. If it
+  is forgotten, the ingestion exits 1 at import (`ModuleNotFoundError: vault_contract`) and the
+  database is untouched, but the Démarrer has also recreated the api on the new code, which then
+  runs against the old schema: add the mount and the variable, then Démarrer again.
+- **`.env` rename**: `RAW_DIR` (which pointed at `data/raw`) is replaced by
+  `CENTRAL_BANK_DATA_DIR`, the central-bank **data root** (the directory holding `raw/`),
+  required by compose. A stale `RAW_DIR` is ignored.
+- **NAS api**: it needs `CORPUS_ROOTS=central-bank=/cbdata` (the compose default) **and** the
+  data root mounted at `/cbdata` (`${CENTRAL_BANK_DATA_DIR}:/cbdata:ro`). Without the variable
+  every download is a 404 naming `CORPUS_ROOTS` (WARNING at startup: downloads disabled);
+  without the mount, a startup WARNING says the root is not an existing directory and every
+  download is a 404.
+- **Company ingestion** (`ingestion-company`, profile `company`): both ingestion services build
+  the same image tag (`vault-ingestion:local`), so one `docker compose build` refreshes both.
+  Dockge only runs `up`, which skips a profile. Two ways to run it on the NAS:
+  - `COMPOSE_PROFILES=company` in the stack's environment: every Démarrer then starts both
+    ingestions. They serialise only on the DDL train: each run takes the global `vault-ddl`
+    advisory lock around the train alone, releases it, then takes its own `vault-ingest-<corpus>`
+    lock, so the two documents passes run in parallel (`ingestion/ingest.py`, `main`).
+  - Or a one-shot from a shell: `docker compose run --rm ingestion-company`.
+- **`COMPANY_MANIFEST_DIR`** is optional: compose commands work without it. Unset, the company
+  service mounts the empty `/var/empty` and, with `REQUIRE_MANIFESTS=1` (set on that service),
+  exits 1 before connecting with `No .jsonl manifest files found under /data and
+  REQUIRE_MANIFESTS is set` instead of a successful run of 0 rows. `REQUIRE_MANIFESTS` (1/true/
+  yes, 0/false/no; default off) works for any ingestion service; the central-bank one keeps the
+  historical behaviour (no manifest = a WARNING, the train and producer-file passes still run).
 
 ### Migration (2026-11 bad_content per source)
 
@@ -352,8 +521,33 @@ plus a certificate on the host is the next hardening step.
 ## API
 
 `GET /health` · `GET /documents` (filters: corpus, source, type, dates, pagination) ·
-`GET /documents/{doc_id}` · `GET /documents/{doc_id}/file` (serves the raw file from the
-read-only mount) · `GET /stats/summary` (totals, by_corpus, by_source_code)
+`GET /documents/{doc_id}?corpus=` · `GET /documents/{doc_id}/file?corpus=` · `GET /stats/summary`
+(totals, by_corpus, by_source_code, by_doc_type per corpus)
+
+Identity is `(corpus, doc_id)` (documents contract): a `doc_id` is unique within its corpus only.
+
+- `GET /documents/{doc_id}?corpus=X` returns one document (404 if X has none);
+  without `corpus` it returns **a list**, one document per corpus holding that `doc_id`
+  (404 when there is none). Rows carry `date_precision`, `date_kind`, `entity_scheme`,
+  `entity_value`.
+- A `doc_type` filter without `corpus` is a **400** whose detail starts `doc_type needs corpus`
+  and lists each corpus's codes with their labels (vault-query's message): central-bank `A1`
+  and company `A1` share a name, not a meaning.
+- `GET /documents/{doc_id}/file` serves `<corpus root>/<local_path>`, one root per corpus from
+  `CORPUS_ROOTS` (`central-bank=/cbdata,company=/companydata`; compose default
+  `central-bank=/cbdata`, the mount of `CENTRAL_BANK_DATA_DIR`). The value is checked at startup:
+  corpus names are contract codes, each corpus once, roots absolute, not `/`, without `..`,
+  whitespace, control characters or `;`; anything else stops the API. A root that is not an
+  existing directory is only a startup WARNING (a mount may come later): its downloads are 404
+  until it is there. The resolved file must stay under its root (`..`, an absolute path or a
+  symlink leading out: 404 `Invalid file path`, as is a path no file can have: a component past
+  255 bytes, the whole past 4096); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
+  `corpus` is required (400) when the `doc_id` exists in several corpora. `RAW_DATA_DIR` and
+  the split on the `raw` path component are gone.
+- **Transition note.** The ingestion now stores `local_path` without the old `data/` prefix
+  (`raw/...`). Rows ingested before the deploy still hold `data/raw/...` and are a 404 (`File
+  not found on disk`) until the first post-deploy ingestion of their corpus rewrites every live
+  row; no compatibility code exists for them, so run the ingestion right after deploying.
 
 The document and stats routes read through `vault-query` (below); the image installs it from
 the same checkout, which is why `api`'s build context is the repo root (`api/Dockerfile`).
@@ -370,6 +564,8 @@ pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdire
 `<sha>` is the commit to pin (a merge commit on `master`); pin a SHA rather than a branch so a
 consumer's queries only change when it bumps the pin.
 
+- Vocabulary: `list_vocabulary(conn, corpus=None, *, kind=None, limit=1000)` — the codes each
+  corpus declares (`vocabulary` table: corpus, kind, code, label, family).
 - Documents: `search_documents` (filters, sort, paging, total; optional column projection —
   `SEARCH_COLUMNS` for result lists), `get_document`.
 - Counts: `corpus_stats` (live total plus per-field groups, one statement).
@@ -383,6 +579,21 @@ Guarantees: read-only — no function writes or commits the caller's transaction
 takes an open psycopg2 connection that the caller owns (opens, closes, and chooses the role —
 `vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
 "idle in transaction" holds locks that block the ingester's DDL train.
+
+Changes in 0.5.0 (breaking — bump the pin together with the vault deploy of the documents
+contract; the MCP server's tools must follow):
+
+- `get_document(conn, doc_id, corpus=None)` returns a **list**: with `corpus`, zero or one row;
+  without, one row per corpus holding the `doc_id`, ordered by corpus. Unknown: `[]` (was `None`).
+- A `doc_type` filter without `corpus` (`search_documents`, `build_where_clause`) and
+  `corpus_stats(group_by="doc_type")` without `corpus` raise `DocTypeNeedsCorpus` (an
+  `InvalidQuery`, so a `ValueError`); the message starts `doc_type needs corpus` and lists,
+  per corpus, `code = label` from `vocabulary`, or the codes in use for a corpus with no
+  vocabulary loaded. Value checks (NUL, dates, bounds) still come first, without SQL.
+- Rows carry the four contract columns `date_precision`, `date_kind`, `entity_scheme`,
+  `entity_value` (in `ALL_COLUMNS`; not in `SEARCH_COLUMNS`). Needs the 2026-11 schema
+  (`vocabulary` table, new columns).
+- New `list_vocabulary`, `VOCABULARY_KINDS`, `DocTypeNeedsCorpus`.
 
 Changes in 0.4.0 (additive): `RUN_COLUMNS` gains `bad_content`, so every `runs_status` row
 carries it (an integer, NULL when the producer did not report it). Needs a vault deployed with
@@ -420,7 +631,8 @@ Three dashboards over the vault, defined as code in [`metabase/`](metabase/READM
 (`cards.json` + `dashboards.json`, the source of truth, edited by hand):
 
 - **Vault — Corpus** — what's in the corpus: volume, shape, coverage, document explorer.
-- **Vault — Coverage & QC** — what's missing, late or anomalous.
+- **Vault — Coverage & QC** — what's missing, late or anomalous, and (Q7) the manifest rows
+  the last ingestion of each corpus refused.
 - **Vault — RAG & Runs** — is the machine healthy.
 
 ```bash
@@ -457,9 +669,10 @@ from cron.
 ```bash
 pip install -e cli/
 vaultctl stats                                # corpus totals from the API
-vaultctl list --source-code ecb --doc-type D1 # query documents
-vaultctl get <doc_id>                         # one document's metadata
-vaultctl download <doc_id>                    # fetch the raw file via the API
+vaultctl list --corpus central-bank --source-code ecb --doc-type D1  # doc_type needs corpus
+vaultctl get <doc_id>                         # metadata, one per corpus holding the doc_id
+vaultctl get <doc_id> --corpus company        # one document
+vaultctl download <doc_id> --corpus central-bank  # the file (corpus needed if the id is in several)
 ```
 
 ## Tests

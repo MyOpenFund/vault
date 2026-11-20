@@ -30,6 +30,11 @@ class Document(BaseModel):
     # manifests); NULL until a document has been probed.
     has_text_layer: Optional[bool] = None
     page_count: Optional[int] = None
+    # documents contract 1.0.0
+    date_precision: Optional[str] = None
+    date_kind: Optional[str] = None
+    entity_scheme: Optional[str] = None
+    entity_value: Optional[str] = None
     extra: Optional[dict[str, Any]] = None
 
 
@@ -45,11 +50,16 @@ class CountItem(BaseModel):
     count: int
 
 
+class CorpusCountItem(CountItem):
+    """A count whose key means something only within its corpus (doc_type)."""
+    corpus: str
+
+
 class StatsSummary(BaseModel):
     total_documents: int
     by_corpus: list[CountItem]
     by_source_code: list[CountItem]
-    by_doc_type: list[CountItem]
+    by_doc_type: list[CorpusCountItem]
     by_language: list[CountItem]
     by_year: list[CountItem]
     by_provenance: list[CountItem]

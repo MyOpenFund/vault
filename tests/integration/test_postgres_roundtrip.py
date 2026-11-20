@@ -124,16 +124,22 @@ def test_sweep_is_scoped_to_the_service_corpus(clean_db, tmp_path, monkeypatch):
     assert rows == {"cb1": None, "co1": None}
 
 
-def test_contradicting_corpus_line_is_rejected(clean_db, tmp_path, monkeypatch):
+def test_contradicting_corpus_line_is_refused(clean_db, tmp_path, monkeypatch):
+    # Before the documents contract: a skipped line. Now a corpus_conflict
+    # refusal: not written, recorded, and the run exits 1.
     write_manifest(
         tmp_path,
         "mixed.jsonl",
         [make_doc("ok1"), make_doc("bad1", corpus="company")],
     )
-    run_ingest(monkeypatch, clean_db, tmp_path, corpus="central-bank")
+    with pytest.raises(SystemExit) as exc:
+        run_ingest(monkeypatch, clean_db, tmp_path, corpus="central-bank")
+    assert exc.value.code == 1
 
     rows = fetch_all(clean_db, "SELECT doc_id FROM documents")
     assert rows == [("ok1",)]
+    assert fetch_all(clean_db, "SELECT doc_id, reason, field, value FROM ingestion_refusals") == [
+        ("bad1", "corpus_conflict", "corpus", "'company'")]
 
 
 def test_service_run_ingests_documents_and_cadence(

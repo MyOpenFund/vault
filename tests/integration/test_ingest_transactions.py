@@ -34,6 +34,18 @@ def fresh_db(clean_db):
     return clean_db
 
 
+def _add_failing_check(pg_url, doc_id):
+    """Make the database refuse one doc_id (a failure the contract cannot see)."""
+    conn = psycopg2.connect(pg_url)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE documents ADD CONSTRAINT test_refuses_one_doc "
+                        "CHECK (doc_id <> %s)", (doc_id,))
+    finally:
+        conn.close()
+
+
 def test_ingest_main_rolls_back_and_reraises_on_mid_run_db_failure(
     clean_db, tmp_path, monkeypatch
 ):
@@ -41,16 +53,21 @@ def test_ingest_main_rolls_back_and_reraises_on_mid_run_db_failure(
 
     execute_values pages the upsert 500 rows at a time, so with 501 manifest
     lines the first page is already written inside the run's transaction when
-    the last line — valid JSON, but an invalid DATE at the DB layer — makes
-    the second page raise. The half-written batch must not be visible to
+    the last line — a row the contract accepts but the database refuses —
+    makes the second page raise. The half-written batch must not be visible to
     readers: the run has to roll back and re-raise rather than commit the
     part of the share it happened to get through.
+
+    The database-level failure is a CHECK constraint added by the test: since
+    the documents contract, every row shape the database used to refuse (an
+    invalid date, a NUL) is refused before the upsert, as a counted refusal.
     """
-    docs = [make_doc(f"d{i:04d}") for i in range(500)]
-    docs.append(make_doc("d0500", date="not-a-date"))
+    run_ingest(monkeypatch, clean_db, tmp_path)          # empty data dir: DDL only
+    _add_failing_check(clean_db, "d0500")
+    docs = [make_doc(f"d{i:04d}") for i in range(501)]
     write_manifest(tmp_path, "us.jsonl", docs)
 
-    with pytest.raises(psycopg2.DataError):
+    with pytest.raises(psycopg2.errors.CheckViolation):
         run_ingest(monkeypatch, clean_db, tmp_path)
 
     (count,) = fetch_all(clean_db, "SELECT COUNT(*) FROM documents")[0]
@@ -77,14 +94,14 @@ def test_ingest_main_partial_multi_file_run_leaves_earlier_files_committed(
 
     # Run 2 — stale1 has vanished from the manifests (so the sweep, whose
     # fraction guard run_ingest disables, would tombstone it), a second
-    # manifest carries a DB-invalid date, and a newer cadence snapshot waits.
+    # manifest carries a row the database refuses, and a newer cadence
+    # snapshot waits.
+    _add_failing_check(fresh_db, "lost1")
     write_manifest(tmp_path, "a_first.jsonl", [make_doc("kept1")])
-    write_manifest(
-        tmp_path, "b_second.jsonl", [make_doc("lost1", date="not-a-date")]
-    )
+    write_manifest(tmp_path, "b_second.jsonl", [make_doc("lost1")])
     write_cadence(tmp_path, [make_entry(status="on-track")])
 
-    with pytest.raises(psycopg2.DataError):
+    with pytest.raises(psycopg2.errors.CheckViolation):
         run_ingest(monkeypatch, fresh_db, tmp_path)
 
     rows = dict(fetch_all(fresh_db, "SELECT doc_id, deleted_at FROM documents"))

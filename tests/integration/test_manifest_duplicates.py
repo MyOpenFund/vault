@@ -47,7 +47,8 @@ def test_duplicate_in_one_page_no_longer_aborts_the_run(clean_db, tmp_path, monk
     assert len(titles) == 11
     assert titles["dup"] == "second"
     assert _rows(clean_db, "SELECT count(*) FROM cadence") == [(1,)]
-    (warning,) = [r.getMessage() for r in caplog.records if "duplicate" in r.getMessage()]
+    (warning,) = [r.getMessage() for r in caplog.records
+                  if "duplicate line(s) for" in r.getMessage()]
     assert "us.jsonl: dropped 1 duplicate line(s) for 1 doc_id(s)" in warning
     assert warning.endswith("(e.g. 'dup')")
 
@@ -83,7 +84,10 @@ def test_last_valid_line_wins_when_last_copy_is_invalid_json(clean_db, tmp_path,
         + '{"doc_id": "dup", "title": "broken"\n',
         encoding="utf-8",
     )
-    run_ingest(monkeypatch, clean_db, tmp_path)
+    # The broken line is a not_json refusal (the run exits 1, no sweep); the
+    # last VALID line of the doc_id is the one written.
+    with pytest.raises(SystemExit):
+        run_ingest(monkeypatch, clean_db, tmp_path)
     assert _titles(clean_db) == {"dup": "good-2"}
 
 
@@ -96,15 +100,18 @@ def test_same_doc_id_in_two_files_still_fine(clean_db, tmp_path, monkeypatch):
 
 
 def test_mixed_type_doc_ids_no_longer_crash(clean_db, tmp_path, monkeypatch, caplog):
-    # 5 and "5" are one TEXT key in Postgres: the int one is rejected at
-    # parse time, so the page holds a single "5" and the run completes.
+    # 5 and "5" are one TEXT key in Postgres: the int one is refused at
+    # parse time (documents contract: bad_text / missing_doc_id), so the page
+    # holds a single "5" and the pass completes; the refusals make it exit 1.
     path = tmp_path / "manifest" / "us.jsonl"
     path.parent.mkdir(parents=True)
     lines = [make_doc("5", title="text"), make_doc(5, title="int"), make_doc(True),
              make_doc(1), make_doc([1]), make_doc(""), make_doc("ok")]
     path.write_text("".join(json.dumps(d) + "\n" for d in lines), encoding="utf-8")
-    with caplog.at_level(logging.WARNING, logger="ingest"):
+    with caplog.at_level(logging.WARNING, logger="ingest"), pytest.raises(SystemExit):
         run_ingest(monkeypatch, clean_db, tmp_path)
     assert _titles(clean_db) == {"5": "text", "ok": "doc ok"}
-    assert any("Rejected 5 line(s)" in r.getMessage() and "doc_id" in r.getMessage()
+    assert _rows(clean_db, "SELECT reason, count(*) FROM ingestion_refusals "
+                           "GROUP BY 1 ORDER BY 1") == [("bad_text", 4), ("missing_doc_id", 1)]
+    assert any("5 refused (bad_text=4, missing_doc_id=1)" in r.getMessage()
                for r in caplog.records)

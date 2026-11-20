@@ -1,0 +1,66 @@
+{
+  "contract": "documents",
+  "contract_version": "1.0.0",
+  "corpus": "central-bank",
+  "source_codes": [
+    {
+      "code": "ecb",
+      "label": "European Central Bank"
+    },
+    {
+      "code": "ca",
+      "label": "Bank of Canada"
+    },
+    {
+      "code": "us",
+      "label": "Federal Reserve System"
+    },
+    {
+      "code": "tr",
+      "label": "Central Bank of the Republic of Turkiye"
+    },
+    {
+      "code": "jp",
+      "label": "Bank of Japan"
+    }
+  ],
+  "doc_types": [
+    {
+      "code": "A1",
+      "label": "Rate-decision press release",
+      "family": "A"
+    },
+    {
+      "code": "A3",
+      "label": "Meeting minutes / accounts / summary of deliberations",
+      "family": "A"
+    },
+    {
+      "code": "C1",
+      "label": "Speech",
+      "family": "C"
+    },
+    {
+      "code": "D1",
+      "label": "Working paper",
+      "family": "D"
+    },
+    {
+      "code": "E1",
+      "label": "Monetary policy / inflation report",
+      "family": "E"
+    },
+    {
+      "code": "E3",
+      "label": "Annual report",
+      "family": "E"
+    }
+  ],
+  "provenances": [
+    "bank_site",
+    "bis_index",
+    "repec_discovery",
+    "wayback"
+  ],
+  "entity_schemes": []
+}

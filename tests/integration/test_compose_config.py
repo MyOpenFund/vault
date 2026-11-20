@@ -9,6 +9,7 @@ host, and — by uncommenting them into a scratch copy — that the two commente
 and resolve to the loopback rather than to every interface.
 """
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -115,3 +116,59 @@ def test_the_api_image_builds_from_the_repo_root(as_committed):
     build = as_committed["services"]["api"]["build"]
     assert Path(build["context"]) == ROOT
     assert build["dockerfile"] == "api/Dockerfile"
+
+
+def test_the_ingestion_image_builds_from_the_repo_root(as_committed):
+    """The ingestion image copies contract/ (vault-contract) next to ingest.py,
+    so, as for the api, its build context is the repo root."""
+    build = as_committed["services"]["ingestion"]["build"]
+    assert Path(build["context"]) == ROOT
+    assert build["dockerfile"] == "ingestion/Dockerfile"
+
+
+def test_the_api_reads_files_under_corpus_roots(as_committed):
+    api = as_committed["services"]["api"]
+    assert api["environment"]["CORPUS_ROOTS"] == "central-bank=/cbdata"
+    assert "RAW_DATA_DIR" not in api["environment"]
+    mounts = {(v["target"], v.get("read_only", False)) for v in api["volumes"]}
+    assert ("/cbdata", True) in mounts
+
+
+def test_the_company_ingestion_is_off_by_default_and_runs_in_its_profile():
+    """`docker compose up` leaves it out; the `company` profile (or `docker
+    compose run ingestion-company`, which enables it) brings it in, built
+    from the same image as `ingestion`."""
+    if not compose_available():
+        pytest.skip("docker compose unavailable")
+    assert "ingestion-company" not in render(COMPOSE)["services"]
+    out = subprocess.run(
+        ["docker", "compose", "--project-directory", str(ROOT),
+         "--env-file", str(ROOT / ".env.example"), "--profile", "company",
+         "-f", str(COMPOSE), "config", "--format", "json"],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+    )
+    assert out.returncode == 0, out.stderr
+    services = json.loads(out.stdout)["services"]
+    company, ingestion = services["ingestion-company"], services["ingestion"]
+    assert company["build"] == ingestion["build"]
+    env = company["environment"]
+    assert (env["CORPUS"], env["DATA_DIR"], env["MANIFEST_GLOBS"], env["VOCABULARY_PATH"]) == (
+        "company", "/data", "manifest/*.jsonl", "/data/vocabulary.json")
+    assert env["VAULT_READONLY_PASSWORD"] and env["VAULT_ORCHESTRATOR_PASSWORD"]
+    assert company["restart"] == "no"
+    [volume] = company["volumes"]
+    assert (volume["target"], volume["read_only"]) == ("/data", True)
+    # .env.example leaves COMPANY_MANIFEST_DIR commented out: the fallback
+    # mount is an empty directory, and REQUIRE_MANIFESTS makes that run fail.
+    assert volume["source"] == "/var/empty"
+    assert env["REQUIRE_MANIFESTS"] == "1"
+    honoured = subprocess.run(
+        ["docker", "compose", "--project-directory", str(ROOT),
+         "--env-file", str(ROOT / ".env.example"), "--profile", "company",
+         "-f", str(COMPOSE), "config", "--format", "json"],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+        env={**os.environ, "COMPANY_MANIFEST_DIR": "/srv/company-corpus/data"},
+    )
+    assert honoured.returncode == 0, honoured.stderr
+    [volume] = json.loads(honoured.stdout)["services"]["ingestion-company"]["volumes"]
+    assert volume["source"] == "/srv/company-corpus/data"

@@ -5,13 +5,24 @@ Ingest .jsonl document inventories into PostgreSQL.
 Finds the manifest .jsonl files under DATA_DIR (find_manifest_files: the
 data/ root layout reads manifest/**/*.jsonl + manifest.jsonl only, a DATA_DIR
 that is the manifest directory itself is read recursively, MANIFEST_GLOBS
-overrides), parses each line and upserts it into the `documents` table keyed
-on doc_id. A doc_id repeated inside one file keeps its last valid line, with a
-WARNING (vault #6). Documents belong
-to a corpus: the service-level CORPUS env var provides the default, a
-"corpus" field on a manifest line is checked against it, and a
-contradiction rejects the line (this service is being fed another
-corpus's manifests — never guess).
+overrides), checks each line against the documents contract
+(vault_contract.check_row, contract/README.md) and upserts the accepted rows
+into the `documents` table keyed on (corpus, doc_id). A doc_id repeated inside
+one file keeps its last valid line, with a WARNING (vault #6). Documents belong
+to a corpus: the service-level CORPUS env var is the expected one, a manifest
+line without "corpus" takes it (transition), and a contradicting one is
+refused (corpus_conflict: this service is being fed another corpus's
+manifests — never guess).
+
+Contract (chantier 4): DATA_DIR/vocabulary.json (or VOCABULARY_PATH), when
+present, is validated before connecting (invalid or of another corpus: exit 1,
+nothing written), replaces this corpus's `vocabulary` rows, and the rows' codes
+are checked against it; absent, codes are not checked and the run says so. A
+refused row is not written; it is counted per reason, logged as
+`file:line reason field=value` and stored in `ingestion_refusals` (replaced per
+corpus every run). Quality notices are counted and summarised; the row is
+written. ANY refused row skips the soft-delete sweep and makes the run exit 1,
+after the cadence, runs and discovery-error passes.
 
 Idempotent: safe to re-run as often as needed (e.g. hourly cron after
 an SMB share update) without creating duplicates.
@@ -21,7 +32,8 @@ the run timestamp. After a successful full pass, rows absent from all
 manifests are soft-deleted (`deleted_at` set); rows that reappear are
 resurrected (`deleted_at` cleared). Rows are never hard-deleted.
 
-Torn-share protection: the sweep is skipped when the run yields zero
+Torn-share protection: the sweep is skipped when a row was refused (above),
+when the run yields zero
 valid rows, and also when the fraction of live rows that would be
 soft-deleted exceeds SWEEP_MAX_DELETE_FRACTION (default 0.05) — a
 partially synced share exposing only a subset of the manifests must
@@ -64,14 +76,17 @@ import glob
 import logging
 from datetime import datetime, timezone
 
+from collections import Counter
+
 import psycopg2
 from psycopg2.extras import execute_values
+from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row
 import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
+import ingest_vocabulary
 import roles
 import schema_gate
-from common import resolve_corpus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,18 +94,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("ingest")
 
-# "Known" schema fields -> everything else goes into `extra` (JSONB).
-# bank_code stays listed: legacy manifests emit it (mapped to source_code),
-# and it must not fall into extra.
-# pdf_url likewise (2026-11 rename): manifests not yet migrated emit it, mapped
-# to document_url when document_url is absent (see parse_line). Transition
-# only: remove pdf_url here and in parse_line once producers write
-# document_url (central-bank-corpus migrate-document-url).
-KNOWN_FIELDS = {
-    "doc_id", "corpus", "source_code", "bank_code", "doc_type", "title",
-    "document_url", "pdf_url", "source_url", "date", "year", "language",
-    "provenance", "mime_type", "sha256", "local_path",
-}
+# The documents contract (vault_contract, contract/README.md) decides what a
+# manifest row is: its 18 common fields become columns, everything else goes
+# to `extra` (JSONB), and check_row refuses or notes each row (bad_extra, an
+# extra JSONB cannot hold, included). The ingestion adds the refusal of its
+# own below (VAULT_REASONS) and nothing else.
 
 CREATE_TABLE_SQL = """
 -- Gated: this whole text only runs when its sha256 differs from the one
@@ -112,9 +120,12 @@ DROP VIEW IF EXISTS rag_backlog_any;
 DROP VIEW IF EXISTS rag_backlog;
 DROP VIEW IF EXISTS runs_sources;
 
+-- Identity is (corpus, doc_id) (documents contract 1.0.0, chantier 4): a
+-- doc_id is unique within its corpus only. A database created before the
+-- contract had UNIQUE (doc_id); the identity block below moves it.
 CREATE TABLE IF NOT EXISTS documents (
     id SERIAL PRIMARY KEY,
-    doc_id TEXT UNIQUE NOT NULL,
+    doc_id TEXT NOT NULL,
     corpus TEXT NOT NULL,
     source_code TEXT,
     doc_type TEXT,
@@ -128,11 +139,16 @@ CREATE TABLE IF NOT EXISTS documents (
     mime_type TEXT,
     sha256 TEXT,
     local_path TEXT,
+    date_precision TEXT,
+    date_kind TEXT,
+    entity_scheme TEXT,
+    entity_value TEXT,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     last_seen_at TIMESTAMPTZ,
     deleted_at TIMESTAMPTZ,
-    extra JSONB
+    extra JSONB,
+    CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id)
 );
 
 -- Upgrade path for databases created before deletion tracking existed.
@@ -207,6 +223,34 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS corpus TEXT;
 UPDATE documents SET corpus = 'central-bank' WHERE corpus IS NULL;
 ALTER TABLE documents ALTER COLUMN corpus SET NOT NULL;
 
+-- documents contract 1.0.0 (chantier 4): the four common fields that were not
+-- columns yet. Catalog-only (no default): no table rewrite. Central-bank rows
+-- carried date_precision/date_kind inside `extra`; the next documents pass
+-- lifts them into the columns (vault_contract.split_row) and they leave extra.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_precision TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_kind TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_scheme TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_value TEXT;
+
+-- Identity, part 1: UNIQUE (corpus, doc_id), added when no unique constraint
+-- on exactly those columns exists (a fresh table has it inline). On a
+-- pre-contract database doc_id was unique on its own, so this cannot fail on
+-- existing data. Part 2 (rag_ingestions' keys, then the old UNIQUE (doc_id))
+-- follows the rag_ingestions table, which references this constraint.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id']
+    ) THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id);
+    END IF;
+END $$;
+
 -- One-time upgrade of pre-existing naive TIMESTAMP columns to TIMESTAMPTZ
 -- (values were written as UTC); no-op once migrated or on fresh databases.
 -- Each column is checked on its own: a database where created_at/updated_at
@@ -263,8 +307,8 @@ CREATE INDEX IF NOT EXISTS idx_documents_extra_gin
     ON documents USING GIN (extra jsonb_path_ops);
 
 -- Facts feeding the RAG OCR policy. Filled by data-orchestrator's probe pass
--- (its UPDATE is their only writer). Deliberately absent from KNOWN_FIELDS and
--- from the manifest upsert: manifests never carry them, and upserting them
+-- (its UPDATE is their only writer). Deliberately absent from the contract's
+-- columns and from the manifest upsert: manifests never carry them, and upserting them
 -- would null probed values on every nightly run.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
@@ -274,8 +318,10 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
 -- Cross-model history lives in the collection dimension (one fresh collection
 -- per re-embed campaign). The vault owns this DDL; data-orchestrator only needs
 -- INSERT/UPDATE/SELECT rights.
+-- Keyed by (corpus, doc_id, collection) since the documents contract: its
+-- corpus column joins the key and the foreign key (identity part 2 below).
 CREATE TABLE IF NOT EXISTS rag_ingestions (
-    doc_id            TEXT NOT NULL REFERENCES documents(doc_id),
+    doc_id            TEXT NOT NULL,
     collection        TEXT NOT NULL,
     corpus            TEXT NOT NULL,
     source_code       TEXT,
@@ -283,8 +329,98 @@ CREATE TABLE IF NOT EXISTS rag_ingestions (
     embedding_version TEXT,
     chunk_count       INTEGER NOT NULL,
     ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (doc_id, collection)
+    CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection),
+    CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+        REFERENCES documents (corpus, doc_id)
 );
+
+-- Identity, part 2, idempotent (every step checks the catalog by columns,
+-- not by name). On a pre-contract database: the foreign key on doc_id alone is
+-- dropped, the primary key (doc_id, collection) becomes (corpus, doc_id,
+-- collection), the foreign key (corpus, doc_id) is added, and only then the
+-- old UNIQUE (doc_id) it depended on is dropped. Adding the foreign key
+-- checks every existing row: a rag_ingestions row whose corpus is not its
+-- document's would make it fail, so that case is counted first and stops the
+-- train with a message saying what to fix (the train is one transaction:
+-- nothing is left half-done). A plain index on doc_id replaces the old unique
+-- one for the lookups by doc_id alone (vault-query, the API, the
+-- orchestrator's probe UPDATE), which the (corpus, doc_id) index cannot serve.
+DO $$
+DECLARE
+    con      record;
+    orphans  bigint;
+BEGIN
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) <> ARRAY['corpus', 'doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id', 'collection']
+    ) THEN
+        FOR con IN
+            SELECT c.conname FROM pg_constraint c
+             WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+        LOOP
+            EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+        END LOOP;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+    ) THEN
+        SELECT count(*) INTO orphans
+          FROM rag_ingestions r
+         WHERE NOT EXISTS (SELECT 1 FROM documents d
+                            WHERE d.corpus = r.corpus AND d.doc_id = r.doc_id);
+        IF orphans > 0 THEN
+            RAISE EXCEPTION 'rag_ingestions has % row(s) whose (corpus, doc_id) matches no document (a corpus differing from its document''s): fix them before deploying the documents contract (SELECT r.* FROM rag_ingestions r JOIN documents d USING (doc_id) WHERE r.corpus <> d.corpus)', orphans;
+        END IF;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+            REFERENCES documents (corpus, doc_id);
+    END IF;
+
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE documents DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+END $$;
+
+-- TRANSITION (removed by the cleanup PR 6): the deployed data-orchestrator
+-- upserts with ON CONFLICT (doc_id, collection), which needs a unique index on
+-- exactly those columns. Keeping one lets it run between the vault deploy
+-- and its own update. Valid only while collections are per corpus (a
+-- collection never holds two corpora's documents); a mixed-corpus collection
+-- needs this index gone first.
+CREATE UNIQUE INDEX IF NOT EXISTS rag_ingestions_doc_collection_transition
+    ON rag_ingestions (doc_id, collection);
+
+CREATE INDEX IF NOT EXISTS idx_documents_doc_id ON documents (doc_id);
+-- Documents about one company (contract: entity = the company the document is about).
+CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents (entity_scheme, entity_value);
 
 CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
     ON rag_ingestions(collection);
@@ -401,6 +537,40 @@ CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
 CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
     ON discovery_errors (last_run_id);
 
+-- Corpus vocabulary (documents contract, vocabulary.json at the producer's
+-- data root): the codes a corpus declares, one row per (kind, code), kind
+-- being the column the code is for: source_code, doc_type, provenance or
+-- entity_scheme. Full replace per corpus by the documents pass
+-- (ingest_vocabulary.py), before the documents are checked against it.
+CREATE TABLE IF NOT EXISTS vocabulary (
+    corpus TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    code   TEXT NOT NULL,
+    label  TEXT,
+    family TEXT,
+    PRIMARY KEY (corpus, kind, code)
+);
+
+-- Manifest rows the last documents pass of a corpus refused (contract
+-- refusals, plus the vault's own: see ingest.VAULT_REASONS), one row per
+-- refusal: a row with two defects has two. Replaced per corpus at every pass,
+-- so it always shows the last run; empty for a corpus whose last run refused
+-- nothing. `value` is the repr of the refused value, truncated
+-- (ingest.REFUSAL_VALUE_CHARS). Read by Metabase; the vault ingestion writes
+-- no `runs` row of its own.
+CREATE TABLE IF NOT EXISTS ingestion_refusals (
+    corpus      TEXT NOT NULL,
+    run_ts      TIMESTAMPTZ NOT NULL,
+    source_file TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    doc_id      TEXT,
+    reason      TEXT NOT NULL,
+    field       TEXT,
+    value       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ingestion_refusals_corpus_reason
+    ON ingestion_refusals (corpus, reason);
+
 -- ---------------------------------------------------------------------------
 -- Views, recreated at the tail of the train in dependency order (they were
 -- dropped at its head, before the first ALTER — see the block above).
@@ -446,7 +616,8 @@ SELECT c.collection,
        d.updated_at AS document_updated_at
 FROM documents d
 CROSS JOIN collections c
-LEFT JOIN rag_ingestions r ON r.doc_id = d.doc_id AND r.collection = c.collection
+LEFT JOIN rag_ingestions r
+       ON r.corpus = d.corpus AND r.doc_id = d.doc_id AND r.collection = c.collection
 WHERE d.deleted_at IS NULL AND r.doc_id IS NULL;
 
 -- Absolute backlog: live documents in NO collection at all. Correct on a
@@ -459,7 +630,8 @@ SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
        d.updated_at AS document_updated_at
 FROM documents d
 WHERE d.deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r WHERE r.doc_id = d.doc_id);
+  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r
+                   WHERE r.corpus = d.corpus AND r.doc_id = d.doc_id);
 
 -- Sources that produce runs but have no cadence expectation. Empty is
 -- healthy; a non-empty result means source_health cannot see part of the
@@ -575,26 +747,36 @@ ON CONFLICT (singleton) DO UPDATE
     SET fingerprint = EXCLUDED.fingerprint, applied_at = now();
 """
 
+# Column order of an upsert row (parse_line): the contract's common fields
+# in DDL order, then the run stamps and extra.
+UPSERT_COLUMNS = COLUMNS + ("updated_at", "last_seen_at", "extra")
+
+# Identity is (corpus, doc_id) (documents contract): a row of one corpus can
+# never overwrite another corpus's row with the same doc_id.
 UPSERT_SQL = """
 INSERT INTO documents (
-    doc_id, corpus, source_code, doc_type, title, document_url, source_url,
-    date, year, language, provenance, mime_type, sha256, local_path,
+    doc_id, corpus, source_code, doc_type, title, date, year,
+    date_precision, date_kind, language, provenance, document_url,
+    source_url, mime_type, sha256, local_path, entity_scheme, entity_value,
     updated_at, last_seen_at, extra
 ) VALUES %s
-ON CONFLICT (doc_id) DO UPDATE SET
-    corpus = EXCLUDED.corpus,
+ON CONFLICT (corpus, doc_id) DO UPDATE SET
     source_code = EXCLUDED.source_code,
     doc_type = EXCLUDED.doc_type,
     title = EXCLUDED.title,
-    document_url = EXCLUDED.document_url,
-    source_url = EXCLUDED.source_url,
     date = EXCLUDED.date,
     year = EXCLUDED.year,
+    date_precision = EXCLUDED.date_precision,
+    date_kind = EXCLUDED.date_kind,
     language = EXCLUDED.language,
     provenance = EXCLUDED.provenance,
+    document_url = EXCLUDED.document_url,
+    source_url = EXCLUDED.source_url,
     mime_type = EXCLUDED.mime_type,
     sha256 = EXCLUDED.sha256,
     local_path = EXCLUDED.local_path,
+    entity_scheme = EXCLUDED.entity_scheme,
+    entity_value = EXCLUDED.entity_value,
     extra = EXCLUDED.extra,
     updated_at = EXCLUDED.updated_at,
     -- never rewind: a slower run carrying an older run timestamp must not make a live row look stale to a newer run's sweep (vault #3)
@@ -749,9 +931,11 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
     CardinalityViolation (ON CONFLICT DO UPDATE cannot affect a row twice) and
     kill the run; in different pages they went through silently. Last wins is
     what two upserts issued in line order would have stored. The kept rows are
-    returned in the order of their (last) occurrence. doc_ids are compared
-    exactly, as the UNIQUE constraint does (parse_line only lets non-empty
-    strings through, so Python and Postgres equality agree). A WARNING gives
+    returned in the order of their (last) occurrence. One file holds one
+    corpus's rows, so doc_id alone is the (corpus, doc_id) key here; doc_ids
+    are compared exactly, as the UNIQUE (corpus, doc_id) constraint does
+    (parse_line only lets text doc_ids through, so Python and Postgres
+    equality agree). A WARNING gives
     the number of dropped lines, the number of doc_ids concerned and up to
     `sample_size` of them (first-seen order).
     """
@@ -776,6 +960,14 @@ def dedupe_rows(rows, source_file, sample_size=DUPLICATE_SAMPLE_SIZE):
         f"of each wins (e.g. {sample}{more})"
     )
     return kept
+
+
+def kept_indexes(rows):
+    """Indexes of the rows dedupe_rows keeps (the last line of each doc_id)."""
+    last = {}
+    for i, row in enumerate(rows):
+        last[row[0]] = i
+    return sorted(last.values())
 
 
 # Which .jsonl files the documents pass reads (Spec W5). Two layouts exist:
@@ -877,6 +1069,28 @@ def _warn_unread_root_files(data_dir):
         )
 
 
+REQUIRE_MANIFESTS_ENV = "REQUIRE_MANIFESTS"
+
+
+def parse_require_manifests(env):
+    """REQUIRE_MANIFESTS -> bool: 1/true/yes or 0/false/no, unset/empty = False.
+
+    False (the default) keeps the historical behaviour: a run that finds no
+    manifest only warns and still runs the DDL train and the producer-file
+    passes. True makes it a failure (exit 1 before connecting): for a service
+    whose only job is a corpus's manifests (`ingestion-company`), an empty or
+    unmounted data root must not look like a successful run of 0 rows.
+    """
+    raw = env.get(REQUIRE_MANIFESTS_ENV)
+    value = (raw or "").strip(_ASCII_SPACE).lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("", "0", "false", "no"):
+        return False
+    raise IngestSettingsError(
+        f"{REQUIRE_MANIFESTS_ENV}={raw!r}: expected 1/true/yes or 0/false/no (or unset)")
+
+
 def find_manifest_files(data_dir, env):
     """The manifest files of this run, sorted; the layout used is logged."""
     patterns = parse_manifest_globs(env.get("MANIFEST_GLOBS"))
@@ -906,79 +1120,222 @@ def find_manifest_files(data_dir, env):
     return files
 
 
-# How much of a rejected doc_id the warning shows: a producer can write a
-# huge list or object there, and the line is logged once per manifest line.
-INVALID_DOC_ID_LOG_CHARS = 80
+# Refusals the vault adds to the contract's (vault_contract.REASONS). Like
+# the checker's duplicate_doc_id, they are not contract reasons.
+# (bad_extra, an extra JSONB cannot hold, is the contract's own since 1.0.0:
+# check_row returns it. Stored here with `field` = the top-level key, its repr
+# when the key itself cannot be stored, cut to REFUSAL_VALUE_CHARS.)
+# - not_json: a non-blank line that is not a JSON object (a torn write, a
+#   UTF-8 BOM on line 1, a JSON array). It cannot be a row, but its document
+#   is "not seen" all the same, so it must skip the sweep like any refusal
+#   rather than get that document soft-deleted. `field` is NULL and `value`
+#   the line's first REFUSAL_VALUE_CHARS characters (its repr when it holds a
+#   character TEXT cannot store).
+VAULT_REASONS = ("not_json",)
+NOT_JSON = "not_json"
+
+# ingestion_refusals.value: the repr of the refused value, cut to this many
+# characters (then "…"); a producer can put a huge list or object anywhere.
+REFUSAL_VALUE_CHARS = 200
+
+# Refusals logged one per line (file:line reason field=value); past this many
+# in one run, the rest are only counted and stored in ingestion_refusals, so a
+# vocabulary mistake on a whole source cannot flood the log.
+REFUSAL_LOG_LIMIT = 100
 
 
-def parse_line(line, source_file, line_num, run_ts, default_corpus, counters=None):
+def shown_value(value, limit=REFUSAL_VALUE_CHARS):
+    """repr of a refused value, at most `limit` characters plus "…"."""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _utf8(text):
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:       # a lone surrogate, from a "\ud800" escape
+        return False
+    return True
+
+
+def _storable_text(text):
+    return "\x00" not in text and _utf8(text)
+
+
+def stored_text(value, limit=REFUSAL_VALUE_CHARS):
+    """`value` when it is text Postgres can store, cut to `limit` characters
+    (then "…"), else its repr (shown_value)."""
+    if isinstance(value, str) and _storable_text(value):
+        return value if len(value) <= limit else value[:limit] + "…"
+    return shown_value(value, limit)
+
+
+class RunReport:
+    """What one documents pass read, wrote, refused and noted.
+
+    Refused rows are counted per reason (one count per refusal: a row with two
+    defects counts under both reasons, and once in `refused_rows`), logged up
+    to REFUSAL_LOG_LIMIT lines, and kept as ingestion_refusals rows. Notices
+    are counted per reason for written rows only (a refused row is not
+    written, its notices are moot) and only summarised.
+    """
+
+    def __init__(self, corpus, run_ts, data_dir=None):
+        self.corpus = corpus
+        self.run_ts = run_ts
+        self.data_dir = data_dir
+        self.rows_read = 0          # non-blank lines
+        self.refused_rows = 0
+        self.duplicates = 0         # lines dropped by dedupe_rows
+        self.upserted = 0
+        self.refusals = Counter()
+        self.notices = Counter()
+        self.records = []           # ingestion_refusals rows
+        self.unlogged = 0
+        self.pending = []           # notices of each row parse_line returned, in order
+
+    def source_name(self, source_file):
+        """The file as stored in ingestion_refusals: relative to DATA_DIR when under it."""
+        if self.data_dir:
+            rel = os.path.relpath(source_file, self.data_dir)
+            if not rel.startswith(".."):
+                return rel
+        return str(source_file)
+
+    def refuse(self, source_file, line_num, doc_id, refusals):
+        self.refused_rows += 1
+        # A storable doc_id is kept for the row, cut like a value: a too_long
+        # id would otherwise land whole in the table and the Metabase card.
+        stored_id = (stored_text(doc_id)
+                     if isinstance(doc_id, str) and _storable_text(doc_id) else None)
+        name = self.source_name(source_file)
+        for r in refusals:
+            self.refusals[r.reason] += 1
+            if r.reason == NOT_JSON:          # the raw line, not a value
+                # Sliced first: a torn line can be megabytes long, and its
+                # repr would be built in full only to be cut.
+                head = r.value[:REFUSAL_VALUE_CHARS]
+                field, value = None, stored_text(head)
+                shown = f"line={shown_value(head)}"
+            else:
+                # A contract field name, or a bad_extra key: any producer
+                # string, capped like a value.
+                field, value = stored_text(r.field), shown_value(r.value)
+                shown = f"{field}={value}"
+            self.records.append((self.corpus, self.run_ts, name, line_num, stored_id,
+                                 r.reason, field, value))
+            if len(self.records) <= REFUSAL_LOG_LIMIT:
+                log.warning(f"{source_file}:{line_num} {r.reason} {shown}")
+            else:
+                self.unlogged += 1
+
+    def commit_notices(self, kept=None):
+        """Count the pending notices of the rows actually upserted.
+
+        `kept` holds the indexes (into the rows parse_line returned since the
+        last commit) that dedupe_rows kept; None = all of them. A line
+        superseded by a later one of the same doc_id is not written, so its
+        notices are not counted.
+        """
+        pending, self.pending = self.pending, []
+        indexes = range(len(pending)) if kept is None else kept
+        for i in indexes:
+            for n in pending[i]:
+                self.notices[n.reason] += 1
+
+    def summary_lines(self, sweep):
+        """The run summary: rows, refusals and notices by reason, the sweep."""
+        def by_reason(counter):
+            return ", ".join(f"{k}={v}" for k, v in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+
+        refused = f"{self.refused_rows} refused"
+        if self.refusals:
+            refused += f" ({by_reason(self.refusals)})"
+        lines = [
+            f"documents: {self.rows_read} rows read, {self.upserted} upserted, {refused}, "
+            f"{self.duplicates} duplicate line(s) dropped",
+            f"notices: {sum(self.notices.values())}"
+            + (f" ({by_reason(self.notices)})" if self.notices else ""),
+            f"sweep: {sweep}",
+        ]
+        if self.unlogged:
+            lines.insert(1, f"refusals: {self.unlogged} more not logged one by one "
+                            f"(REFUSAL_LOG_LIMIT={REFUSAL_LOG_LIMIT}); all are in ingestion_refusals")
+        return lines
+
+
+def parse_line(line, source_file, line_num, run_ts, default_corpus, vocabulary=None,
+               report=None):
+    """One manifest line -> an upsert row (UPSERT_COLUMNS order), or None.
+
+    None for a blank line, and for a refused line: not a JSON object
+    (not_json), or refused by vault_contract.check_row (transition on, this
+    service's CORPUS expected, `vocabulary` None = codes not checked; its
+    bad_extra included). A refused line is recorded in `report` (counted, logged,
+    kept for ingestion_refusals); an accepted row's notices are appended to
+    `report.pending`, counted by commit_notices once the row is known to be
+    upserted (after dedupe_rows). Unlike before the contract, a doc_id that
+    is not a string, a corpus that contradicts CORPUS or a line that is not
+    JSON is a refusal, not a silent skip.
+    """
+    if report is None:
+        report = RunReport(default_corpus, run_ts)
+    # str.strip() removes every Unicode whitespace character, not only ASCII
+    # ones: the information separators U+001C..U+001F, NEL U+0085, NBSP
+    # U+00A0, U+2028, U+3000, ... A line made of them alone is blank here, not
+    # not_json: it holds no JSON value, so it was never a document (a torn
+    # write keeps at least its "{"), and refusing it would only skip the
+    # sweep for nothing. The flip side, accepted: an object padded with such
+    # characters is read although strict JSON would refuse the padding. The
+    # checker (vault_contract.check) strips the same way, so both agree.
     line = line.strip()
     if not line:
         return None
+    report.rows_read += 1
     try:
         obj = json.loads(line)
-    except json.JSONDecodeError as e:
-        log.warning(f"Skipping invalid line ({source_file}:{line_num}): {e}")
-        return None
+    except (ValueError, RecursionError):   # JSONDecodeError; an int past 4300 digits
+        obj = None
     if not isinstance(obj, dict):
-        log.warning(
-            f"Skipping line ({source_file}:{line_num}): a JSON "
-            f"{type(obj).__name__}, not an object"
-        )
+        report.refuse(source_file, line_num, None, [Refusal(NOT_JSON, None, line)])
         return None
 
-    # doc_id is the TEXT upsert key: only a non-empty string free of NUL
-    # (which Postgres TEXT cannot hold) is one. Anything else is rejected, not
-    # coerced: 5 and "5" would be one key to Postgres but two to dedupe_rows
-    # (vault #6 crash again), 1 and true one to Python, [1] unhashable.
-    doc_id = obj.get("doc_id")
-    if not isinstance(doc_id, str) or not doc_id or "\x00" in doc_id:
-        shown = repr(doc_id)
-        if len(shown) > INVALID_DOC_ID_LOG_CHARS:
-            shown = shown[:INVALID_DOC_ID_LOG_CHARS] + "…"
-        reason = "without doc_id" if doc_id is None else f"with invalid doc_id {shown}"
-        log.warning(
-            f"Skipping line {reason} ({source_file}:{line_num}): "
-            "doc_id must be a non-empty string"
-        )
-        if counters is not None:
-            counters["invalid_doc_id"] = counters.get("invalid_doc_id", 0) + 1
+    checked = check_row(obj, vocabulary, expected_corpus=default_corpus, transition=True)
+    refusals = checked.refusals
+    if refusals:
+        report.refuse(source_file, line_num, checked.columns.get("doc_id"), refusals)
         return None
+    report.pending.append(checked.notices)
 
-    corpus = resolve_corpus(obj.get("corpus"), default_corpus)
-    if corpus is None:
-        log.warning(
-            f"Skipping line with contradicting corpus "
-            f"({source_file}:{line_num}): manifest says "
-            f"'{obj.get('corpus')}', this service ingests '{default_corpus}'"
-        )
-        if counters is not None:
-            counters["corpus_conflict"] = counters.get("corpus_conflict", 0) + 1
-        return None
+    columns = dict(checked.columns)
+    if not columns["corpus"]:           # transition: absent or "", corpus_missing, CORPUS applies
+        columns["corpus"] = default_corpus
+    extra = json.dumps(checked.extra) if checked.extra else None
+    return tuple(columns[name] for name in COLUMNS) + (run_ts, run_ts, extra)
 
-    extra = {k: v for k, v in obj.items() if k not in KNOWN_FIELDS}
 
-    return (
-        doc_id,
-        corpus,
-        obj.get("source_code") or obj.get("bank_code"),
-        obj.get("doc_type"),
-        obj.get("title"),
-        # document_url wins; the legacy pdf_url fills it when it is absent
-        # (transition: drop the fallback once producers write document_url).
-        (obj.get("document_url") or obj.get("pdf_url")) or None,
-        obj.get("source_url"),
-        obj.get("date") or None,
-        obj.get("year"),
-        obj.get("language"),
-        obj.get("provenance"),
-        obj.get("mime_type"),
-        obj.get("sha256"),
-        obj.get("local_path"),
-        run_ts,  # updated_at
-        run_ts,  # last_seen_at
-        json.dumps(extra) if extra else None,
-    )
+INSERT_REFUSALS_SQL = """
+INSERT INTO ingestion_refusals (
+    corpus, run_ts, source_file, line, doc_id, reason, field, value
+) VALUES %s
+"""
+
+
+def replace_refusals(conn, report):
+    """This corpus's ingestion_refusals rows := this run's, in one transaction.
+
+    Runs after every documents pass that read the whole share, so a clean run
+    empties the table for its corpus.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ingestion_refusals WHERE corpus = %s", (report.corpus,))
+            if report.records:
+                execute_values(cur, INSERT_REFUSALS_SQL, report.records, page_size=500)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # Shared catalog the roles' ALTER ROLE / CREATE ROLE write to: a session
@@ -1075,13 +1432,27 @@ def main(*, corpus=None, data_dir=None):
         log.error("DATABASE_URL is not set")
         sys.exit(1)
     try:
+        if not CODE_PATTERN.fullmatch(default_corpus):
+            # A corpus is a contract code: it names locks, refusal rows and the
+            # vocabulary, and every row's corpus is compared with it.
+            raise IngestSettingsError(f"CORPUS={default_corpus!r} must be a corpus code "
+                                      f"({CODE_PATTERN.pattern})")
         gate = schema_gate.load_settings(os.environ)
         sweep_max_fraction = parse_sweep_fraction(os.environ)
+        require_manifests = parse_require_manifests(os.environ)
         jsonl_files = find_manifest_files(data_dir, os.environ)
-    except (schema_gate.SettingsError, IngestSettingsError) as exc:
+        vocabulary_path = ingest_vocabulary.vocabulary_path(data_dir, os.environ)
+        vocabulary = ingest_vocabulary.load(vocabulary_path, default_corpus)
+    except (schema_gate.SettingsError, IngestSettingsError,
+            ingest_vocabulary.VocabularyError) as exc:
         log.error(str(exc))
         sys.exit(1)
 
+    if not jsonl_files and require_manifests:
+        log.error(f"No .jsonl manifest files found under {data_dir} and "
+                  f"{REQUIRE_MANIFESTS_ENV} is set: is the {default_corpus} data root "
+                  "mounted? Exiting 1 before connecting")
+        sys.exit(1)
     if jsonl_files:
         log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
     else:
@@ -1095,7 +1466,7 @@ def main(*, corpus=None, data_dir=None):
         log.warning(f"No .jsonl manifest files found under {data_dir} — skipping the documents pass")
 
     run_ts = datetime.now(timezone.utc)
-    counters = {"corpus_conflict": 0, "invalid_doc_id": 0}
+    report = RunReport(default_corpus, run_ts, data_dir)
 
     conn = psycopg2.connect(database_url)
     conn.autocommit = False
@@ -1115,15 +1486,23 @@ def main(*, corpus=None, data_dir=None):
         acquire_lock(conn, corpus_lock)
         held.append(corpus_lock)
 
-        total_rows = 0
+        if vocabulary is None:
+            log.warning(f"vocabulary: missing (membership not checked) — no {vocabulary_path}")
+        else:
+            ingest_vocabulary.replace(conn, vocabulary)
+
         for filepath in jsonl_files:
             rows = []
             with open(filepath, "r", encoding="utf-8") as f:
                 for i, line in enumerate(f, start=1):
-                    row = parse_line(line, filepath, i, run_ts, default_corpus, counters)
+                    row = parse_line(line, filepath, i, run_ts, default_corpus,
+                                     vocabulary, report)
                     if row:
                         rows.append(row)
-            rows = dedupe_rows(rows, filepath)
+            kept = dedupe_rows(rows, filepath)
+            report.duplicates += len(rows) - len(kept)
+            report.commit_notices(kept_indexes(rows))
+            rows = kept
 
             if not rows:
                 log.info(f"{filepath}: 0 valid lines")
@@ -1133,21 +1512,20 @@ def main(*, corpus=None, data_dir=None):
                 execute_values(cur, UPSERT_SQL, rows, page_size=500)
             conn.commit()
 
-            total_rows += len(rows)
+            report.upserted += len(rows)
             log.info(f"{filepath}: upserted {len(rows)} rows")
 
-        if counters["invalid_doc_id"]:
-            log.warning(
-                f"Rejected {counters['invalid_doc_id']} line(s) whose doc_id is "
-                "missing or not a non-empty string"
-            )
-        if counters["corpus_conflict"]:
-            log.warning(
-                f"Rejected {counters['corpus_conflict']} line(s) with a "
-                f"corpus contradicting this service's '{default_corpus}'"
-            )
+        # Every manifest was read: this run's refusals replace the last run's.
+        replace_refusals(conn, report)
 
-        if total_rows == 0:
+        # Any refused row skips the sweep: a refused row is "not seen", and a
+        # vocabulary mistake on a whole source would otherwise soft-delete its
+        # documents up to the fraction guard, silently (spec §4.3).
+        if report.refused_rows:
+            sweep = f"skipped ({report.refused_rows} refused rows)"
+            log.warning(f"sweep skipped: {report.refused_rows} refused rows")
+        elif report.upserted == 0:
+            sweep = "skipped (0 valid rows)"
             log.warning(
                 "Run yielded 0 valid rows — skipping the soft-delete sweep "
                 "(possible torn/partial share sync)"
@@ -1158,14 +1536,17 @@ def main(*, corpus=None, data_dir=None):
                 candidates, live = cur.fetchone()
 
             if candidates == 0:
+                sweep = "done (0 soft-deleted)"
                 log.info("No rows to soft-delete")
             elif not should_sweep(candidates, live, sweep_max_fraction):
+                sweep = f"blocked ({candidates}/{live} live rows would go)"
                 log.warning(sweep_blocked_message(candidates, live, sweep_max_fraction))
             else:
                 with conn.cursor() as cur:
                     cur.execute(SWEEP_SQL, (run_ts, run_ts, run_ts, default_corpus))
                     swept = cur.rowcount
                 conn.commit()
+                sweep = f"done ({swept} soft-deleted)"
                 log.warning(
                     f"Soft-deleted {swept} row(s) no longer present in any "
                     "manifest (kept in DB with deleted_at set)"
@@ -1177,8 +1558,10 @@ def main(*, corpus=None, data_dir=None):
             conn, data_dir, default_corpus, run_ts
         )
 
+        for summary in report.summary_lines(sweep):
+            log.log(logging.WARNING if report.refused_rows else logging.INFO, summary)
         log.info(
-            f"Done — processed {total_rows} document rows, "
+            f"Done — processed {report.upserted} document rows, "
             f"{cadence_rows} cadence rows, {runs_rows} run-report rows offered, "
             f"and {errors_rows} discovery-error fingerprints"
         )
@@ -1209,6 +1592,13 @@ def main(*, corpus=None, data_dir=None):
             except Exception:  # noqa: BLE001 — closing releases it anyway
                 log.warning(f"could not release lock {key!r}; the connection close will")
         conn.close()
+
+    if report.refused_rows:
+        # After every pass and the lock release: exit 1 is the vault
+        # ingestion's failure code (Dockge shows the service exited in error).
+        log.error(f"{report.refused_rows} manifest row(s) refused by the documents "
+                  "contract — see ingestion_refusals; exiting 1")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

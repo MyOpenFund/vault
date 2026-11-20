@@ -3,7 +3,10 @@ import psycopg2
 from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from psycopg2.extras import RealDictCursor
 
-from .filters import SORTABLE_FIELDS, InvalidQuery, build_where_clause, check_int, check_text
+from .filters import (
+    SORTABLE_FIELDS, DocTypeNeedsCorpus, InvalidQuery, build_where_clause, check_int, check_text,
+)
+from .vocabulary import doc_type_needs_corpus
 
 # Every column of `documents` after the DDL train (ingestion/ingest.py). A
 # caller-chosen projection is checked against it: column names are
@@ -13,6 +16,7 @@ ALL_COLUMNS = frozenset({
     "date", "year", "language", "provenance", "mime_type", "sha256", "local_path",
     "created_at", "updated_at", "last_seen_at", "deleted_at", "extra",
     "has_text_layer", "page_count",
+    "date_precision", "date_kind", "entity_scheme", "entity_value",   # documents contract 1.0.0
 })
 
 # How search_documents opens its snapshot on an autocommit connection: the
@@ -41,6 +45,11 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
     `limit` (>= 1) and `offset` (>= 0) are ints (not bool), at most MAX_BOUND.
     `columns`, when given, is a non-empty subset of ALL_COLUMNS; None means
     every column.
+
+    A `doc_type` filter needs a `corpus` filter (documents contract: a code
+    means something only within its corpus): without one, DocTypeNeedsCorpus,
+    whose message lists each corpus's codes and labels (one bounded read of
+    `vocabulary`, after every argument and value check; no snapshot is opened).
 
     `filters["q"]` is a literal, case-insensitive substring of the title: every
     character, `%`, `_`, `!` and `\\` included, matches itself (`q="50%"` finds
@@ -75,7 +84,10 @@ def search_documents(conn, filters, *, sort_by="date", sort_dir="desc", limit=50
         raise InvalidQuery(f"unknown columns: {sorted(set(columns) - ALL_COLUMNS)}")
 
     projection = "*" if columns is None else ", ".join(columns)
-    where_sql, params = build_where_clause(filters, include_deleted=include_deleted)
+    try:
+        where_sql, params = build_where_clause(filters, include_deleted=include_deleted)
+    except DocTypeNeedsCorpus:
+        raise doc_type_needs_corpus(conn) from None
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         own_snapshot = conn.autocommit and conn.get_transaction_status() == TRANSACTION_STATUS_IDLE
         if own_snapshot:
@@ -112,13 +124,20 @@ def _rollback_quietly(cur):
         pass
 
 
-def get_document(conn, doc_id):
-    """Every stored fact of one document, soft-deleted or not; None if unknown.
+def get_document(conn, doc_id, corpus=None):
+    """Every stored fact of the documents with this doc_id, soft-deleted or not.
 
-    A doc_id holding a NUL character is InvalidQuery (no stored id can hold one).
+    A document's identity is (corpus, doc_id): a doc_id is unique within its
+    corpus only. With `corpus`, a list of zero or one row; without, one row
+    per corpus holding that doc_id, ordered by corpus (each row carries its
+    `corpus`). Unknown: []. A doc_id or corpus holding a NUL character (or a
+    lone surrogate) is InvalidQuery (no stored value can hold one).
     """
     check_text("doc_id", doc_id)
+    check_text("corpus", corpus)
+    sql, params = "SELECT * FROM documents WHERE doc_id = %s", (doc_id,)
+    if corpus is not None:
+        sql, params = sql + " AND corpus = %s", (doc_id, corpus)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM documents WHERE doc_id = %s", (doc_id,))
-        row = cur.fetchone()
-    return dict(row) if row else None
+        cur.execute(sql + " ORDER BY corpus", params)
+        return [dict(r) for r in cur.fetchall()]

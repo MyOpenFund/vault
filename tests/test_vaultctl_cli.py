@@ -161,6 +161,20 @@ def test_get_unknown_doc_id(api):
     assert "Document 'nope' not found" in result.output
 
 
+def test_get_error_shows_the_api_detail(api):
+    api(lambda r: httpx.Response(400, json={"detail": "doc_id must not contain NUL"}))
+    result = invoke("get", "ab12")
+    assert result.exit_code == 1
+    assert "400" in result.output and "doc_id must not contain NUL" in " ".join(result.output.split())
+
+
+def test_get_unknown_doc_id_in_a_corpus_names_it(api):
+    api(lambda r: httpx.Response(404, json={"detail": "Document x not found in corpus company"}))
+    result = invoke("get", "nope", "--corpus", "company")
+    assert result.exit_code == 1
+    assert "Document 'nope' not found in corpus 'company'" in result.output
+
+
 def test_get_server_error(api):
     api(lambda r: httpx.Response(500, text="boom"))
     result = invoke("get", "hh88")
@@ -330,3 +344,64 @@ def test_download_path_is_printed_literally(api, tmp_path, dirname):
     assert result.exit_code == 0, result.output
     assert (out / "r.pdf").read_bytes() == PDF
     assert str(out / "r.pdf") in result.output.replace("\n", "")
+
+
+# --- documents contract: (corpus, doc_id) and doc_type needs corpus ----------
+
+def test_get_forwards_the_corpus(api):
+    fake = api(lambda r: httpx.Response(200, json=_doc("ab12", corpus="company")))
+    result = invoke("get", "ab12", "--corpus", "company")
+    assert result.exit_code == 0, result.output
+    assert dict(fake.requests[0].url.params) == {"corpus": "company"}
+    assert "corpus: company" in result.output
+
+
+def test_get_without_corpus_prints_each_corpus_document(api):
+    fake = api(lambda r: httpx.Response(200, json=[
+        _doc("ab12", title="cb one"), _doc("ab12", corpus="company", title="co one")]))
+    result = invoke("get", "ab12")
+    assert result.exit_code == 0, result.output
+    assert dict(fake.requests[0].url.params) == {}
+    assert "2 documents with doc_id 'ab12'" in result.output
+    assert "title: cb one" in result.output and "title: co one" in result.output
+    assert result.output.index("corpus: central-bank") < result.output.index("corpus: company")
+
+
+def test_get_without_corpus_one_document_prints_it_plainly(api):
+    api(lambda r: httpx.Response(200, json=[_doc("ab12")]))
+    result = invoke("get", "ab12")
+    assert result.exit_code == 0, result.output
+    assert "documents with doc_id" not in result.output
+    assert "doc_id: ab12" in result.output
+
+
+def test_download_forwards_the_corpus(api, tmp_path):
+    fake = api(_file({"content-disposition": 'attachment; filename="r.pdf"'}))
+    assert invoke("download", "ab12", "--corpus", "company", "-o", str(tmp_path)).exit_code == 0
+    assert dict(fake.requests[0].url.params) == {"corpus": "company"}
+
+
+def test_download_in_several_corpora_shows_the_api_detail(api, tmp_path):
+    detail = "Document ab12 exists in several corpora (central-bank, company): pass ?corpus="
+    api(lambda r: httpx.Response(400, json={"detail": detail}))
+    result = invoke("download", "ab12", "-o", str(tmp_path))
+    assert result.exit_code == 1
+    assert "several corpora (central-bank, company)" in result.output
+
+
+def test_list_doc_type_without_corpus_shows_the_api_detail(api):
+    detail = "doc_type needs corpus: ... Codes per corpus: company: A1 = Annual report (10-K)"
+    api(lambda r: httpx.Response(400, json={"detail": detail}))
+    result = invoke("list", "--doc-type", "A1")
+    assert result.exit_code == 1
+    assert "doc_type needs corpus" in " ".join(result.output.split())
+    assert "400" in result.output
+
+
+def test_stats_shows_each_doc_type_with_its_corpus(api):
+    stats = {**STATS, "by_doc_type": [{"corpus": "central-bank", "key": "A1", "count": 3},
+                                      {"corpus": "company", "key": "A1", "count": 2}]}
+    api(lambda r: httpx.Response(200, json=stats))
+    result = invoke("stats")
+    assert result.exit_code == 0, result.output
+    assert "central-bank: A1" in result.output and "company: A1" in result.output

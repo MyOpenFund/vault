@@ -26,13 +26,18 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     - `q` -> literal, case-insensitive substring of `title` (ILIKE with `%`,
       `_` and LIKE_ESCAPE escaped: `q="50%"` finds "50%", it is not a wildcard)
     - by default, excludes soft-deleted documents (`deleted_at IS NULL`)
+    - `doc_type` without `corpus` is DocTypeNeedsCorpus: a doc_type code means
+      something only within its corpus (documents contract), so a filter that
+      would mix corpora is refused rather than answered
 
     Values are checked before any SQL runs: `year` is a plain int >= 0 (not a
     bool), `date_from` / `date_to` a `datetime.date` / `datetime.datetime` or a
     `YYYY-MM-DD` str naming a real day; an empty / falsy date is ignored (no
     bound); anything else raises InvalidQuery. Only validates: the caller's
     original value is the bound parameter. A str value (`q` included) holding
-    a NUL character is InvalidQuery: the driver cannot send one.
+    a NUL character is InvalidQuery: the driver cannot send one. The corpus
+    rule is checked last, after every value: its message here is short (no
+    connection to list the codes with); search_documents words the full one.
     """
     clauses = []
     params = []
@@ -66,6 +71,11 @@ def build_where_clause(filters: dict, include_deleted: bool = False) -> tuple[st
     if q:
         clauses.append(f"title ILIKE %s ESCAPE '{LIKE_ESCAPE}'")
         params.append(f"%{escape_like(q)}%")
+
+    if filters.get("doc_type") is not None and filters.get("corpus") is None:
+        raise DocTypeNeedsCorpus(
+            "doc_type needs corpus: a doc_type code means something only within its corpus; "
+            "pass corpus with doc_type (vault_query.list_vocabulary lists each corpus's codes)")
 
     where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
     return where_sql, params
@@ -132,6 +142,18 @@ class InvalidQuery(ValueError):
 
     Raised before any SQL runs. The API maps it to HTTP 400, the MCP server to an
     `invalid_argument` tool error.
+    """
+
+
+class DocTypeNeedsCorpus(InvalidQuery):
+    """A `doc_type` filter or grouping without `corpus` (documents contract).
+
+    A doc_type code belongs to its corpus: central-bank `A1` (a rate decision)
+    and company `A1` (a 10-K) share a name, not a meaning, so a query mixing
+    corpora on it is refused. The message starts with "doc_type needs corpus"
+    and, when raised by search_documents or corpus_stats, lists each corpus's
+    codes with their labels, so a caller (an LLM through the MCP server) can
+    ask the user or pick the corpus from context.
     """
 
 

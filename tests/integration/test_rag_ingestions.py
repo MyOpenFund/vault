@@ -11,7 +11,7 @@ INSERT INTO rag_ingestions (
     doc_id, collection, corpus, source_code,
     embedding_model, embedding_version, chunk_count
 ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-ON CONFLICT (doc_id, collection) DO UPDATE SET
+ON CONFLICT (corpus, doc_id, collection) DO UPDATE SET
     corpus = EXCLUDED.corpus,
     source_code = EXCLUDED.source_code,
     embedding_model = EXCLUDED.embedding_model,

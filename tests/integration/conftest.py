@@ -83,7 +83,8 @@ def fast_ddl_retries(monkeypatch):
 # CREATE. vault_schema holds the train's fingerprint, so a test never inherits
 # "schema current" either. The views go with their tables (CASCADE).
 OWNED_TABLES = (
-    "rag_ingestions", "documents", "cadence", "runs", "discovery_errors", "vault_schema",
+    "rag_ingestions", "documents", "cadence", "runs", "discovery_errors",
+    "vocabulary", "ingestion_refusals", "vault_schema",
 )
 
 

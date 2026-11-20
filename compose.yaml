@@ -71,7 +71,13 @@ services:
       - ${METABASE_DATA_DIR:?set it in .env — see .env.example}:/metabase-data
     restart: unless-stopped
   ingestion:
-    build: ./ingestion
+    build:
+      # Repo root, not ./ingestion: the image copies contract/ (vault-contract) too.
+      context: .
+      dockerfile: ingestion/Dockerfile
+    # One tag for both ingestion services: `docker compose build` (which
+    # skips the `company` profile) refreshes the image ingestion-company runs.
+    image: vault-ingestion:local
     container_name: vault_ingestion
     environment:
       DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
@@ -104,6 +110,11 @@ services:
       CADENCE_PATH: ${CADENCE_PATH:-}
       RUNS_PATH: ${RUNS_PATH:-}
       DISCOVERY_ERRORS_PATH: ${DISCOVERY_ERRORS_PATH:-}
+      # The corpus vocabulary (documents contract); empty = <DATA_DIR>/vocabulary.json.
+      # Manifest-dir layout (DATA_DIR is the manifest dir, as on the NAS): the file
+      # sits one level up, e.g. /cbdata/vocabulary.json. Invalid or newer-MINOR
+      # file: the whole run stops before connecting (README).
+      VOCABULARY_PATH: ${VOCABULARY_PATH:-}
     volumes:
       - ${MANIFEST_DIR:?set it in .env — see .env.example}:/data:ro # the corpus data/ root: manifest/**/*.jsonl (+ legacy manifest.jsonl) plus cadence.jsonl, runs.jsonl, discovery_errors.jsonl — never raw/
     depends_on:
@@ -111,6 +122,50 @@ services:
         condition: service_healthy
     # Run on demand: `docker compose run --rm ingestion`
     # (no restart policy, this is not a long-running service)
+  ingestion-company:
+    # The company corpus (documents contract): the same image, CORPUS=company,
+    # over a copy of the company data root (manifest/ + vocabulary.json, no
+    # files). In the `company` profile, so `docker compose up` does not start
+    # it: run it on demand with `docker compose run --rm ingestion-company`,
+    # or set COMPOSE_PROFILES=company to have every `up` start it too (README
+    # "Deploy notes"). The two runs serialize only on the DDL train.
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    image: vault-ingestion:local
+    container_name: vault_ingestion_company
+    profiles: ["company"]
+    environment:
+      DATABASE_URL: postgresql://docuser:${POSTGRES_PASSWORD}@postgres:5432/documents
+      DATA_DIR: /data
+      CORPUS: company
+      MANIFEST_GLOBS: manifest/*.jsonl
+      VOCABULARY_PATH: /data/vocabulary.json
+      # No manifest = failure (exit 1), not a run of 0 rows: this service
+      # exists only for the company manifests (COMPANY_MANIFEST_DIR unset
+      # mounts the empty /var/empty).
+      REQUIRE_MANIFESTS: "1"
+      SWEEP_MAX_DELETE_FRACTION: ${SWEEP_MAX_DELETE_FRACTION:-0.05}
+      DISCOVERY_ERROR_MAX_CHARS: ${DISCOVERY_ERROR_MAX_CHARS:-2000}
+      DISCOVERY_ERRORS_MIN_RETAIN_FRACTION: ${DISCOVERY_ERRORS_MIN_RETAIN_FRACTION:-0.5}
+      # This run may be the one that applies the DDL train: same roles and
+      # gate settings as `ingestion` (see there). The central-bank producer
+      # file overrides (CADENCE_PATH, ...) are not forwarded: the company
+      # files, if any, sit at the default <DATA_DIR>/<name>.jsonl.
+      VAULT_ORCHESTRATOR_PASSWORD: ${VAULT_ORCHESTRATOR_PASSWORD:-}
+      VAULT_READONLY_PASSWORD: ${VAULT_READONLY_PASSWORD:-}
+      VAULT_DDL_LOCK_TIMEOUT: ${VAULT_DDL_LOCK_TIMEOUT:-}
+      VAULT_DDL_RETRY_DELAYS: ${VAULT_DDL_RETRY_DELAYS:-}
+      VAULT_DDL_FORCE: ${VAULT_DDL_FORCE:-}
+    volumes:
+      # The company data root copy: manifest/*.jsonl + vocabulary.json.
+      # Optional, so a deployment without a company corpus can still run
+      # every compose command; unset, this service fails loudly (above).
+      - ${COMPANY_MANIFEST_DIR:-/var/empty}:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
   api:
     build:
       # Repo root, not ./api: the image installs query/ (vault-query) too.
@@ -127,9 +182,13 @@ services:
       # loudly, rather than build a DSN with an empty password whose only
       # symptom is an authentication failure inside the container.
       DATABASE_URL: postgresql://vault_readonly:${VAULT_READONLY_PASSWORD:?set it in .env — see .env.example}@postgres:5432/documents
-      RAW_DATA_DIR: /data/raw
+      # File downloads: one root per corpus, `corpus=/mount,...`; a document's
+      # file is <its corpus root>/<local_path>. Checked at startup (a malformed
+      # value stops the API). To serve another corpus, mount its data root
+      # below and add it here, e.g. central-bank=/cbdata,company=/companydata.
+      CORPUS_ROOTS: ${CORPUS_ROOTS:-central-bank=/cbdata}
     volumes:
-      - ${RAW_DIR:?set it in .env — see .env.example}:/data/raw:ro   # needed to serve actual file downloads
+      - ${CENTRAL_BANK_DATA_DIR:?set it in .env — see .env.example}:/cbdata:ro   # the central-bank data root (holds raw/), for file downloads
     ports:
       - "8000:8000"
     depends_on:

@@ -396,10 +396,11 @@ def test_the_real_train_owns_exactly_these_relations():
     import ingest
     assert set(ingest.EXPECTED_RELATIONS) == {
         "documents", "rag_ingestions", "cadence", "runs", "discovery_errors",
+        "vocabulary", "ingestion_refusals",
         "vault_schema", "runs_sources", "rag_backlog", "rag_backlog_any",
         "sources_without_cadence", "source_health",
     }
-    assert len(ingest.EXPECTED_RELATIONS) == 11
+    assert len(ingest.EXPECTED_RELATIONS) == 13
 
 
 def test_the_fingerprint_is_the_hash_of_the_train_text():
