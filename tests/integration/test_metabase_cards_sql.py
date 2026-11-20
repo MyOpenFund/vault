@@ -361,6 +361,19 @@ def test_r5_reads_malformed_counters_as_null(seeded_db):
             for r in rows} == {(1, None, None, None)}
 
 
+def test_r6_lists_the_malformed_truncated_source_with_null_counters(seeded_db):
+    rows = _card_dicts(seeded_db, "R6")
+    assert [(r["source_code"], r["docs_seen"], r["docs_new"], r["docs_failed"],
+             r["fetch_errors"], r["error_samples"]) for r in rows] == [
+        ("ecb", 1, 1, 1, 2, ["ReadTimeout on listing page 3"]),
+        ("ecb", None, None, None, None, []),       # the malformed array run
+    ]
+
+
+@pytest.mark.parametrize("card", CARDS, ids=[c["code"] for c in CARDS])
+def test_no_card_counter_regex_admits_a_negative(card):
+    # A negative counter is malformed and reads as NULL, like in runs_sources.
+    assert "-{0,1}[0-9]" not in card["sql"] and "-?[0-9]" not in card["sql"], card["code"]
 
 def test_renderer_drops_blocks_without_values_and_keeps_the_rest():
     tags = {"corpus": {"type": "text", "required": True, "default": "central-bank",
