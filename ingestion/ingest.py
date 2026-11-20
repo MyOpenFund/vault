@@ -80,7 +80,7 @@ from collections import Counter
 
 import psycopg2
 from psycopg2.extras import execute_values
-from vault_contract import COLUMNS, Refusal, check_row
+from vault_contract import CODE_PATTERN, COLUMNS, Refusal, check_row
 import ingest_cadence
 import ingest_discovery_errors
 import ingest_runs
@@ -1429,6 +1429,11 @@ def main(*, corpus=None, data_dir=None):
         log.error("DATABASE_URL is not set")
         sys.exit(1)
     try:
+        if not CODE_PATTERN.fullmatch(default_corpus):
+            # A corpus is a contract code: it names locks, refusal rows and the
+            # vocabulary, and every row's corpus is compared with it.
+            raise IngestSettingsError(f"CORPUS={default_corpus!r} must be a corpus code "
+                                      f"({CODE_PATTERN.pattern})")
         gate = schema_gate.load_settings(os.environ)
         sweep_max_fraction = parse_sweep_fraction(os.environ)
         require_manifests = parse_require_manifests(os.environ)

@@ -26,7 +26,7 @@ PATH_MAX_BYTES = 4096
 # Cc, NEL included) are a copy-paste or quoting slip, and `;` a shell one.
 _BAD_ROOT_CHAR = re.compile(r"[\s\x00-\x1f\x7f-\x9f;]")
 
-# A corpus name is a contract code (vault_contract.vocabulary.CODE_PATTERN).
+# A corpus name is a contract code (vault_contract.CODE_PATTERN).
 # Copied, not imported: the API image installs vault-query only.
 # tests/test_corpus_roots.py fails if the two drift apart.
 CORPUS_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,32}")

@@ -665,3 +665,20 @@ def test_the_checker_refuses_a_line_for_the_reasons_the_ingestion_does(tmp_path,
                      for _ in range(int(n)))
     assert checker == ingestion
     assert code == (1 if ingestion else 0)
+
+
+
+@pytest.mark.parametrize("corpus", ["central bank", "c" * 33, "cb/x", ""])
+def test_a_service_corpus_that_is_not_a_code_stops_the_run_before_connecting(
+    monkeypatch, tmp_path, caplog, corpus
+):
+    def connect(*_a, **_k):
+        raise _Connected()
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    monkeypatch.setenv("CORPUS", corpus)
+    monkeypatch.setattr(ingest.psycopg2, "connect", connect)
+    with caplog.at_level(logging.ERROR, logger="ingest"), pytest.raises(SystemExit) as exc:
+        ingest.main(data_dir=str(tmp_path))
+    assert exc.value.code == 1
+    assert "CORPUS" in caplog.text

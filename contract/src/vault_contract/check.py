@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from .validate import check_row, is_text
-from .vocabulary import load_vocabulary
+from .vocabulary import CODE_PATTERN, load_vocabulary
 
 DUPLICATE_DOC_ID = "duplicate_doc_id"
 # The vault ingestion's reason for a line that is not a JSON object (like
@@ -97,6 +97,8 @@ def main(argv=None):
 
     if not args.corpus:
         parser.error("--corpus must not be empty")
+    if not CODE_PATTERN.fullmatch(args.corpus):
+        parser.error(f"--corpus {args.corpus!r} must be a corpus code ({CODE_PATTERN.pattern})")
     if not args.manifest_dir.is_dir():
         parser.error(f"not a directory: {args.manifest_dir}")
     vocabulary = None

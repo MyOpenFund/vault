@@ -289,3 +289,12 @@ def test_files_are_read_in_the_ingestions_order_plain_string_sort(tmp_path, caps
     assert "  duplicate_doc_id: 1" in out
     (example,) = [l for l in out.splitlines() if "superseded by" in l]
     assert example.strip().startswith("a-b/x.jsonl:1") and example.endswith("superseded by a/x.jsonl:1")
+
+
+@pytest.mark.parametrize("corpus", ["central bank", "c" * 33, "cb;x"])
+def test_a_corpus_that_is_not_a_code_is_a_usage_error(tmp_path, capsys, corpus):
+    _write(tmp_path, "a.jsonl", [_row("cb_rendered_html")])
+    with pytest.raises(SystemExit) as exc:
+        main([str(tmp_path), "--corpus", corpus])
+    assert exc.value.code == 2
+    assert "--corpus" in capsys.readouterr().err

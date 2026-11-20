@@ -20,7 +20,7 @@ from .fields import (
     DATE_DEPENDENT, DATE_KINDS, DATE_PRECISIONS, REFUSED_WHEN_ABSENT, TRANSITION_ALIASES,
     TRANSITION_LOCAL_PATH_PREFIX, alias_used, is_blank, split_row,
 )
-from .vocabulary import Vocabulary
+from .vocabulary import CODE_PATTERN, Vocabulary
 
 # Every reason validate_row can give, in check order. Run reports count
 # refused rows per reason: these strings are part of the contract.
@@ -161,7 +161,11 @@ def validate_row(columns: Mapping, vocabulary: Vocabulary | None, *,
     another corpus is a caller error: ValueError. With `transition`, a row
     without `corpus` is accepted (quality_notices says corpus_missing).
     A field refused for presence or type is not judged further.
+    `expected_corpus` must be a code (CODE_PATTERN): ValueError otherwise, so
+    a row `corpus` that is not a code is always corpus_conflict (or bad_text).
     """
+    if not (isinstance(expected_corpus, str) and CODE_PATTERN.fullmatch(expected_corpus)):
+        raise ValueError(f"expected_corpus {expected_corpus!r} must match {CODE_PATTERN.pattern}")
     if vocabulary is not None and vocabulary.corpus != expected_corpus:
         raise ValueError(f"vocabulary of corpus {vocabulary.corpus!r} cannot check "
                          f"rows of corpus {expected_corpus!r}")

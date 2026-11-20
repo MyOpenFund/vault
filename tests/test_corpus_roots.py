@@ -63,7 +63,7 @@ def test_a_malformed_value_is_refused(text, match):
 def test_the_corpus_name_pattern_is_the_contracts():
     """A corpus name is a contract code (vault_contract.CODE_PATTERN). The API
     image does not ship vault-contract, so the pattern is copied: drift guard."""
-    from vault_contract.vocabulary import CODE_PATTERN
+    from vault_contract import CODE_PATTERN
 
     assert files.CORPUS_NAME_PATTERN.pattern == CODE_PATTERN.pattern
 

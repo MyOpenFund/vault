@@ -68,7 +68,7 @@ too large to parse) is refused as `not_json`, as the vault ingestion refuses it.
 resolves `doc_id`s as the vault does: the last valid line of a `doc_id` wins, so every earlier
 valid occurrence is refused as `duplicate_doc_id`, pointing at the kept one. Exit 0: nothing
 refused. 1: a row refused (`not_json` included), or under `--strict` a notice. 2: usage
-error (empty `--corpus`, bad `--glob`), no matching file, a file that cannot be read, is not
+error (empty `--corpus` or one that is not a corpus code, bad `--glob`), no matching file, a file that cannot be read, is not
 UTF-8 or starts with a UTF-8 BOM (the ingestion would refuse its first line as `not_json`),
 no line that is a JSON object at all, an unreadable or invalid vocabulary, a vocabulary of
 another corpus.
@@ -169,7 +169,7 @@ columns' first.
 | `missing_provenance` | `provenance` absent or `""` |
 | `bad_text` | a text column set to something else than a non-blank string without NUL or lone surrogate: a number (a CIK `320193` has lost its zeros), a list, an object, `"  "`, a NUL, an escaped `\ud800`; also a `doc_id` with leading or trailing whitespace; `field` names the column |
 | `too_long` | a text column past its cap; `field` names it. Identifiers and paths count UTF-8 bytes, other text characters: `doc_id`, `entity_value` ≤ 512 bytes (`MAX_ID_BYTES`); `corpus`, `source_code`, `doc_type`, `date_precision`, `date_kind`, `language`, `provenance`, `entity_scheme` ≤ 32 characters (`MAX_CODE_CHARS`, as a vocabulary code); `local_path` ≤ 4096 bytes and each segment ≤ 255 bytes (`MAX_PATH_BYTES`, `MAX_PATH_SEGMENT_BYTES`: Linux PATH_MAX and NAME_MAX); `title` ≤ 2000 characters (`MAX_TITLE_CHARS`); `document_url`, `source_url` ≤ 4096 characters (`MAX_URL_CHARS`). A too-long field is not judged further |
-| `corpus_conflict` | `corpus` present and not the ingesting service's corpus |
+| `corpus_conflict` | `corpus` present and not the ingesting service's corpus (a code: `expected_corpus` must match `CODE_PATTERN`, else `ValueError`, so a row `corpus` that is not a code always conflicts) |
 | `unknown_source_code` | `source_code` not declared in the vocabulary |
 | `unknown_doc_type` | `doc_type` not declared in the vocabulary (a raw form such as `10-K` included) |
 | `unknown_provenance` | `provenance` not declared in the vocabulary |

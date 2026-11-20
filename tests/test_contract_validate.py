@@ -696,16 +696,14 @@ CODE_FIELDS = ("source_code", "doc_type", "provenance", "corpus", "entity_scheme
 ] + [(f, None, "x" * 33) for f in CODE_FIELDS])
 def test_a_value_past_its_cap_is_too_long(field, at_cap, over_cap):
     base = _golden("sec_form4")
-    corpus = base["corpus"]
-    if field == "corpus":
-        corpus = None
     for value, refused in ((at_cap, False), (over_cap, True)):
         if value is None:
             continue
         row = dict(base, **{field: value})
         if field == "entity_value":
             row["entity_scheme"] = "cik"
-        checked = check_row(row, None, expected_corpus=corpus or value)
+        # A too-long corpus is too_long only: not judged further (no corpus_conflict).
+        checked = check_row(row, None, expected_corpus=base["corpus"])
         reasons = [(r.reason, r.field) for r in checked.refusals]
         if refused:
             assert reasons == [("too_long", field)], reasons
@@ -718,3 +716,27 @@ def test_a_too_long_field_is_not_judged_further():
     reasons = [(r.reason, r.field) for r in check_row(
         row, VOCABULARIES["company"], expected_corpus="company").refusals]
     assert reasons == [("too_long", "doc_type"), ("too_long", "language")]
+
+
+# --- the package's public names; the expected corpus must be a code ---------------------
+
+def test_code_pattern_and_is_bad_local_path_are_exported():
+    import vault_contract
+    from vault_contract.validate import is_bad_local_path
+    from vault_contract.vocabulary import CODE_PATTERN
+
+    assert vault_contract.CODE_PATTERN is CODE_PATTERN
+    assert vault_contract.is_bad_local_path is is_bad_local_path
+    assert {"CODE_PATTERN", "is_bad_local_path"} <= set(vault_contract.__all__)
+
+
+@pytest.mark.parametrize("corpus", ["central bank", "", "c" * 33, "cb/x", "cb\n"])
+def test_an_expected_corpus_that_is_not_a_code_is_a_caller_error(corpus):
+    with pytest.raises(ValueError, match="expected_corpus"):
+        check_row(_golden("sec_10k"), None, expected_corpus=corpus)
+
+
+@pytest.mark.parametrize("corpus", ["company ", "comp any", "company\u200b", "Company/x"])
+def test_a_row_corpus_that_is_not_a_code_never_matches(corpus):
+    reasons = _reasons(dict(_golden("sec_10k"), corpus=corpus), expected_corpus="company")
+    assert reasons in (["corpus_conflict"], ["bad_text"]), reasons
