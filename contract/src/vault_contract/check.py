@@ -4,21 +4,21 @@
         [--vocabulary vocabulary.json] [--glob '*.jsonl'] [--no-transition] [--strict]
 
 Files are read as the vault ingestion reads them: UTF-8, lines ended by \n,
-\r\n or \r only, each line stripped. Every line goes through check_row
-exactly as the ingestion will. doc_ids are then resolved as the vault resolves
+\r\n or \r only, each line stripped, blank lines skipped. A line that is not a
+JSON object (unparsable, deep nesting and oversized integers included, or
+valid JSON of another type) is refused as not_json, as the ingestion refuses
+it; every other line goes through check_row exactly as the ingestion will. doc_ids are then resolved as the vault resolves
 them: the last valid line of a doc_id wins (dedupe_rows within a file, upserts
 in file order across files), so every earlier valid occurrence is refused as
 duplicate_doc_id, pointing at the kept one. Prints the counts of refusals and
 notices per reason with up to 3 examples each.
 
-Exit 0: no row refused. 1: at least one row refused, or under --strict at
-least one notice or one line that is not a JSON object. 2: usage error (an
-empty --corpus, a bad --glob), no file matching the glob, a file that cannot
-be read, is not UTF-8 or starts with a UTF-8 BOM (the ingestion would skip its
-first line), no row at all, an unreadable or invalid vocabulary, or a
-vocabulary of another corpus. Lines that are not a JSON object (deep nesting
-and oversized integers included) are counted apart: the ingestion skips them
-before the contract applies.
+Exit 0: no row refused. 1: at least one row refused (not_json included), or
+under --strict at least one notice. 2: usage error (an empty --corpus, a bad
+--glob), no file matching the glob, a file that cannot be read, is not UTF-8
+or starts with a UTF-8 BOM (the ingestion would refuse its first line as
+not_json), no line that is a JSON object at all, an unreadable or invalid
+vocabulary, or a vocabulary of another corpus.
 """
 import argparse
 import io
@@ -31,6 +31,9 @@ from .validate import check_row, is_text
 from .vocabulary import load_vocabulary
 
 DUPLICATE_DOC_ID = "duplicate_doc_id"
+# The vault ingestion's reason for a line that is not a JSON object (like
+# duplicate_doc_id, not a contract reason: such a line is not a row at all).
+NOT_JSON = "not_json"
 EXAMPLES = 3
 VALUE_CHARS = 80
 
@@ -81,7 +84,7 @@ def main(argv=None):
     parser.add_argument("--no-transition", dest="transition", action="store_false",
                         help="judge as after the cleanup: no old key mapped, no corpus implied")
     parser.add_argument("--strict", action="store_true",
-                        help="exit 1 on any notice or line that is not a JSON object")
+                        help="exit 1 on any notice too")
     args = parser.parse_args(argv)
 
     if not args.corpus:
@@ -103,7 +106,7 @@ def main(argv=None):
         print(f"no file matches {args.glob!r} under {args.manifest_dir}", file=sys.stderr)
         return 2
 
-    rows = refused_rows = noticed_rows = not_objects = 0
+    rows = refused_rows = noticed_rows = objects = 0
     unreadable = []
     refusals, notices = _Tally(), _Tally()
     valid = {}          # doc_id -> [location of each valid line], in vault order
@@ -132,14 +135,17 @@ def main(argv=None):
             line = line.strip()
             if not line:
                 continue
+            rows += 1
             try:
                 row = json.loads(line)
             except (ValueError, RecursionError):   # JSONDecodeError; an int past 4300 digits
                 row = None
             if not isinstance(row, dict):
-                not_objects += 1
+                refused_rows += 1
+                # Sliced before repr: a torn line can be megabytes long.
+                refusals.add(NOT_JSON, f"{path.name}:{line_num} line={_shown(line[:VALUE_CHARS])}")
                 continue
-            rows += 1
+            objects += 1
             checked = check_row(row, vocabulary, expected_corpus=args.corpus,
                                 transition=args.transition)
             where = f"{path.name}:{line_num} doc_id={_shown(checked.columns['doc_id'])}"
@@ -165,16 +171,15 @@ def main(argv=None):
     print(f"transition: {'on' if args.transition else 'off'}")
     print(f"files: {len(files)}" + (f" ({len(unreadable)} not checked)" if unreadable else ""))
     print(f"rows: {rows} (refused {refused_rows}, with notices {noticed_rows})")
-    print(f"lines that are not a JSON object: {not_objects}")
     refusals.print("refusals")
     notices.print("notices")
 
     if unreadable:
         return 2
-    if not rows:
+    if not objects:
         print("no rows: no line of the matching files is a JSON object", file=sys.stderr)
         return 2
-    if refused_rows or (args.strict and (noticed_rows or not_objects)):
+    if refused_rows or (args.strict and noticed_rows):
         return 1
     return 0
 

@@ -61,13 +61,16 @@ python -m vault_contract.check <manifest_dir> --corpus central-bank \
 ```
 
 It reads files as the vault ingestion does (UTF-8; lines ended by `\n`, `\r\n` or `\r` only)
-and prints the count of refusals and notices per reason with up to 3 examples each. It also
+and prints the count of refusals and notices per reason with up to 3 examples each. A
+non-blank line that is not a JSON object (a torn write, a JSON array, nesting or an integer
+too large to parse) is refused as `not_json`, as the vault ingestion refuses it. It also
 resolves `doc_id`s as the vault does: the last valid line of a `doc_id` wins, so every earlier
 valid occurrence is refused as `duplicate_doc_id`, pointing at the kept one. Exit 0: nothing
-refused. 1: a row refused, or under `--strict` a notice or a line that is not a JSON object.
-2: usage error (empty `--corpus`, bad `--glob`), no matching file, a file that cannot be
-read, is not UTF-8 or starts with a UTF-8 BOM (the ingestion would skip its first line), no
-row at all, an unreadable or invalid vocabulary, a vocabulary of another corpus.
+refused. 1: a row refused (`not_json` included), or under `--strict` a notice. 2: usage
+error (empty `--corpus`, bad `--glob`), no matching file, a file that cannot be read, is not
+UTF-8 or starts with a UTF-8 BOM (the ingestion would refuse its first line as `not_json`),
+no line that is a JSON object at all, an unreadable or invalid vocabulary, a vocabulary of
+another corpus.
 
 ## Fields
 
@@ -178,6 +181,8 @@ Both reason lists, in check order, are part of the contract: run reports count r
 
 Across rows, `python -m vault_contract.check` also refuses `duplicate_doc_id`: every valid
 occurrence of a `doc_id` before the last one within the corpus (the vault keeps the last).
+Before any row, a non-blank line that is not a JSON object is refused as `not_json` by both
+the checker and the vault ingestion (not a contract reason: such a line is not a row).
 
 A field refused for presence or type is not judged further (a numeric `source_code` is
 `bad_text`, not also `unknown_source_code`).

@@ -117,14 +117,18 @@ def test_glob_selects_the_files(tmp_path, capsys):
     assert code == 0 and "files: 1" in out
 
 
-def test_lines_that_are_not_objects_are_counted_apart_and_fail_strict(tmp_path, capsys):
+def test_lines_that_are_not_objects_are_refused_as_not_json(tmp_path, capsys):
+    """The vault ingestion refuses such a line (not_json: counted, stored,
+    sweep skipped, exit 1), so the checker fails on it without --strict."""
     path = _write(tmp_path, "a.jsonl", [_row("cb_rendered_html")])
     with path.open("a", encoding="utf-8") as f:
         f.write("not json\n[1, 2]\n\n")
     code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank")
-    assert code == 0
-    assert "lines that are not a JSON object: 2" in out
-    assert _run(capsys, tmp_path, "--corpus", "central-bank", "--strict")[0] == 1
+    assert code == 1
+    assert "rows: 3 (refused 2, with notices 0)" in out
+    assert "  not_json: 2" in out
+    assert "a.jsonl:2 line='not json'" in out
+    assert "a.jsonl:3 line='[1, 2]'" in out
 
 
 def test_a_missing_directory_exits_2(tmp_path, capsys):
@@ -196,12 +200,12 @@ def test_lines_are_split_as_the_ingestion_splits_them(tmp_path, capsys):
     code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank")
     assert code == 0, out
     assert "rows: 4 (refused 0, with notices 0)" in out
-    assert "lines that are not a JSON object: 0" in out
+    assert "not_json" not in out
 
 
 def test_a_utf8_bom_exits_2(tmp_path, capsys):
     """The ingestion reads with encoding="utf-8": a BOM glues to line 1, which
-    json.loads then rejects, so that row would be skipped without a refusal."""
+    json.loads then rejects, so that row would be refused as not_json."""
     (tmp_path / "a.jsonl").write_bytes(
         b"\xef\xbb\xbf" + json.dumps(_row("cb_rendered_html")).encode() + b"\n")
     code, _, err = _run(capsys, tmp_path, "--corpus", "central-bank")
@@ -234,14 +238,18 @@ def test_a_file_that_cannot_be_read_exits_2(tmp_path, capsys, monkeypatch):
     assert "rows: 1 " in out
 
 
-def test_deep_nesting_and_huge_ints_are_lines_that_are_not_objects(tmp_path, capsys):
+def test_deep_nesting_and_huge_ints_are_not_json(tmp_path, capsys):
     path = _write(tmp_path, "a.jsonl", [_row("cb_rendered_html")])
     with path.open("a", encoding="utf-8") as f:
         f.write("[" * 200_000 + "\n")
         f.write('{"doc_id": ' + "9" * 5000 + "}\n")
     code, out, _ = _run(capsys, tmp_path, "--corpus", "central-bank")
-    assert code == 0
-    assert "lines that are not a JSON object: 2" in out
+    assert code == 1
+    assert "  not_json: 2" in out
+    # The example shows the line's start, not a 200,000-character repr.
+    example = next(line for line in out.splitlines() if "a.jsonl:2 line=" in line)
+    assert len(example) < 120
+
 
 
 def test_no_rows_at_all_exits_2(tmp_path, capsys):
