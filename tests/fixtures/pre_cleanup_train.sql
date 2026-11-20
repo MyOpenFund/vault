@@ -1,0 +1,642 @@
+-- Frozen copy of the DDL train as of master eff1aec (the documents contract with
+-- the transitional unique index rag_ingestions_doc_collection_transition), the
+-- train deployed on the NAS on 2026-11-20. Used to build a pre-cleanup database;
+-- never edit it. The header is stripped before use (fingerprint = master's).
+
+-- Gated: this whole text only runs when its sha256 differs from the one
+-- recorded in vault_schema, when one of its relations is missing, or when
+-- VAULT_DDL_FORCE is set (schema_gate.py, vault #4). Editing ANY character of
+-- it, comments included, re-runs it once on the next pass.
+--
+-- Views first. They are dropped at the HEAD of the train and recreated at its
+-- tail, in dependency order, so every ALTER below is view-safe (an
+-- ALTER COLUMN ... TYPE on a column a view reads would otherwise fail) and so
+-- the train stays idempotent under schema evolution (CREATE OR REPLACE VIEW
+-- cannot drop a column). No CASCADE on purpose: an object outside this train
+-- depending on a view must fail loudly, not vanish. Rule: nothing outside the
+-- train may depend on these views (Metabase and the agent reference them by
+-- name at query time, which is fine).
+DROP VIEW IF EXISTS source_health;
+DROP VIEW IF EXISTS sources_without_cadence;
+DROP VIEW IF EXISTS rag_backlog_any;
+DROP VIEW IF EXISTS rag_backlog;
+DROP VIEW IF EXISTS runs_sources;
+
+-- Identity is (corpus, doc_id) (documents contract 1.0.0, chantier 4): a
+-- doc_id is unique within its corpus only. A database created before the
+-- contract had UNIQUE (doc_id); the identity block below moves it.
+CREATE TABLE IF NOT EXISTS documents (
+    id SERIAL PRIMARY KEY,
+    doc_id TEXT NOT NULL,
+    corpus TEXT NOT NULL,
+    source_code TEXT,
+    doc_type TEXT,
+    title TEXT,
+    document_url TEXT,
+    source_url TEXT,
+    date DATE,
+    year INTEGER,
+    language TEXT,
+    provenance TEXT,
+    mime_type TEXT,
+    sha256 TEXT,
+    local_path TEXT,
+    date_precision TEXT,
+    date_kind TEXT,
+    entity_scheme TEXT,
+    entity_value TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    last_seen_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    extra JSONB,
+    CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id)
+);
+
+-- Upgrade path for databases created before deletion tracking existed.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- Generalization migration: bank_code -> source_code + corpus backfill.
+-- Idempotent; no-ops on fresh databases and on already-migrated ones.
+-- The rename only happens when source_code is absent. When BOTH columns exist
+-- (a half-applied migration, a column added by hand), renaming would fail and
+-- dropping would lose data: source_code is filled from bank_code where it is
+-- NULL, bank_code is KEPT for a human to inspect and drop (made nullable: the
+-- upsert writes source_code only, so a NOT NULL bank_code would reject every
+-- new document), and a WARNING says so. ingest.py also detects this state
+-- from the catalog and logs it on every pass until bank_code is dropped.
+DO $$
+DECLARE
+    has_bank   boolean;
+    has_source boolean;
+    filled     bigint;
+BEGIN
+    SELECT coalesce(bool_or(column_name = 'bank_code'), false),
+           coalesce(bool_or(column_name = 'source_code'), false)
+      INTO has_bank, has_source
+      FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'documents'
+       AND column_name IN ('bank_code', 'source_code');
+    IF has_bank AND NOT has_source THEN
+        ALTER TABLE documents RENAME COLUMN bank_code TO source_code;
+    ELSIF has_bank AND has_source THEN
+        ALTER TABLE documents ALTER COLUMN bank_code DROP NOT NULL;
+        UPDATE documents SET source_code = bank_code
+         WHERE source_code IS NULL AND bank_code IS NOT NULL;
+        GET DIAGNOSTICS filled = ROW_COUNT;
+        RAISE WARNING 'documents has both bank_code and source_code: source_code filled from bank_code on % row(s) where it was NULL; bank_code kept (drop it by hand once checked)', filled;
+    END IF;
+END $$;
+
+-- Rename (2026-11): pdf_url -> document_url (the URL is not always a PDF).
+-- Same shape as the bank_code migration above, idempotent: the rename only
+-- happens when document_url is absent (a database created before the rename);
+-- a fresh database already has document_url and no pdf_url, and an already
+-- renamed one has nothing to do. When BOTH exist (a column added by hand),
+-- document_url is filled from pdf_url where it is NULL, pdf_url is KEPT for a
+-- human to inspect and drop, and a WARNING says so (ingest.py repeats it on
+-- every pass from the catalog). The ADD COLUMN covers a table missing both.
+-- RENAME COLUMN is a catalog change: no table rewrite, no data touched.
+DO $$
+DECLARE
+    has_pdf boolean;
+    has_doc boolean;
+    filled  bigint;
+BEGIN
+    SELECT coalesce(bool_or(column_name = 'pdf_url'), false),
+           coalesce(bool_or(column_name = 'document_url'), false)
+      INTO has_pdf, has_doc
+      FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'documents'
+       AND column_name IN ('pdf_url', 'document_url');
+    IF has_pdf AND NOT has_doc THEN
+        ALTER TABLE documents RENAME COLUMN pdf_url TO document_url;
+    ELSIF has_pdf AND has_doc THEN
+        UPDATE documents SET document_url = pdf_url
+         WHERE document_url IS NULL AND pdf_url IS NOT NULL;
+        GET DIAGNOSTICS filled = ROW_COUNT;
+        RAISE WARNING 'documents has both pdf_url and document_url: document_url filled from pdf_url on % row(s) where it was NULL; pdf_url kept (drop it by hand once checked)', filled;
+    END IF;
+END $$;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_url TEXT;
+
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS corpus TEXT;
+UPDATE documents SET corpus = 'central-bank' WHERE corpus IS NULL;
+ALTER TABLE documents ALTER COLUMN corpus SET NOT NULL;
+
+-- documents contract 1.0.0 (chantier 4): the four common fields that were not
+-- columns yet. Catalog-only (no default): no table rewrite. Central-bank rows
+-- carried date_precision/date_kind inside `extra`; the next documents pass
+-- lifts them into the columns (vault_contract.split_row) and they leave extra.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_precision TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_kind TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_scheme TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS entity_value TEXT;
+
+-- Identity, part 1: UNIQUE (corpus, doc_id), added when no unique constraint
+-- on exactly those columns exists (a fresh table has it inline). On a
+-- pre-contract database doc_id was unique on its own, so this cannot fail on
+-- existing data. Part 2 (rag_ingestions' keys, then the old UNIQUE (doc_id))
+-- follows the rag_ingestions table, which references this constraint.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id']
+    ) THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_corpus_doc_id_key UNIQUE (corpus, doc_id);
+    END IF;
+END $$;
+
+-- One-time upgrade of pre-existing naive TIMESTAMP columns to TIMESTAMPTZ
+-- (values were written as UTC); no-op once migrated or on fresh databases.
+-- Each column is checked on its own: a database where created_at/updated_at
+-- were already migrated but last_seen_at/deleted_at were added naive (or the
+-- reverse) must converge too, not hinge on updated_at alone.
+DO $$
+DECLARE
+    col text;
+BEGIN
+    FOREACH col IN ARRAY ARRAY['created_at', 'updated_at', 'last_seen_at', 'deleted_at'] LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'documents' AND column_name = col
+              AND data_type = 'timestamp without time zone'
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE documents ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE ''UTC''',
+                col, col);
+        END IF;
+    END LOOP;
+END $$;
+
+DROP INDEX IF EXISTS idx_documents_bank_code;
+CREATE INDEX IF NOT EXISTS idx_documents_source_code ON documents(source_code);
+CREATE INDEX IF NOT EXISTS idx_documents_corpus_source ON documents(corpus, source_code);
+CREATE INDEX IF NOT EXISTS idx_documents_doc_type ON documents(doc_type);
+CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date);
+CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year);
+CREATE INDEX IF NOT EXISTS idx_documents_language ON documents(language);
+CREATE INDEX IF NOT EXISTS idx_documents_provenance ON documents(provenance);
+CREATE INDEX IF NOT EXISTS idx_documents_deleted_at ON documents(deleted_at);
+
+-- Live-aggregation index: the drill-down shape of the Metabase coverage
+-- cards. Partial on the deleted_at IS NULL every card carries. Measured:
+-- index-only scan, 3.2 -> 0.52 ms on a per-source aggregation at 40k rows.
+-- It does NOT help the whole-corpus rollup (97% of rows are live -> seq
+-- scan is correct).
+CREATE INDEX IF NOT EXISTS idx_documents_live_agg
+    ON documents (corpus, source_code, doc_type, year)
+    WHERE deleted_at IS NULL;
+
+-- doc_type is free text and collides across corpora (central-bank A1 = rate
+-- decision, company A1 = annual report). The corpus-scoped query must be the
+-- fast path. Unused while one corpus exists; 2x once two do.
+CREATE INDEX IF NOT EXISTS idx_documents_corpus_doc_type
+    ON documents (corpus, doc_type);
+
+-- Containment lookups into `extra` (entity_key, date_precision, ...).
+-- jsonb_path_ops: smaller and faster than the default opclass for the @>
+-- queries we issue. NOTE: it does not accelerate `extra ->> 'k' = 'v'`; the
+-- documented consumer contract is @> containment.
+CREATE INDEX IF NOT EXISTS idx_documents_extra_gin
+    ON documents USING GIN (extra jsonb_path_ops);
+
+-- Facts feeding the RAG OCR policy. Filled by data-orchestrator's probe pass
+-- (its UPDATE is their only writer). Deliberately absent from the contract's
+-- columns and from the manifest upsert: manifests never carry them, and upserting them
+-- would null probed values on every nightly run.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS has_text_layer BOOLEAN;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+
+-- RAG ingestion state: current-state row per (doc_id, collection), upserted by
+-- data-orchestrator over plain SQL (INSERT ... ON CONFLICT DO UPDATE).
+-- Cross-model history lives in the collection dimension (one fresh collection
+-- per re-embed campaign). The vault owns this DDL; data-orchestrator only needs
+-- INSERT/UPDATE/SELECT rights.
+-- Keyed by (corpus, doc_id, collection) since the documents contract: its
+-- corpus column joins the key and the foreign key (identity part 2 below).
+CREATE TABLE IF NOT EXISTS rag_ingestions (
+    doc_id            TEXT NOT NULL,
+    collection        TEXT NOT NULL,
+    corpus            TEXT NOT NULL,
+    source_code       TEXT,
+    embedding_model   TEXT NOT NULL,
+    embedding_version TEXT,
+    chunk_count       INTEGER NOT NULL,
+    ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection),
+    CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+        REFERENCES documents (corpus, doc_id)
+);
+
+-- Identity, part 2, idempotent (every step checks the catalog by columns,
+-- not by name). On a pre-contract database: the foreign key on doc_id alone is
+-- dropped, the primary key (doc_id, collection) becomes (corpus, doc_id,
+-- collection), the foreign key (corpus, doc_id) is added, and only then the
+-- old UNIQUE (doc_id) it depended on is dropped. Adding the foreign key
+-- checks every existing row: a rag_ingestions row whose corpus is not its
+-- document's would make it fail, so that case is counted first and stops the
+-- train with a message saying what to fix (the train is one transaction:
+-- nothing is left half-done). A plain index on doc_id replaces the old unique
+-- one for the lookups by doc_id alone (vault-query, the API, the
+-- orchestrator's probe UPDATE), which the (corpus, doc_id) index cannot serve.
+DO $$
+DECLARE
+    con      record;
+    orphans  bigint;
+BEGIN
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) <> ARRAY['corpus', 'doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['corpus', 'doc_id', 'collection']
+    ) THEN
+        FOR con IN
+            SELECT c.conname FROM pg_constraint c
+             WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'p'
+        LOOP
+            EXECUTE format('ALTER TABLE rag_ingestions DROP CONSTRAINT %I', con.conname);
+        END LOOP;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (corpus, doc_id, collection);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'rag_ingestions'::regclass AND c.contype = 'f'
+           AND c.confrelid = 'documents'::regclass
+    ) THEN
+        SELECT count(*) INTO orphans
+          FROM rag_ingestions r
+         WHERE NOT EXISTS (SELECT 1 FROM documents d
+                            WHERE d.corpus = r.corpus AND d.doc_id = r.doc_id);
+        IF orphans > 0 THEN
+            RAISE EXCEPTION 'rag_ingestions has % row(s) whose (corpus, doc_id) matches no document (a corpus differing from its document''s): fix them before deploying the documents contract (SELECT r.* FROM rag_ingestions r JOIN documents d USING (doc_id) WHERE r.corpus <> d.corpus)', orphans;
+        END IF;
+        ALTER TABLE rag_ingestions
+            ADD CONSTRAINT rag_ingestions_corpus_doc_id_fkey FOREIGN KEY (corpus, doc_id)
+            REFERENCES documents (corpus, doc_id);
+    END IF;
+
+    FOR con IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = 'documents'::regclass AND c.contype = 'u'
+           AND ARRAY(SELECT a.attname::text
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(n, i)
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n
+                      ORDER BY k.i) = ARRAY['doc_id']
+    LOOP
+        EXECUTE format('ALTER TABLE documents DROP CONSTRAINT %I', con.conname);
+    END LOOP;
+END $$;
+
+-- TRANSITION (removed by the cleanup PR 6): the deployed data-orchestrator
+-- upserts with ON CONFLICT (doc_id, collection), which needs a unique index on
+-- exactly those columns. Keeping one lets it run between the vault deploy
+-- and its own update. Valid only while collections are per corpus (a
+-- collection never holds two corpora's documents); a mixed-corpus collection
+-- needs this index gone first.
+CREATE UNIQUE INDEX IF NOT EXISTS rag_ingestions_doc_collection_transition
+    ON rag_ingestions (doc_id, collection);
+
+CREATE INDEX IF NOT EXISTS idx_documents_doc_id ON documents (doc_id);
+-- Documents about one company (contract: entity = the company the document is about).
+CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents (entity_scheme, entity_value);
+
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_collection
+    ON rag_ingestions(collection);
+CREATE INDEX IF NOT EXISTS idx_rag_ingestions_corpus_source
+    ON rag_ingestions(corpus, source_code);
+
+-- cadence table, owned and populated by ingest_cadence.py. Included here too
+-- so the full target schema exists after any service run's DDL train, even
+-- on a deployment with no cadence producer (e.g. a docs-only run before
+-- cadence.jsonl ever shows up). ingest_cadence.run() also issues this same
+-- CREATE TABLE IF NOT EXISTS so the module stays usable standalone; the
+-- duplication between the two is deliberate, not drift.
+CREATE TABLE IF NOT EXISTS cadence (
+    corpus            TEXT NOT NULL,
+    source_code       TEXT NOT NULL,
+    doc_type          TEXT NOT NULL,
+    last              DATE,
+    interval_days     INTEGER,
+    next_expected     DATE,
+    days_until        INTEGER,
+    status            TEXT,
+    expected_per_year INTEGER,
+    n_3y              INTEGER,
+    updated_at        TIMESTAMPTZ NOT NULL,
+    extra             JSONB,
+    PRIMARY KEY (corpus, source_code, doc_type)
+);
+
+-- Run telemetry: one row per producer run (central-bank-corpus via
+-- data/runs.jsonl handoff; data-orchestrator writes directly). Append-only
+-- for content: ingestion is INSERT ... ON CONFLICT (run_id) DO UPDATE SET
+-- corpus = coalesce(runs.corpus, EXCLUDED.corpus), which rewrites no stored
+-- column, so producer-side file rotation is always safe; `corpus` alone is
+-- filled in when NULL (one-time repair of rows ingested before the column
+-- existed, which the producer has never emitted and DO NOTHING never fixed). Owned and populated by ingest_runs.py.
+-- Included here too so the full target schema exists after any service run's
+-- DDL train, even on a deployment with no runs producer. ingest_runs.run()
+-- also issues this same CREATE TABLE IF NOT EXISTS (index included) so the
+-- module stays usable standalone; the duplication between the two is
+-- deliberate, not drift.
+CREATE TABLE IF NOT EXISTS runs (
+    run_id      TEXT PRIMARY KEY,
+    tool        TEXT NOT NULL,
+    command     TEXT,
+    started_at  TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    outcome     TEXT,
+    exit_code   INTEGER,
+    totals      JSONB,
+    sources     JSONB,
+    extra       JSONB,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_tool_finished ON runs(tool, finished_at);
+
+-- Corpus attribution (2026-09-04). Producers writing runs.jsonl into a
+-- corpus's data/ get the ingesting service's CORPUS; the data-orchestrator
+-- is corpus-agnostic and leaves it NULL. Rows ingested before the column
+-- existed carried `corpus` inside extra (unknown-field rule): backfilled.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS corpus TEXT;
+-- The type guard matters: `extra ->> 'corpus'` renders a JSON number or
+-- object as text, so an unguarded backfill would promote `{"corpus": 42}`
+-- into a corpus named '42'. The value is otherwise taken as-is -- this is a
+-- one-shot legacy path, not the ingestion path, so it deliberately does not
+-- run resolve_corpus's contradiction check against the service's CORPUS.
+UPDATE runs SET corpus = extra ->> 'corpus'
+ WHERE corpus IS NULL AND jsonb_typeof(extra -> 'corpus') = 'string';
+CREATE INDEX IF NOT EXISTS idx_runs_corpus_finished ON runs(corpus, finished_at);
+
+-- Producer rename (2026-09-02): the RAG orchestrator's `tool` identity was
+-- renamed from 'rag-orchestrator' to 'data-orchestrator'; rows it already
+-- wrote under the old identity are relabeled so telemetry history isn't
+-- split across two `tool` values for the same producer. No-op once applied,
+-- and on any deployment that never saw the old identity.
+UPDATE runs SET tool = 'data-orchestrator' WHERE tool = 'rag-orchestrator';
+
+-- Discovery failures, ingested from the producer's data/discovery_errors.jsonl
+-- by ingest_discovery_errors.py. The producer's file is append-only and is
+-- never truncated, so it is a FULL HISTORY snapshot: the ingester aggregates
+-- per fingerprint and ASSIGNS occurrences (never increments), which is what
+-- makes re-ingestion idempotent.
+--
+-- The nullable columns (doc_type, error_class, http_status, first/last_run_id)
+-- are filled the moment the producer emits them; until then
+-- seen_at_is_ingestion_time stays TRUE and last_seen_at is an approximation.
+-- resolved_at is NOT populated today: an unrotated file means a fixed URL's
+-- old lines never disappear, so "not seen this run" is never true.
+CREATE TABLE IF NOT EXISTS discovery_errors (
+    fingerprint   TEXT PRIMARY KEY,  -- sha256(corpus|source_code|context|url|error_class)
+    corpus        TEXT NOT NULL,
+    source_code   TEXT,
+    doc_type      TEXT,
+    context       TEXT,
+    url           TEXT,
+    error_class   TEXT,
+    error         TEXT,
+    http_status   INTEGER,
+    first_run_id  TEXT,
+    last_run_id   TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL,
+    last_seen_at  TIMESTAMPTZ NOT NULL,
+    seen_at_is_ingestion_time BOOLEAN NOT NULL DEFAULT TRUE,
+    occurrences   INTEGER NOT NULL DEFAULT 1,
+    resolved_at   TIMESTAMPTZ,
+    extra         JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_corpus_source
+    ON discovery_errors (corpus, source_code);
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_open
+    ON discovery_errors (corpus, source_code, last_seen_at DESC)
+    WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_discovery_errors_last_run
+    ON discovery_errors (last_run_id);
+
+-- Corpus vocabulary (documents contract, vocabulary.json at the producer's
+-- data root): the codes a corpus declares, one row per (kind, code), kind
+-- being the column the code is for: source_code, doc_type, provenance or
+-- entity_scheme. Full replace per corpus by the documents pass
+-- (ingest_vocabulary.py), before the documents are checked against it.
+CREATE TABLE IF NOT EXISTS vocabulary (
+    corpus TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    code   TEXT NOT NULL,
+    label  TEXT,
+    family TEXT,
+    PRIMARY KEY (corpus, kind, code)
+);
+
+-- Manifest rows the last documents pass of a corpus refused (contract
+-- refusals, plus the vault's own: see ingest.VAULT_REASONS), one row per
+-- refusal: a row with two defects has two. Replaced per corpus at every pass,
+-- so it always shows the last run; empty for a corpus whose last run refused
+-- nothing. `value` is the repr of the refused value, truncated
+-- (ingest.REFUSAL_VALUE_CHARS). Read by Metabase; the vault ingestion writes
+-- no `runs` row of its own.
+CREATE TABLE IF NOT EXISTS ingestion_refusals (
+    corpus      TEXT NOT NULL,
+    run_ts      TIMESTAMPTZ NOT NULL,
+    source_file TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    doc_id      TEXT,
+    reason      TEXT NOT NULL,
+    field       TEXT,
+    value       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ingestion_refusals_corpus_reason
+    ON ingestion_refusals (corpus, reason);
+
+-- ---------------------------------------------------------------------------
+-- Views, recreated at the tail of the train in dependency order (they were
+-- dropped at its head, before the first ALTER — see the block above).
+
+-- One row per (run, source). The base view every runs-shaped card and the
+-- agent detector build on; no time window, so consumers choose their own.
+-- Defensive casts: a producer writing a non-integer counter, an object where
+-- an array belongs, or a NULL must not make the view raise.
+-- bad_content (central-bank-corpus, 2026-11-19) is a sub-count of docs_failed:
+-- documents whose every URL served the wrong bytes (an HTML page for a PDF, a
+-- stub, a truncated PDF). NULL when the producer did not report it, never 0.
+-- Every counter takes at most 9 digits, so a value past the int range is NULL
+-- rather than an "integer out of range" that would make every reader raise.
+-- A negative counter is malformed and NULL too: a negative bad_content would
+-- otherwise offset a positive one and hide a bank under `HAVING sum > 0`.
+-- Appended last so positional readers of the earlier columns are unaffected.
+CREATE VIEW runs_sources AS
+SELECT r.run_id, r.tool, r.command, r.corpus,
+       r.started_at, r.finished_at, r.outcome, r.exit_code,
+       s ->> 'source_code' AS source_code,
+       CASE WHEN s ->> 'docs_seen'    ~ '^[0-9]{1,9}$' THEN (s ->> 'docs_seen')::int    END AS docs_seen,
+       CASE WHEN s ->> 'docs_new'     ~ '^[0-9]{1,9}$' THEN (s ->> 'docs_new')::int     END AS docs_new,
+       CASE WHEN s ->> 'docs_failed'  ~ '^[0-9]{1,9}$' THEN (s ->> 'docs_failed')::int  END AS docs_failed,
+       CASE WHEN s ->> 'fetch_errors' ~ '^[0-9]{1,9}$' THEN (s ->> 'fetch_errors')::int END AS fetch_errors,
+       CASE WHEN jsonb_typeof(s -> 'truncated') = 'boolean'
+            THEN (s ->> 'truncated')::boolean ELSE FALSE END AS truncated,
+       CASE WHEN jsonb_typeof(s -> 'error_samples') = 'array'
+            THEN s -> 'error_samples' ELSE '[]'::jsonb END AS error_samples,
+       CASE WHEN s ->> 'bad_content'  ~ '^[0-9]{1,9}$' THEN (s ->> 'bad_content')::int  END AS bad_content
+FROM runs r
+CROSS JOIN LATERAL jsonb_array_elements(
+    CASE WHEN jsonb_typeof(r.sources) = 'array' THEN r.sources ELSE '[]'::jsonb END
+) AS s;
+
+-- Per-collection RAG backlog: one row per (document, collection) gap. This is
+-- the campaign view -- during a re-embed, "missing" is relative to the NEW
+-- collection and presence in the old one is irrelevant. EMPTY on a database
+-- with no rag_ingestions rows (no collection to enumerate): see rag_backlog_any.
+CREATE VIEW rag_backlog AS
+WITH collections AS (SELECT DISTINCT collection FROM rag_ingestions)
+SELECT c.collection,
+       d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
+       d.local_path, d.mime_type, d.document_url, d.source_url,
+       d.page_count, d.has_text_layer,
+       d.updated_at AS document_updated_at
+FROM documents d
+CROSS JOIN collections c
+LEFT JOIN rag_ingestions r
+       ON r.corpus = d.corpus AND r.doc_id = d.doc_id AND r.collection = c.collection
+WHERE d.deleted_at IS NULL AND r.doc_id IS NULL;
+
+-- Absolute backlog: live documents in NO collection at all. Correct on a
+-- fresh deployment. Pair any backlog card with a live-document count:
+-- backlog 0 with documents 0 means "no data", not "done".
+CREATE VIEW rag_backlog_any AS
+SELECT d.corpus, d.source_code, d.doc_type, d.doc_id, d.title, d.date, d.year,
+       d.local_path, d.mime_type, d.document_url, d.source_url,
+       d.page_count, d.has_text_layer,
+       d.updated_at AS document_updated_at
+FROM documents d
+WHERE d.deleted_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM rag_ingestions r
+                   WHERE r.corpus = d.corpus AND r.doc_id = d.doc_id);
+
+-- Sources that produce runs but have no cadence expectation. Empty is
+-- healthy; a non-empty result means source_health cannot see part of the
+-- pipeline (it is built FROM cadence).
+CREATE VIEW sources_without_cadence AS
+SELECT rs.corpus, rs.source_code, max(rs.finished_at) AS last_run_at
+FROM runs_sources rs
+WHERE rs.corpus IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM cadence c
+                   WHERE c.corpus = rs.corpus AND c.source_code = rs.source_code)
+GROUP BY 1, 2;
+
+-- Expected (cadence) x observed (runs) per series.
+-- Grain: (corpus, source_code, doc_type) -- the cadence grain.
+-- Every source_* column is SOURCE-grain (runs.sources carries no doc_type)
+-- and is therefore repeated identically across a source's doc_type rows.
+-- last_run_outcome is RUN-grain: a run is degraded if ANY source failed.
+-- Windows are fixed at 7d (recent) / 90d (baseline) and named in the
+-- columns; use runs_sources for any other window. No anomaly threshold here
+-- on purpose -- the detector owns it as a documented, testable config value.
+-- source_bad_content_7d and last_run_bad_content stay NULL when no run (resp.
+-- the last run) reported the key, unlike their coalesce(.., 0) siblings: a
+-- producer that does not check content must not read as "0 bad content".
+CREATE VIEW source_health AS
+WITH obs_7d AS (
+    SELECT corpus, source_code,
+           count(*)                                                  AS runs_7d,
+           count(*) FILTER (WHERE outcome IN ('degraded', 'failed'))  AS degraded_runs_7d,
+           count(*) FILTER (WHERE truncated)                          AS truncated_runs_7d,
+           count(*) FILTER (WHERE coalesce(docs_seen, 0) = 0)         AS zero_yield_runs_7d,
+           sum(coalesce(docs_new, 0))                                 AS docs_new_7d,
+           sum(coalesce(docs_seen, 0))                                AS docs_seen_7d,
+           sum(coalesce(fetch_errors, 0))                             AS fetch_errors_7d,
+           sum(bad_content)                                           AS bad_content_7d
+    FROM runs_sources
+    WHERE finished_at >= now() - interval '7 days'
+    GROUP BY 1, 2
+),
+base_90d AS (
+    SELECT corpus, source_code, count(*) AS runs_90d,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY coalesce(docs_new, 0))
+               AS docs_new_median_per_run_90d
+    FROM runs_sources
+    WHERE finished_at >= now() - interval '90 days'
+    GROUP BY 1, 2
+),
+last_run AS (
+    SELECT DISTINCT ON (corpus, source_code)
+           corpus, source_code, run_id, finished_at, outcome, truncated, bad_content
+    FROM runs_sources
+    WHERE finished_at IS NOT NULL
+    ORDER BY corpus, source_code, finished_at DESC, run_id DESC
+),
+open_errors AS (
+    SELECT corpus, source_code,
+           count(*)          AS open_discovery_errors,
+           sum(occurrences)  AS open_discovery_attempts,
+           max(last_seen_at) AS last_discovery_error_at
+    FROM discovery_errors
+    WHERE resolved_at IS NULL
+    GROUP BY 1, 2
+)
+SELECT c.corpus, c.source_code, c.doc_type,
+       c.interval_days                                          AS expected_interval_days,
+       c.expected_per_year, c.n_3y,
+       c.last                                                   AS last_document_date,
+       c.next_expected, c.days_until,
+       CASE WHEN c.days_until < 0 THEN -c.days_until
+            WHEN c.days_until IS NULL THEN NULL
+            ELSE 0 END                                           AS days_late,
+       c.status                                                 AS cadence_status,
+       c.updated_at                                             AS cadence_updated_at,
+       lr.run_id                                    AS last_run_id,
+       lr.finished_at                               AS last_run_at,
+       lr.outcome                                   AS last_run_outcome,
+       lr.truncated                                 AS last_run_truncated,
+       coalesce(o.runs_7d, 0)                       AS source_runs_7d,
+       coalesce(o.degraded_runs_7d, 0)              AS source_degraded_runs_7d,
+       coalesce(o.truncated_runs_7d, 0)             AS source_truncated_runs_7d,
+       coalesce(o.zero_yield_runs_7d, 0)            AS source_zero_yield_runs_7d,
+       coalesce(o.docs_new_7d, 0)                   AS source_docs_new_7d,
+       coalesce(o.docs_seen_7d, 0)                  AS source_docs_seen_7d,
+       coalesce(o.fetch_errors_7d, 0)               AS source_fetch_errors_7d,
+       coalesce(b.runs_90d, 0)                      AS source_runs_90d,
+       b.docs_new_median_per_run_90d                AS source_docs_new_median_per_run_90d,
+       coalesce(e.open_discovery_errors, 0)         AS source_open_discovery_errors,
+       coalesce(e.open_discovery_attempts, 0)       AS source_open_discovery_attempts,
+       e.last_discovery_error_at                    AS source_last_discovery_error_at,
+       o.bad_content_7d                             AS source_bad_content_7d,
+       lr.bad_content                               AS last_run_bad_content
+FROM cadence c
+LEFT JOIN obs_7d     o  ON o.corpus  = c.corpus AND o.source_code  = c.source_code
+LEFT JOIN base_90d   b  ON b.corpus  = c.corpus AND b.source_code  = c.source_code
+LEFT JOIN last_run   lr ON lr.corpus = c.corpus AND lr.source_code = c.source_code
+LEFT JOIN open_errors e ON e.corpus  = c.corpus AND e.source_code  = c.source_code;
+
+-- The gate's record (schema_gate.py): one row, the sha256 of this text as it
+-- was last applied. Last statement of the train; main() upserts the row in the
+-- same transaction, so a train that fails half-way records nothing.
+CREATE TABLE IF NOT EXISTS vault_schema (
+    singleton   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    fingerprint TEXT NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

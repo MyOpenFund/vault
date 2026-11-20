@@ -78,12 +78,12 @@ Write contract (`data-orchestrator` is the only writer):
         embedding_version = EXCLUDED.embedding_version,
         chunk_count = EXCLUDED.chunk_count, ingested_at = now();
 
-**Transitional:** the deployed data-orchestrator still writes `ON CONFLICT (doc_id, collection)`
-(the key before the [documents contract](#migration-2026-11-documents-contract)). The unique
-index `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps that form working
-until the orchestrator is updated; it is removed **in code**, by the cleanup PR's DDL train,
-never by hand (a hand-dropped index breaks the old orchestrator still running, and the train
-would not know it is gone). New writers use the key above.
+The pre-contract key `ON CONFLICT (doc_id, collection)` no longer works: the transitional
+unique index `rag_ingestions_doc_collection_transition (doc_id, collection)` that served it
+during the documents-contract deploy is dropped by the DDL train (see
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup)), and such a
+statement now fails with `there is no unique or exclusion constraint matching the ON CONFLICT
+specification`, writing nothing.
 
 "Documents not yet in the RAG" is the anti-join on this table; drift between the vault and Qdrant becomes a SQL query. Cross-model history lives in the collection dimension: each re-embed campaign targets a fresh collection.
 
@@ -207,6 +207,21 @@ with `VAULT_DDL_FORCE=1`. Two services on different code versions against the sa
 alternately, each time the other one has recorded its own — the nightly lock convoy comes back
 until both run the same tree.
 
+### Migration (2026-11 documents contract transition cleanup)
+
+Both corpora are migrated to the [documents contract](contract/README.md) and every reader is
+updated (deploy of 2026-11-20), so the transition code goes. One DDL train re-run:
+
+- `DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition`: the unique index on
+  `rag_ingestions (doc_id, collection)` that kept the pre-contract data-orchestrator's
+  `ON CONFLICT (doc_id, collection)` working. Only the contract's key
+  `(corpus, doc_id, collection)` serves an upsert now. No value is touched, no view changes
+  (the train recreates them as on every train run), and a fresh database never gets the index.
+
+**Rollback** of this cleanup: redeploy the previous tree (master `eff1aec`) and run its
+ingestion once; its train text differs, so it re-runs and recreates the index. Nothing else
+to undo.
+
 ### Migration (2026-11 documents contract)
 
 The ingestion checks every manifest row against the [documents contract](contract/README.md)
@@ -256,44 +271,16 @@ when set. In the manifest-directory layout (the NAS: `DATA_DIR` is the manifest 
   bug or of codes it does not know; nothing is better than a wrong partial run. Fix the file
   (or deploy the vault that reads the newer MINOR) and run again.
 
-**Rollback to the 2d0457e schema.** With the ingestion stopped, and only while no `doc_id`
-exists under two corpora (`UNIQUE (doc_id)` would fail), run as `docuser` in one transaction
-(`psql -v ON_ERROR_STOP=1 -1 -f rollback.sql`), then deploy the 2d0457e code. The first
-statement bounds the wait for the table locks (Metabase, the API or the orchestrator reading
-`documents`): if it times out, nothing has changed; re-run it. Preconditions and what stays:
-
-- The data-orchestrator must still write `ON CONFLICT (doc_id, collection)`: the rollback
-  restores that key, and an orchestrator already updated to `(corpus, doc_id, collection)`
-  fails on it, so roll it back too.
-- `date_precision`/`date_kind` come back into `extra` (where the 2d0457e code and the old
-  orchestrator read them) only when the 2d0457e ingestion writes the row again, at its first
-  run, and never for a document no longer in a manifest: the new code moved them to their
-  columns, which the old code ignores.
-- Left behind, ignored by the old code: the columns `date_precision`, `date_kind`,
-  `entity_scheme`, `entity_value` (with their values), the indexes `idx_documents_doc_id` and
-  `idx_documents_entity`, and the tables `vocabulary` and `ingestion_refusals` (with their
-  rows and index). Rolling forward again reuses them.
-- Emptying `vault_schema` makes the old code re-run its train once, which puts the views back
-  on `doc_id` alone.
-
-```sql
--- rollback: documents contract -> 2d0457e
-SET LOCAL lock_timeout = '5s';
-DROP INDEX IF EXISTS rag_ingestions_doc_collection_transition;
-ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_corpus_doc_id_fkey;
-ALTER TABLE rag_ingestions DROP CONSTRAINT rag_ingestions_pkey;
-ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_pkey PRIMARY KEY (doc_id, collection);
-ALTER TABLE documents ADD CONSTRAINT documents_doc_id_key UNIQUE (doc_id);
-ALTER TABLE rag_ingestions ADD CONSTRAINT rag_ingestions_doc_id_fkey
-    FOREIGN KEY (doc_id) REFERENCES documents (doc_id);
-ALTER TABLE documents DROP CONSTRAINT documents_corpus_doc_id_key;
-DELETE FROM vault_schema;
-```
-
-Tested by `tests/integration/test_documents_contract.py` (the snippet above is read from this
-file, run, then the 2d0457e train and upsert and the deployed orchestrator's upsert run on it;
-once on a freshly migrated database, once after an ingestion and orchestrator writes under the
-new code).
+**Rollback to the 2d0457e schema: no longer applicable.** Until the
+[transition cleanup](#migration-2026-11-documents-contract-transition-cleanup) this section
+gave a SQL rollback to the pre-contract keys. It is withdrawn: every consumer has moved past
+the contract (data-orchestrator `2695b26` refuses the old schema with `VaultSchemaTooOld`, the
+MCP's vault-query 0.5 reads `vocabulary`, the producers' manifests are migrated and their old
+code must not run on them), and with two corpora live nothing guarantees that
+`UNIQUE (doc_id)` alone still holds. Going back means restoring a
+database backup together with every repository's previous release, not a vault-side script.
+The historical snippet and its preconditions are in the README of master `eff1aec`
+(`git show eff1aec:README.md`).
 
 #### Breaking changes (2026-11 documents contract)
 

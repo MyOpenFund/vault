@@ -167,8 +167,8 @@ def test_a_2d0457e_database_gets_the_contract_schema_once_with_data_intact(
     indexes = {name for (name,) in fetch_all(
         clean_db, "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()")}
     assert {"idx_documents_entity", "idx_documents_doc_id",
-            "idx_ingestion_refusals_corpus_reason",
-            "rag_ingestions_doc_collection_transition"} <= indexes
+            "idx_ingestion_refusals_corpus_reason"} <= indexes
+    assert "rag_ingestions_doc_collection_transition" not in indexes
     assert _columns(clean_db, "vocabulary") == {"corpus", "kind", "code", "label", "family"}
     assert _columns(clean_db, "ingestion_refusals") == {
         "corpus", "run_ts", "source_file", "line", "doc_id", "reason", "field", "value"}
@@ -549,8 +549,10 @@ def test_a_bom_on_the_first_line_is_refused_and_soft_deletes_nothing(
     assert fetch_all(clean_db, "SELECT line, reason FROM ingestion_refusals") == [(1, "not_json")]
 
 
-# The deployed data-orchestrator's statement (master 81ead10, data_orchestrator/vault.py),
-# kept working by the transitional unique index until its own update.
+# The pre-contract data-orchestrator's statement (master 81ead10,
+# data_orchestrator/vault.py). The documents-contract deploy kept it working
+# with a transitional unique index; the cleanup (PR 6) dropped that index, so
+# it now fails (see also test_transition_cleanup.py).
 OLD_ORCHESTRATOR_UPSERT = """
 INSERT INTO rag_ingestions (
     doc_id, collection, corpus, source_code,
@@ -566,159 +568,13 @@ ON CONFLICT (doc_id, collection) DO UPDATE SET
 """
 
 
-def test_the_deployed_orchestrator_upsert_still_works_after_the_train(
+def test_the_pre_contract_orchestrator_upsert_fails_after_the_train(
     clean_db, tmp_path, monkeypatch
 ):
     _build_pre_contract_database(clean_db)
     run_ingest(monkeypatch, clean_db, tmp_path)
-    for chunks in (11, 12):            # insert branch, then the DO UPDATE branch
-        _exec(clean_db, OLD_ORCHESTRATOR_UPSERT,
-              ("cb-3", "c1", CB, "us", "e5", "v1", chunks))
-    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-1", "c1", CB, "ecb", "e5", "v1", 5))
+    with pytest.raises(psycopg2.errors.InvalidColumnReference,
+                       match="no unique or exclusion constraint matching the ON CONFLICT"):
+        _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-3", "c1", CB, "us", "e5", "v1", 11))
     assert fetch_all(clean_db, "SELECT doc_id, chunk_count FROM rag_ingestions "
-                               "ORDER BY doc_id") == [("cb-1", 5), ("cb-2", 7), ("cb-3", 12)]
-
-
-def _readme_rollback_sql():
-    readme = (Path(__file__).parent.parent.parent / "README.md").read_text(encoding="utf-8")
-    start = readme.index("-- rollback: documents contract -> 2d0457e")
-    return readme[start:readme.index("```", start)]
-
-
-def test_the_readme_rollback_returns_to_the_2d0457e_keys(clean_db, tmp_path, monkeypatch):
-    from psycopg2.extras import execute_values
-
-    _build_pre_contract_database(clean_db)
-    run_ingest(monkeypatch, clean_db, tmp_path)                    # contract schema
-    _exec(clean_db, _readme_rollback_sql())
-    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)] == [
-        ("documents", "p", ["id"]),
-        ("documents", "u", ["doc_id"]),
-        ("rag_ingestions", "f", ["doc_id"]),
-        ("rag_ingestions", "p", ["doc_id", "collection"]),
-    ]
-    # No fingerprint: the 2d0457e code re-runs its own train once (views back
-    # on doc_id). That train succeeds on the rolled-back schema, twice.
-    assert fetch_all(clean_db, "SELECT count(*) FROM vault_schema") == [(0,)]
-    _exec(clean_db, PRE_CONTRACT_TRAIN)
-    _exec(clean_db, PRE_CONTRACT_TRAIN)
-    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)][1] == ("documents", "u", ["doc_id"])
-    # The 2d0457e upsert and the deployed orchestrator's run again.
-    conn = psycopg2.connect(clean_db)
-    try:
-        with conn.cursor() as cur:
-            execute_values(cur, PRE_CONTRACT_UPSERT, [(
-                "cb-1", CB, "ecb", "A1", "t1 again", None, None, "2022-07-21", 2022, "en",
-                "bank_site", None, None, "raw/x.pdf", None, None, None)])
-        conn.commit()
-    finally:
-        conn.close()
-    assert fetch_all(clean_db, "SELECT title FROM documents WHERE doc_id = 'cb-1'") == [
-        ("t1 again",)]
-    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-3", "c1", CB, "us", "e5", "v1", 2))
-
-
-
-# The updated data-orchestrator's statement (PR 4): the contract's key.
-NEW_ORCHESTRATOR_UPSERT = OLD_ORCHESTRATOR_UPSERT.replace(
-    "ON CONFLICT (doc_id, collection)", "ON CONFLICT (corpus, doc_id, collection)")
-
-
-def test_the_readme_rollback_after_an_ingestion_under_the_new_code(
-    clean_db, tmp_path, monkeypatch
-):
-    """The realistic case: the new code has ingested (date facts moved from
-    `extra` to their columns, a refusal stored, a new document) and the
-    updated orchestrator has written under the new key before the rollback."""
-    from psycopg2.extras import execute_values
-
-    _build_pre_contract_database(clean_db)
-    write_manifest(tmp_path / "manifest", "cb.jsonl", [
-        dict(contract_cb_row("cb-1", "ecb", "A1"), date="2022-07-21", year=2022,
-             date_precision="day", date_kind="meeting"),
-        contract_cb_row("cb-3", "us", "C1"),
-        contract_cb_row("cb-4", "us", "C1"),                 # new under the new code
-        dict(contract_cb_row("cb-5", "us", "C1"), language="english"),   # refused
-    ])
-    with pytest.raises(SystemExit):
-        run_ingest(monkeypatch, clean_db, tmp_path)
-    assert fetch_all(clean_db, "SELECT doc_id, date_precision, extra FROM documents "
-                               "WHERE doc_id IN ('cb-1', 'cb-2') ORDER BY doc_id") == [
-        ("cb-1", "day", None),                               # left `extra` for its column
-        ("cb-2", None, {"date_precision": "month", "date_source": "repec"}),  # not in a manifest
-    ]
-    for chunks in (4, 5):              # insert branch, then the DO UPDATE branch
-        _exec(clean_db, NEW_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", chunks))
-    assert fetch_all(clean_db, "SELECT count(*) FROM ingestion_refusals") == [(1,)]
-
-    rollback = _readme_rollback_sql()
-    # The wait for the table locks is bounded before any other statement.
-    assert rollback.splitlines()[1] == "SET LOCAL lock_timeout = '5s';"
-    _exec(clean_db, rollback)
-    assert [tuple(r) for r in fetch_all(clean_db, CONSTRAINTS_SQL)] == [
-        ("documents", "p", ["id"]),
-        ("documents", "u", ["doc_id"]),
-        ("rag_ingestions", "f", ["doc_id"]),
-        ("rag_ingestions", "p", ["doc_id", "collection"]),
-    ]
-    # An orchestrator already updated to the contract's key fails on the
-    # rolled-back schema (README precondition: roll it back too).
-    with pytest.raises(psycopg2.errors.InvalidColumnReference):
-        _exec(clean_db, NEW_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", 9))
-    _exec(clean_db, PRE_CONTRACT_TRAIN)
-    assert fetch_all(clean_db, "SELECT doc_id, chunk_count FROM rag_ingestions "
-                               "ORDER BY doc_id") == [("cb-1", 3), ("cb-2", 7), ("cb-4", 5)]
-    # Left behind, ignored by the old code: the columns keep their values,
-    # the new tables their rows.
-    assert fetch_all(clean_db, "SELECT count(*) FROM ingestion_refusals") == [(1,)]
-    # cb-1's date facts are back in `extra` only once the 2d0457e ingestion
-    # writes the row again (its extra carried them).
-    conn = psycopg2.connect(clean_db)
-    try:
-        with conn.cursor() as cur:
-            execute_values(cur, PRE_CONTRACT_UPSERT, [(
-                "cb-1", CB, "ecb", "A1", "t1 again", None, None, "2022-07-21", 2022, "en",
-                "bank_site", None, None, "raw/x.pdf", None, None,
-                json.dumps({"date_precision": "day", "date_kind": "meeting"}))])
-        conn.commit()
-    finally:
-        conn.close()
-    assert fetch_all(clean_db, "SELECT extra FROM documents WHERE doc_id = 'cb-1'") == [
-        ({"date_precision": "day", "date_kind": "meeting"},)]
-    _exec(clean_db, OLD_ORCHESTRATOR_UPSERT, ("cb-4", "c1", CB, "us", "e5", "v1", 6))
-    assert fetch_all(clean_db, "SELECT chunk_count FROM rag_ingestions "
-                               "WHERE doc_id = 'cb-4'") == [(6,)]
-
-
-def contract_cb_row(doc_id, source, doc_type):
-    """A contract row of the central-bank corpus (columns, not `extra`)."""
-    return {"doc_id": doc_id, "corpus": CB, "source_code": source, "doc_type": doc_type,
-            "title": f"t {doc_id}", "language": "en", "provenance": "bis_index"}
-
-# master 2d0457e's ingest.UPSERT_SQL, verbatim.
-PRE_CONTRACT_UPSERT = """
-INSERT INTO documents (
-    doc_id, corpus, source_code, doc_type, title, document_url, source_url,
-    date, year, language, provenance, mime_type, sha256, local_path,
-    updated_at, last_seen_at, extra
-) VALUES %s
-ON CONFLICT (doc_id) DO UPDATE SET
-    corpus = EXCLUDED.corpus,
-    source_code = EXCLUDED.source_code,
-    doc_type = EXCLUDED.doc_type,
-    title = EXCLUDED.title,
-    document_url = EXCLUDED.document_url,
-    source_url = EXCLUDED.source_url,
-    date = EXCLUDED.date,
-    year = EXCLUDED.year,
-    language = EXCLUDED.language,
-    provenance = EXCLUDED.provenance,
-    mime_type = EXCLUDED.mime_type,
-    sha256 = EXCLUDED.sha256,
-    local_path = EXCLUDED.local_path,
-    extra = EXCLUDED.extra,
-    updated_at = EXCLUDED.updated_at,
-    -- never rewind: a slower run carrying an older run timestamp must not make a live row look stale to a newer run's sweep (vault #3)
-    last_seen_at = GREATEST(documents.last_seen_at, EXCLUDED.last_seen_at),
-    deleted_at = NULL;
-"""
+                               "ORDER BY doc_id") == [("cb-1", 3), ("cb-2", 7)]
