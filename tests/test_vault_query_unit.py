@@ -626,6 +626,44 @@ def test_search_documents_doc_type_without_corpus_lists_the_codes_per_corpus():
     assert "LIMIT %s" in sql
 
 
+def test_the_code_list_is_cut_past_max_message_codes():
+    from vault_query import DocTypeNeedsCorpus
+    from vault_query.vocabulary import MAX_MESSAGE_CODES
+
+    rows = [{"corpus": "big", "code": f"C{i:04d}", "label": None, "declared": True}
+            for i in range(MAX_MESSAGE_CODES + 1)]      # the SQL fetches one more than kept
+    conn = _ScriptedConnection(rows)
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        search_documents(conn, {"doc_type": "A1"})
+    message = str(exc.value)
+    assert message.endswith(" (list cut: see vault_query.list_vocabulary)")
+    assert f"C{MAX_MESSAGE_CODES - 1:04d}" in message and f"C{MAX_MESSAGE_CODES:04d}" not in message
+    assert conn.log[0][1] == (MAX_MESSAGE_CODES + 1,)
+
+
+def test_each_label_is_cut_to_max_label_chars():
+    from vault_query import DocTypeNeedsCorpus
+    from vault_query.vocabulary import MAX_LABEL_CHARS, MAX_MESSAGE_CODES
+
+    rows = [{"corpus": "big", "code": f"C{i:04d}", "label": "é" * 10_000, "declared": True}
+            for i in range(MAX_MESSAGE_CODES + 1)]
+    with pytest.raises(DocTypeNeedsCorpus) as exc:
+        search_documents(_ScriptedConnection(rows), {"doc_type": "A1"})
+    message = str(exc.value)
+    assert f"C0000 = {'é' * MAX_LABEL_CHARS}…," in message
+    # Bounded whatever the labels: every code with a cut label, plus the head.
+    per_code = len(f"C0000 = {'é' * MAX_LABEL_CHARS}…, ".encode("utf-8"))
+    assert len(message.encode("utf-8")) < MAX_MESSAGE_CODES * per_code + 1000
+
+
+def test_the_codes_in_use_are_read_only_for_corpora_without_a_vocabulary():
+    from vault_query.vocabulary import _CODES_SQL
+
+    in_use = _CODES_SQL.split("UNION ALL", 1)[1]
+    assert "NOT EXISTS (SELECT 1 FROM vocabulary v WHERE v.corpus = d.corpus)" in " ".join(
+        in_use.split())
+
+
 def test_the_message_says_so_when_no_corpus_has_codes():
     from vault_query import DocTypeNeedsCorpus
 

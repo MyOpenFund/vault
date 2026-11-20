@@ -11,8 +11,16 @@ VOCABULARY_KINDS = frozenset({"source_code", "doc_type", "provenance", "entity_s
 # pathological table from building a megabyte error message.
 MAX_MESSAGE_CODES = 500
 
+# Each label in that message is cut to this many characters (then "…"): a
+# label is producer text of any length, so without it the message would be
+# bounded in codes but not in bytes. 80 keeps every real label whole (the
+# longest taxonomy labels are under 60) and the message under ~170 kB even at
+# MAX_MESSAGE_CODES codes of four-byte characters.
+MAX_LABEL_CHARS = 80
+
 # The doc_type codes of every corpus: its declared vocabulary, or, for a corpus
-# that has none loaded yet (transition), the codes its live documents use.
+# absent from `vocabulary` (none loaded yet: transition), the codes its live
+# documents use. A corpus with a vocabulary is described by it alone.
 _CODES_SQL = """
 SELECT corpus, code, label, TRUE AS declared
   FROM vocabulary WHERE kind = 'doc_type'
@@ -20,8 +28,7 @@ UNION ALL
 SELECT DISTINCT d.corpus, d.doc_type, NULL, FALSE
   FROM documents d
  WHERE d.deleted_at IS NULL AND d.doc_type IS NOT NULL
-   AND NOT EXISTS (SELECT 1 FROM vocabulary v
-                    WHERE v.corpus = d.corpus AND v.kind = 'doc_type')
+   AND NOT EXISTS (SELECT 1 FROM vocabulary v WHERE v.corpus = d.corpus)
 ORDER BY 1, 2
 LIMIT %s
 """
@@ -80,7 +87,10 @@ def _message(rows):
     for r in rows[:MAX_MESSAGE_CODES]:
         name = r["corpus"] if r["declared"] else \
             f"{r['corpus']} (no vocabulary loaded, codes in use)"
-        code = r["code"] if r["label"] is None else f"{r['code']} = {r['label']}"
+        label = r["label"]
+        if label is not None and len(label) > MAX_LABEL_CHARS:
+            label = label[:MAX_LABEL_CHARS] + "…"
+        code = r["code"] if label is None else f"{r['code']} = {label}"
         groups.setdefault(name, []).append(code)
     listing = "; ".join(f"{name}: {', '.join(codes)}" for name, codes in groups.items())
     tail = " (list cut: see vault_query.list_vocabulary)" if truncated else ""
