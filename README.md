@@ -315,10 +315,24 @@ For every consumer of the API, `vaultctl` and `vault-query`, in one place:
 #### Deploy notes (2026-11 documents contract)
 
 - **Order**: deploy the tree and run the ingestion first (it applies the train: `vocabulary`,
-  the new columns and keys), then restart the API, then bump the MCP server's vault-query pin
-  to 0.5.0. An API or MCP on 0.5.0 against the old schema fails on the missing table/columns.
-  The data-orchestrator goes with it (its `ON CONFLICT` key, see
-  [Table `rag_ingestions`](#table-rag_ingestions)).
+  the new columns and keys), then restart the API. vault-query 0.5.0 (the API's) needs the new
+  schema: on the old one it fails on the missing table/columns.
+- **MCP server**: vault-query 0.4.0, its current pin, keeps working on the new schema (it reads
+  no new table or column), so its bump to 0.5.0 is not urgent; do it after the ingestion has
+  run, never before.
+- **data-orchestrator**: its writes keep working (the transitional index serves its
+  `ON CONFLICT (doc_id, collection)`, see [Table `rag_ingestions`](#table-rag_ingestions)).
+  The real constraint is its reads: after the first new ingestion, `date_precision` and
+  `date_kind` leave `extra` for their columns and `local_path` loses its `data/` prefix, both of
+  which the old orchestrator relies on. So **no old-orchestrator ingestion and no
+  `sync-metadata`** between the vault deploy and the orchestrator's update.
+- **NAS ingestion**: the ingestion imports the `vault_contract` package, which the NAS (code
+  bind-mounted, no image build) must provide on both ingestion services: a read-only bind
+  `${VAULT_SRC}/contract/src:/contract:ro` and `PYTHONPATH=/contract`. Extend the deploy's
+  `cmp` check to `contract/src/vault_contract/*.py` and `ingestion/ingest_vocabulary.py`. If it
+  is forgotten, the ingestion exits 1 at import (`ModuleNotFoundError: vault_contract`) and the
+  database is untouched, but the Démarrer has also recreated the api on the new code, which then
+  runs against the old schema: add the mount and the variable, then Démarrer again.
 - **`.env` rename**: `RAW_DIR` (which pointed at `data/raw`) is replaced by
   `CENTRAL_BANK_DATA_DIR`, the central-bank **data root** (the directory holding `raw/`),
   required by compose. A stale `RAW_DIR` is ignored.
