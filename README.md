@@ -12,8 +12,9 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 ## Design
 
 - **Multi-corpus by construction**: every document is identified by
-  `(corpus, source_code)` — e.g. `(central-bank, ecb)` — so a second corpus
-  (companies, news, …) is one more ingestion service block, zero schema change.
+  `(corpus, doc_id)` (a `doc_id` is unique within its corpus only) and carries its
+  `source_code` (e.g. `ecb`), so a second corpus (companies, news, …) is one more
+  ingestion service block, zero schema change.
 - **Manifests are the source of truth**: ingestion is idempotent (upserts) and mirrors
   deletions as **soft-deletes** (`deleted_at`), guarded by `SWEEP_MAX_DELETE_FRACTION`
   so a torn/unmounted share can never mass-delete rows.
@@ -37,7 +38,7 @@ collection mixing corpora must put `corpus` in its point ids**.
 |---|---|---|
 | `postgres` | the vault itself (PostgreSQL 16) | internal only (publishable on one interface — see [Access & roles](#access--roles)) |
 | `ingestion` | one-shot manifest → Postgres sync, central-bank corpus | — |
-| `ingestion-company` | the same, `CORPUS=company`, over a copy of the company data root (profile `company`: `docker compose run --rm ingestion-company`) | — |
+| `ingestion-company` | the same image, `CORPUS=company`, over a copy of the company data root (profile `company`: `docker compose run --rm ingestion-company`, or `COMPOSE_PROFILES=company` — see [Deploy notes](#deploy-notes-2026-11-documents-contract)) | — |
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
 
@@ -294,6 +295,53 @@ file, run, then the 2d0457e train and upsert and the deployed orchestrator's ups
 once on a freshly migrated database, once after an ingestion and orchestrator writes under the
 new code).
 
+#### Breaking changes (2026-11 documents contract)
+
+For every consumer of the API, `vaultctl` and `vault-query`, in one place:
+
+- HTTP `GET /documents?doc_type=X` without `corpus` → **400** (`doc_type needs corpus: …`, with
+  each corpus's codes). Pass `corpus` with `doc_type`.
+- HTTP `GET /documents/{doc_id}` without `corpus` → **a list** (one document per corpus holding
+  the `doc_id`), not an object; with `corpus`, one object as before.
+- An older `vaultctl` against the new API crashes on `get` (it expects an object): upgrade
+  `vaultctl` with the API.
+- `/stats/summary.by_doc_type` is now a **top 20 per corpus**, each item carrying its `corpus`
+  (it was a top 20 over every corpus summed).
+- `GET /documents/{doc_id}/file` reads `CORPUS_ROOTS` + `local_path`; `RAW_DATA_DIR` is gone (see
+  the deploy notes for the NAS).
+- vault-query 0.5.0 (`get_document` returns a list, `DocTypeNeedsCorpus`, the four new columns)
+  needs the new schema (the `vocabulary` table, the new columns).
+
+#### Deploy notes (2026-11 documents contract)
+
+- **Order**: deploy the tree and run the ingestion first (it applies the train: `vocabulary`,
+  the new columns and keys), then restart the API, then bump the MCP server's vault-query pin
+  to 0.5.0. An API or MCP on 0.5.0 against the old schema fails on the missing table/columns.
+  The data-orchestrator goes with it (its `ON CONFLICT` key, see
+  [Table `rag_ingestions`](#table-rag_ingestions)).
+- **`.env` rename**: `RAW_DIR` (which pointed at `data/raw`) is replaced by
+  `CENTRAL_BANK_DATA_DIR`, the central-bank **data root** (the directory holding `raw/`),
+  required by compose. A stale `RAW_DIR` is ignored.
+- **NAS api**: it needs `CORPUS_ROOTS=central-bank=/cbdata` (the compose default) **and** the
+  data root mounted at `/cbdata` (`${CENTRAL_BANK_DATA_DIR}:/cbdata:ro`). Without the variable
+  every download is a 404 naming `CORPUS_ROOTS` (WARNING at startup: downloads disabled);
+  without the mount, a startup WARNING says the root is not an existing directory and every
+  download is a 404.
+- **Company ingestion** (`ingestion-company`, profile `company`): both ingestion services build
+  the same image tag (`vault-ingestion:local`), so one `docker compose build` refreshes both.
+  Dockge only runs `up`, which skips a profile. Two ways to run it on the NAS:
+  - `COMPOSE_PROFILES=company` in the stack's environment: every Démarrer then starts both
+    ingestions. They serialise only on the DDL train: each run takes the global `vault-ddl`
+    advisory lock around the train alone, releases it, then takes its own `vault-ingest-<corpus>`
+    lock, so the two documents passes run in parallel (`ingestion/ingest.py`, `main`).
+  - Or a one-shot from a shell: `docker compose run --rm ingestion-company`.
+- **`COMPANY_MANIFEST_DIR`** is optional: compose commands work without it. Unset, the company
+  service mounts the empty `/var/empty` and, with `REQUIRE_MANIFESTS=1` (set on that service),
+  exits 1 before connecting with `No .jsonl manifest files found under /data and
+  REQUIRE_MANIFESTS is set` instead of a successful run of 0 rows. `REQUIRE_MANIFESTS` (1/true/
+  yes, 0/false/no; default off) works for any ingestion service; the central-bank one keeps the
+  historical behaviour (no manifest = a WARNING, the train and producer-file passes still run).
+
 ### Migration (2026-11 bad_content per source)
 
 Additive. `runs_sources` gains `bad_content`; `source_health` gains `source_bad_content_7d` and
@@ -474,9 +522,12 @@ Identity is `(corpus, doc_id)` (documents contract): a `doc_id` is unique within
 - `GET /documents/{doc_id}/file` serves `<corpus root>/<local_path>`, one root per corpus from
   `CORPUS_ROOTS` (`central-bank=/cbdata,company=/companydata`; compose default
   `central-bank=/cbdata`, the mount of `CENTRAL_BANK_DATA_DIR`). The value is checked at startup:
-  corpus names are contract codes, roots absolute, each corpus once; anything else stops the
-  API. The resolved file must stay under its root (`..`, an absolute path or a symlink leading
-  out: 404 `Invalid file path`); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
+  corpus names are contract codes, each corpus once, roots absolute, not `/`, without `..`,
+  whitespace, control characters or `;`; anything else stops the API. A root that is not an
+  existing directory is only a startup WARNING (a mount may come later): its downloads are 404
+  until it is there. The resolved file must stay under its root (`..`, an absolute path or a
+  symlink leading out: 404 `Invalid file path`, as is a path no file can have: a component past
+  255 bytes, the whole past 4096); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
   `corpus` is required (400) when the `doc_id` exists in several corpora. `RAW_DATA_DIR` and
   the split on the `raw` path component are gone.
 - **Transition note.** The ingestion now stores `local_path` without the old `data/` prefix
