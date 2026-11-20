@@ -436,6 +436,51 @@ def test_an_invalid_vocabulary_fails_the_run_before_connecting(monkeypatch, tmp_
     assert any("vocabulary" in r.getMessage() for r in caplog.records)
 
 
+# --- REQUIRE_MANIFESTS: no manifest is a failure where one is expected -------------
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_require_manifests_fails_a_run_that_finds_none_before_connecting(
+    monkeypatch, tmp_path, caplog, value
+):
+    def connect(*_a, **_k):
+        raise _Connected()
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    monkeypatch.setenv("REQUIRE_MANIFESTS", value)
+    monkeypatch.setenv("MANIFEST_GLOBS", "manifest/*.jsonl")
+    monkeypatch.setattr(ingest.psycopg2, "connect", connect)
+    with caplog.at_level(logging.ERROR, logger="ingest"), pytest.raises(SystemExit) as exc:
+        ingest.main(corpus="company", data_dir=str(tmp_path))
+    assert exc.value.code == 1
+    assert any("REQUIRE_MANIFESTS" in r.getMessage() and str(tmp_path) in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "no"])
+def test_without_require_manifests_no_manifest_is_only_a_warning(monkeypatch, tmp_path, value):
+    def connect(*_a, **_k):
+        raise _Connected()
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    if value is None:
+        monkeypatch.delenv("REQUIRE_MANIFESTS", raising=False)
+    else:
+        monkeypatch.setenv("REQUIRE_MANIFESTS", value)
+    monkeypatch.setattr(ingest.psycopg2, "connect", connect)
+    with pytest.raises(_Connected):              # went on to connect: no early exit
+        ingest.main(corpus=CB, data_dir=str(tmp_path))
+
+
+def test_a_malformed_require_manifests_is_a_settings_error(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused/never-dialed")
+    monkeypatch.setenv("REQUIRE_MANIFESTS", "maybe")
+    with caplog.at_level(logging.ERROR, logger="ingest"), pytest.raises(SystemExit) as exc:
+        ingest.main(corpus=CB, data_dir=str(tmp_path))
+    assert exc.value.code == 1
+    assert "REQUIRE_MANIFESTS" in caplog.text
+
+
 class _FakeCursor:
     def __init__(self, conn):
         self.conn = conn

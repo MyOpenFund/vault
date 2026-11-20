@@ -1068,6 +1068,28 @@ def _warn_unread_root_files(data_dir):
         )
 
 
+REQUIRE_MANIFESTS_ENV = "REQUIRE_MANIFESTS"
+
+
+def parse_require_manifests(env):
+    """REQUIRE_MANIFESTS -> bool: 1/true/yes or 0/false/no, unset/empty = False.
+
+    False (the default) keeps the historical behaviour: a run that finds no
+    manifest only warns and still runs the DDL train and the producer-file
+    passes. True makes it a failure (exit 1 before connecting): for a service
+    whose only job is a corpus's manifests (`ingestion-company`), an empty or
+    unmounted data root must not look like a successful run of 0 rows.
+    """
+    raw = env.get(REQUIRE_MANIFESTS_ENV)
+    value = (raw or "").strip(_ASCII_SPACE).lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("", "0", "false", "no"):
+        return False
+    raise IngestSettingsError(
+        f"{REQUIRE_MANIFESTS_ENV}={raw!r}: expected 1/true/yes or 0/false/no (or unset)")
+
+
 def find_manifest_files(data_dir, env):
     """The manifest files of this run, sorted; the layout used is logged."""
     patterns = parse_manifest_globs(env.get("MANIFEST_GLOBS"))
@@ -1450,6 +1472,7 @@ def main(*, corpus=None, data_dir=None):
     try:
         gate = schema_gate.load_settings(os.environ)
         sweep_max_fraction = parse_sweep_fraction(os.environ)
+        require_manifests = parse_require_manifests(os.environ)
         jsonl_files = find_manifest_files(data_dir, os.environ)
         vocabulary_path = ingest_vocabulary.vocabulary_path(data_dir, os.environ)
         vocabulary = ingest_vocabulary.load(vocabulary_path, default_corpus)
@@ -1458,6 +1481,11 @@ def main(*, corpus=None, data_dir=None):
         log.error(str(exc))
         sys.exit(1)
 
+    if not jsonl_files and require_manifests:
+        log.error(f"No .jsonl manifest files found under {data_dir} and "
+                  f"{REQUIRE_MANIFESTS_ENV} is set: is the {default_corpus} data root "
+                  "mounted? Exiting 1 before connecting")
+        sys.exit(1)
     if jsonl_files:
         log.info(f"Found {len(jsonl_files)} .jsonl file(s); corpus default: {default_corpus}")
     else:
