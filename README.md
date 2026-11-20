@@ -25,7 +25,8 @@ no OCR, no content indexing — titles, dates, document types, provenance, file 
 | Service | Role | Port |
 |---|---|---|
 | `postgres` | the vault itself (PostgreSQL 16) | internal only (publishable on one interface — see [Access & roles](#access--roles)) |
-| `ingestion` | one-shot manifest → Postgres sync (run per corpus) | — |
+| `ingestion` | one-shot manifest → Postgres sync, central-bank corpus | — |
+| `ingestion-company` | the same, `CORPUS=company`, over a copy of the company data root (profile `company`: `docker compose run --rm ingestion-company`) | — |
 | `api` | FastAPI read API | 8000 |
 | `metabase` | dashboards over the vault | 3000 |
 
@@ -422,8 +423,30 @@ plus a certificate on the host is the next hardening step.
 ## API
 
 `GET /health` · `GET /documents` (filters: corpus, source, type, dates, pagination) ·
-`GET /documents/{doc_id}` · `GET /documents/{doc_id}/file` (serves the raw file from the
-read-only mount) · `GET /stats/summary` (totals, by_corpus, by_source_code)
+`GET /documents/{doc_id}?corpus=` · `GET /documents/{doc_id}/file?corpus=` · `GET /stats/summary`
+(totals, by_corpus, by_source_code, by_doc_type per corpus)
+
+Identity is `(corpus, doc_id)` (documents contract): a `doc_id` is unique within its corpus only.
+
+- `GET /documents/{doc_id}?corpus=X` returns one document (404 if X has none);
+  without `corpus` it returns **a list**, one document per corpus holding that `doc_id`
+  (404 when there is none). Rows carry `date_precision`, `date_kind`, `entity_scheme`,
+  `entity_value`.
+- A `doc_type` filter without `corpus` is a **400** whose detail starts `doc_type needs corpus`
+  and lists each corpus's codes with their labels (vault-query's message): central-bank `A1`
+  and company `A1` share a name, not a meaning.
+- `GET /documents/{doc_id}/file` serves `<corpus root>/<local_path>`, one root per corpus from
+  `CORPUS_ROOTS` (`central-bank=/cbdata,company=/companydata`; compose default
+  `central-bank=/cbdata`, the mount of `CENTRAL_BANK_DATA_DIR`). The value is checked at startup:
+  corpus names are contract codes, roots absolute, each corpus once; anything else stops the
+  API. The resolved file must stay under its root (`..`, an absolute path or a symlink leading
+  out: 404 `Invalid file path`); a corpus without a root is a 404 naming `CORPUS_ROOTS`;
+  `corpus` is required (400) when the `doc_id` exists in several corpora. `RAW_DATA_DIR` and
+  the split on the `raw` path component are gone.
+- **Transition note.** The ingestion now stores `local_path` without the old `data/` prefix
+  (`raw/...`). Rows ingested before the deploy still hold `data/raw/...` and are a 404 (`File
+  not found on disk`) until the first post-deploy ingestion of their corpus rewrites every live
+  row; no compatibility code exists for them, so run the ingestion right after deploying.
 
 The document and stats routes read through `vault-query` (below); the image installs it from
 the same checkout, which is why `api`'s build context is the repo root (`api/Dockerfile`).
@@ -440,6 +463,8 @@ pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdire
 `<sha>` is the commit to pin (a merge commit on `master`); pin a SHA rather than a branch so a
 consumer's queries only change when it bumps the pin.
 
+- Vocabulary: `list_vocabulary(conn, corpus=None, *, kind=None, limit=1000)` — the codes each
+  corpus declares (`vocabulary` table: corpus, kind, code, label, family).
 - Documents: `search_documents` (filters, sort, paging, total; optional column projection —
   `SEARCH_COLUMNS` for result lists), `get_document`.
 - Counts: `corpus_stats` (live total plus per-field groups, one statement).
@@ -453,6 +478,21 @@ Guarantees: read-only — no function writes or commits the caller's transaction
 takes an open psycopg2 connection that the caller owns (opens, closes, and chooses the role —
 `vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
 "idle in transaction" holds locks that block the ingester's DDL train.
+
+Changes in 0.5.0 (breaking — bump the pin together with the vault deploy of the documents
+contract; the MCP server's tools must follow):
+
+- `get_document(conn, doc_id, corpus=None)` returns a **list**: with `corpus`, zero or one row;
+  without, one row per corpus holding the `doc_id`, ordered by corpus. Unknown: `[]` (was `None`).
+- A `doc_type` filter without `corpus` (`search_documents`, `build_where_clause`) and
+  `corpus_stats(group_by="doc_type")` without `corpus` raise `DocTypeNeedsCorpus` (an
+  `InvalidQuery`, so a `ValueError`); the message starts `doc_type needs corpus` and lists,
+  per corpus, `code = label` from `vocabulary`, or the codes in use for a corpus with no
+  vocabulary loaded. Value checks (NUL, dates, bounds) still come first, without SQL.
+- Rows carry the four contract columns `date_precision`, `date_kind`, `entity_scheme`,
+  `entity_value` (in `ALL_COLUMNS`; not in `SEARCH_COLUMNS`). Needs the 2026-11 schema
+  (`vocabulary` table, new columns).
+- New `list_vocabulary`, `VOCABULARY_KINDS`, `DocTypeNeedsCorpus`.
 
 Changes in 0.4.0 (additive): `RUN_COLUMNS` gains `bad_content`, so every `runs_status` row
 carries it (an integer, NULL when the producer did not report it). Needs a vault deployed with
