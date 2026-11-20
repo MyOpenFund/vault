@@ -218,7 +218,8 @@ The ingestion checks every manifest row against the [documents contract](contrac
   the backlog views join on both. **Transition:** a unique index
   `rag_ingestions_doc_collection_transition (doc_id, collection)` keeps the deployed
   data-orchestrator's `ON CONFLICT (doc_id, collection)` working until its update (valid while
-  collections are per corpus; removed by the cleanup release).
+  collections are per corpus; removed in code by the cleanup PR's train, never by hand — see
+  [Table `rag_ingestions`](#table-rag_ingestions)).
 - New tables `vocabulary` (the corpus vocabulary, full replace per corpus) and
   `ingestion_refusals` (the refused rows of each corpus's last run, replaced every run;
   `value` is the repr of the refused value cut at 200 characters).
