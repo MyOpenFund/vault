@@ -33,6 +33,14 @@ def test_spaces_around_entries_are_ignored():
 
 
 @pytest.mark.parametrize("text, match", [
+    ("central-bank=/cb data", "whitespace"),
+    ("central-bank=/cb\tdata", "control"),
+    ("central-bank=/cb\x00data", "control"),
+    ("central-bank=/cb\x7fdata", "control"),
+    ("central-bank=/cb\u0085data", "control"),
+    ("central-bank=/cb;rm", ";"),
+    ("central-bank=/", "filesystem root"),
+    ("central-bank=//", "filesystem root"),
     ("central-bank", "name=/absolute/path"),
     ("=/cbdata", "corpus name"),
     ("central bank=/cbdata", "corpus name"),
@@ -95,9 +103,32 @@ def test_a_symlink_staying_under_the_root_is_followed(root):
     "",
     ".",
     "raw/..",
+    "raw/" + "a" * 256 + ".pdf",    # a component past NAME_MAX (255 bytes)
+    "raw/" + "a/" * 2100 + "x.pdf",  # a path past PATH_MAX (4096 bytes)
+    "raw/" + "é" * 128 + ".pdf",    # 128 characters, 260 bytes
+    "raw/a\x00b.pdf",               # the OS refuses it (ValueError)
 ])
 def test_a_path_leaving_the_root_or_naming_it_is_refused(root, local_path):
     assert files.resolve_under_root(root, local_path) is None
+
+
+@pytest.mark.parametrize("error", [OSError(36, "File name too long"),
+                                   RuntimeError("Symlink loop"), ValueError("embedded null")])
+def test_a_path_the_os_cannot_resolve_is_refused(root, monkeypatch, error):
+    def boom(self, *a, **k):
+        raise error
+    monkeypatch.setattr(files.Path, "resolve", boom)
+    assert files.resolve_under_root(root, "raw/us/C1/2010/a.pdf") is None
+
+
+def test_is_file_is_false_when_the_os_cannot_answer(root, monkeypatch):
+    assert files.is_file(root / "raw/us/C1/2010/a.pdf")
+    assert not files.is_file(root / "raw/us/C1/2010/missing.pdf")
+
+    def boom(self):
+        raise OSError(36, "File name too long")
+    monkeypatch.setattr(files.Path, "is_file", boom)
+    assert not files.is_file(root / "raw/us/C1/2010/a.pdf")
 
 
 def test_a_root_that_is_itself_a_symlink_still_contains(tmp_path, root):
@@ -116,3 +147,14 @@ def test_a_legacy_data_prefixed_path_is_not_rewritten(root):
     resolved = files.resolve_under_root(root, "data/raw/us/C1/2010/a.pdf")
     assert resolved == (root / "data/raw/us/C1/2010/a.pdf").resolve()
     assert not resolved.exists()
+
+
+# --- startup warning: a root that is not a directory --------------------------------
+
+def test_missing_roots_lists_the_roots_that_are_not_directories(tmp_path):
+    (tmp_path / "cb").mkdir()
+    (tmp_path / "file").write_text("x", encoding="utf-8")
+    roots = {"central-bank": tmp_path / "cb", "company": tmp_path / "nope",
+             "other": tmp_path / "file"}
+    assert files.missing_roots(roots) == {"company": tmp_path / "nope",
+                                          "other": tmp_path / "file"}

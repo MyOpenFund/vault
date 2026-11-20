@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import db
+import files
 import main
 
 CB = {"id": 1, "doc_id": "d1", "corpus": "central-bank", "title": "cb",
@@ -215,6 +216,24 @@ def test_a_path_leaving_the_root_is_a_404(client, monkeypatch, roots, local_path
     assert r.json()["detail"] == "Invalid file path"
 
 
+@pytest.mark.parametrize("local_path", ["raw/" + "a" * 300 + ".pdf", "raw/" + "a/" * 2100 + "x"])
+def test_an_over_long_path_is_a_404_not_a_500(client, monkeypatch, roots, local_path):
+    monkeypatch.setattr(main, "vq_get_document",
+                        lambda _c, _id, corpus=None: [{**CB, "local_path": local_path}])
+    r = client.get("/documents/d1/file")
+    assert r.status_code == 404
+
+
+def test_an_os_error_on_the_file_check_is_a_404(client, monkeypatch, roots):
+    def boom(self):
+        raise OSError(36, "File name too long")
+    monkeypatch.setattr(files.Path, "is_file", boom)
+    monkeypatch.setattr(main, "vq_get_document", lambda _c, _id, corpus=None: [CB])
+    r = client.get("/documents/d1/file")
+    assert r.status_code == 404
+    assert r.json()["detail"] == f"File not found on disk: {CB['local_path']}"
+
+
 def test_a_missing_file_is_a_404_naming_the_path(client, monkeypatch, roots):
     monkeypatch.setattr(main, "vq_get_document",
                         lambda _c, _id, corpus=None: [{**CB, "local_path": "data/raw/us/a.pdf"}])
@@ -244,6 +263,18 @@ def test_startup_reads_corpus_roots(monkeypatch):
     monkeypatch.setenv("CORPUS_ROOTS", "central-bank=/cbdata,company=/companydata")
     with TestClient(main.app):
         assert set(main.CORPUS_ROOTS) == {"central-bank", "company"}
+
+
+def test_startup_warns_about_a_root_that_is_not_a_directory(monkeypatch, caplog, tmp_path):
+    monkeypatch.setattr(db.psycopg2, "connect", lambda *a, **k: type("C", (), {"close": lambda s: None})())
+    monkeypatch.setattr(main, "CORPUS_ROOTS", {})
+    (tmp_path / "cb").mkdir()
+    monkeypatch.setenv("CORPUS_ROOTS", f"central-bank={tmp_path / 'cb'},company={tmp_path / 'nope'}")
+    with caplog.at_level(logging.WARNING), TestClient(main.app):
+        pass
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("company" in w and "not an existing directory" in w for w in warnings), warnings
+    assert not any("central-bank" in w and "not an existing directory" in w for w in warnings)
 
 
 def test_startup_refuses_a_malformed_corpus_roots_before_connecting(monkeypatch, caplog):

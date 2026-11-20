@@ -9,7 +9,9 @@ from vault_query import InvalidQuery, corpus_stats, get_document as vq_get_docum
 from vault_query.filters import check_text
 
 from db import get_conn, log, verify_connection, SORTABLE_FIELDS
-from files import ENV_NAME as CORPUS_ROOTS_ENV, parse_corpus_roots, resolve_under_root
+from files import (
+    ENV_NAME as CORPUS_ROOTS_ENV, is_file, missing_roots, parse_corpus_roots, resolve_under_root,
+)
 from models import CorpusCountItem, Document, DocumentList, StatsSummary, CountItem
 
 # {corpus: root directory} for file downloads, read from CORPUS_ROOTS at
@@ -44,6 +46,11 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"invalid {CORPUS_ROOTS_ENV}: {reason}")
     if not CORPUS_ROOTS:
         log.warning("vault API: %s is empty, file downloads are disabled", CORPUS_ROOTS_ENV)
+    # Not fatal: a mount can come up after the API, and metadata is still
+    # served. But until it does, every download of that corpus is a 404.
+    for name, root in missing_roots(CORPUS_ROOTS).items():
+        log.warning("vault API: %s root of %r, %s, is not an existing directory: its "
+                    "file downloads are 404 until it is mounted", CORPUS_ROOTS_ENV, name, root)
     verify_connection()
     yield
 
@@ -170,7 +177,7 @@ def download_document_file(doc_id: str, corpus: Optional[str] = CORPUS_QUERY):
     file_path = resolve_under_root(root, row["local_path"])
     if file_path is None:
         raise HTTPException(404, "Invalid file path")
-    if not file_path.is_file():
+    if not is_file(file_path):
         raise HTTPException(404, f"File not found on disk: {row['local_path']}")
 
     return FileResponse(
