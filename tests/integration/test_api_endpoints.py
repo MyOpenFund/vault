@@ -11,6 +11,7 @@ The app is pointed at the throwaway Postgres by patching `db.DATABASE_URL`
 (read inside `get_conn` on every call) rather than by mocking the driver.
 """
 
+import psycopg2
 import pytest
 
 from .conftest import make_doc, run_ingest, write_manifest
@@ -82,12 +83,24 @@ def download_db(clean_db, tmp_path, monkeypatch):
         "corpus.jsonl",
         [
             make_doc("good", local_path="data/raw/us/C1/2010/good.pdf"),
-            make_doc("traversal", local_path="data/raw/../../etc/passwd"),
-            make_doc("absolute", local_path="/etc/passwd"),
             make_doc("symlinked", local_path="data/raw/link/secret.txt"),
         ],
     )
     run_ingest(monkeypatch, clean_db, manifests)
+    # The documents contract refuses these two at ingestion (bad_local_path),
+    # so they are written by hand: the API must stay safe against a stored
+    # row the ingestion would refuse today (a row written before the
+    # contract, or by hand).
+    conn = psycopg2.connect(clean_db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO documents (doc_id, corpus, title, local_path) VALUES "
+                "('traversal', 'central-bank', 'doc traversal', 'data/raw/../../etc/passwd'), "
+                "('absolute', 'central-bank', 'doc absolute', '/etc/passwd')")
+        conn.commit()
+    finally:
+        conn.close()
 
     monkeypatch.setattr(db, "DATABASE_URL", clean_db)
     monkeypatch.setattr(api_main, "RAW_DATA_DIR", raw_dir.resolve())

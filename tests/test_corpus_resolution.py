@@ -1,4 +1,4 @@
-from ingest import resolve_corpus
+from common import resolve_corpus
 
 
 def test_absent_manifest_field_uses_default():

@@ -30,11 +30,16 @@ def _ingest(monkeypatch, pg_url, tmp_path, doc):
 
 def test_extra_is_refreshed_on_reingest(clean_db, tmp_path, monkeypatch):
     # I1 — the #8/#2 regression: enrichment stamped later must reach the vault.
-    _ingest(monkeypatch, clean_db, tmp_path, make_doc("d1", date_precision="year"))
-    assert _extra(clean_db, "d1") == {"date_precision": "year"}
+    # (date_precision used to be an extra; it is a column since the documents
+    # contract, so it is the column that is refreshed, and it leaves extra.)
+    _ingest(monkeypatch, clean_db, tmp_path,
+            make_doc("d1", date="2010-01-01", date_precision="year", date_source="x"))
+    assert _extra(clean_db, "d1") == {"date_source": "x"}
     _ingest(monkeypatch, clean_db, tmp_path,
             make_doc("d1", date_precision="day", repec_handle="RePEc:boj:x"))
-    assert _extra(clean_db, "d1") == {"date_precision": "day", "repec_handle": "RePEc:boj:x"}
+    assert _extra(clean_db, "d1") == {"repec_handle": "RePEc:boj:x"}
+    assert _fetch(clean_db, "SELECT date_precision FROM documents WHERE doc_id = %s",
+                  ("d1",)) == [("day",)]
 
 
 def test_conflicting_key_type_last_write_wins(clean_db, tmp_path, monkeypatch):

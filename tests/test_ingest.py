@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 
-from ingest import parse_line
+from ingest import UPSERT_COLUMNS, RunReport, parse_line
 
 RUN_TS = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
 CORPUS = "central-bank"
@@ -23,12 +23,19 @@ def make_line(**overrides):
     return json.dumps(obj)
 
 
+def as_dict(row):
+    """An upsert row by column name (UPSERT_COLUMNS order)."""
+    return dict(zip(UPSERT_COLUMNS, row, strict=True))
+
+
 def test_valid_line_parses():
     row = parse_line(make_line(), "f.jsonl", 1, RUN_TS, CORPUS)
     assert row is not None
     assert row[0] == "c184d44f298ff622"  # doc_id
     assert row[1] == "central-bank"  # corpus (from default)
     assert row[2] == "us"  # source_code (mapped from bank_code)
+    # transition: the data/ prefix of local_path is dropped (contract)
+    assert as_dict(row)["local_path"] == "raw/us/C1/2010/c184d44f298ff622.pdf"
 
 
 def test_source_code_field_takes_precedence_over_bank_code():
@@ -46,14 +53,15 @@ def test_manifest_corpus_field_matching_env_is_accepted():
     assert row[1] == "central-bank"
 
 
-def test_contradicting_corpus_rejects_line_and_counts():
-    counters = {"corpus_conflict": 0}
+def test_contradicting_corpus_is_a_refusal():
+    # Before the contract: a skipped line. Now a corpus_conflict refusal.
+    report = RunReport(CORPUS, RUN_TS)
     row = parse_line(
-        make_line(corpus="company"), "f.jsonl", 1, RUN_TS, CORPUS,
-        counters=counters,
+        make_line(corpus="company"), "f.jsonl", 1, RUN_TS, CORPUS, report=report,
     )
     assert row is None
-    assert counters["corpus_conflict"] == 1
+    assert report.refusals == {"corpus_conflict": 1}
+    assert report.refused_rows == 1
 
 
 def test_corpus_and_source_code_do_not_leak_into_extra():
@@ -64,7 +72,7 @@ def test_corpus_and_source_code_do_not_leak_into_extra():
     assert row[-1] is None  # no extra
 
 
-DOCUMENT_URL = 5  # row position of document_url (after title)
+DOCUMENT_URL = UPSERT_COLUMNS.index("document_url")
 
 
 def test_document_url_fills_the_column():
@@ -137,8 +145,9 @@ def test_unknown_fields_go_to_extra():
 
 
 def test_empty_date_becomes_none():
-    row = parse_line(make_line(date=""), "f.jsonl", 1, RUN_TS, CORPUS)
-    assert row[7] is None  # date position (shifted by corpus/source_code)
+    # year goes with the date: a year without a date is year_mismatch.
+    row = parse_line(make_line(date="", year=None), "f.jsonl", 1, RUN_TS, CORPUS)
+    assert as_dict(row)["date"] is None
 
 
 # --- documents-scan exclusion of cadence files ---------------------------
@@ -217,33 +226,39 @@ def test_lock_keys_are_distinct_per_corpus_and_from_the_ddl_lock():
 # dedupe_rows compares Python values while Postgres compares TEXT: 5 and "5"
 # are distinct to Python but the same key once adapted, so they still
 # crashed the upsert; 1 and true are equal in Python; [1] is unhashable. A
-# doc_id that is not a non-empty string is therefore rejected at parse time.
+# doc_id that is not a non-empty string is therefore refused at parse time:
+# before the contract a skipped line counted `invalid_doc_id`, now a contract
+# refusal (bad_text, missing_doc_id) that skips the sweep and fails the run.
 
 import pytest  # noqa: E402
 
 
-@pytest.mark.parametrize("bad", [5, 0, 1.5, True, False, [1], {"a": 1}, "", "a\x00b"])
-def test_non_string_or_empty_doc_id_is_rejected_and_counted(bad, caplog):
+@pytest.mark.parametrize("bad, reason", [
+    (5, "bad_text"), (0, "bad_text"), (1.5, "bad_text"), (True, "bad_text"),
+    (False, "bad_text"), ([1], "bad_text"), ({"a": 1}, "bad_text"),
+    ("", "missing_doc_id"), ("a\x00b", "bad_text"), ("  ", "bad_text"),
+])
+def test_non_string_or_empty_doc_id_is_refused_and_logged(bad, reason, caplog):
     import logging
-    counters = {}
+    report = RunReport(CORPUS, RUN_TS)
     with caplog.at_level(logging.WARNING, logger="ingest"):
-        row = parse_line(make_line(doc_id=bad), "f.jsonl", 7, RUN_TS, CORPUS, counters)
+        row = parse_line(make_line(doc_id=bad), "f.jsonl", 7, RUN_TS, CORPUS, report=report)
     assert row is None
-    assert counters == {"invalid_doc_id": 1}
+    assert report.refusals == {reason: 1}
     (record,) = caplog.records
-    assert "f.jsonl:7" in record.getMessage() and "doc_id" in record.getMessage()
+    assert record.getMessage().startswith(f"f.jsonl:7 {reason} doc_id=")
 
 
 @pytest.mark.parametrize("missing", ["absent", None])
-def test_missing_doc_id_is_counted_too(missing):
+def test_missing_doc_id_is_refused_too(missing):
     obj = json.loads(make_line())
     if missing == "absent":
         del obj["doc_id"]
     else:
         obj["doc_id"] = None
-    counters = {}
-    assert parse_line(json.dumps(obj), "f.jsonl", 1, RUN_TS, CORPUS, counters) is None
-    assert counters == {"invalid_doc_id": 1}
+    report = RunReport(CORPUS, RUN_TS)
+    assert parse_line(json.dumps(obj), "f.jsonl", 1, RUN_TS, CORPUS, report=report) is None
+    assert report.refusals == {"missing_doc_id": 1}
 
 
 @pytest.mark.parametrize("ok", ["5", " padded ", "ünïcode-ид", "a" * 500])
@@ -262,9 +277,9 @@ def test_valid_json_that_is_not_an_object_is_skipped(line, caplog):
 def test_a_huge_invalid_doc_id_is_logged_truncated(caplog):
     import ingest
     huge = list(range(10_000))
-    line = json.dumps({"doc_id": huge})
+    line = make_line(doc_id=huge)
     with caplog.at_level("WARNING", logger="ingest"):
         assert ingest.parse_line(line, "f.jsonl", 1, None, "central-bank") is None
     (message,) = [r.getMessage() for r in caplog.records]
-    assert len(message) < ingest.INVALID_DOC_ID_LOG_CHARS + 200
+    assert len(message) < ingest.REFUSAL_VALUE_CHARS + 100
     assert "…" in message

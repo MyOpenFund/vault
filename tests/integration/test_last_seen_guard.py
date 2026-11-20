@@ -12,8 +12,10 @@ pytestmark = pytest.mark.integration
 def _upsert(pg_url, run_ts):
     import ingest
     row = ingest.parse_line(
-        '{"doc_id": "x", "bank_code": "us", "doc_type": "C1", "title": "t"}',
+        '{"doc_id": "x", "bank_code": "us", "doc_type": "C1", "title": "t", '
+        '"language": "en", "provenance": "bis_index"}',
         "m.jsonl", 1, run_ts, "central-bank")
+    assert row is not None
     conn = psycopg2.connect(pg_url)
     with conn.cursor() as cur:
         execute_values(cur, ingest.UPSERT_SQL, [row])
