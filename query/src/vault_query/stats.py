@@ -2,6 +2,7 @@
 from psycopg2.extras import RealDictCursor
 
 from .filters import FILTERABLE_FIELDS, InvalidQuery, check_int, check_text
+from .vocabulary import doc_type_needs_corpus
 
 # Interpolated into GROUP BY: this set is the injection guard. Kept in lock-step
 # with FILTERABLE_FIELDS: whatever a caller can filter on, it can group by.
@@ -17,11 +18,17 @@ def corpus_stats(conn, group_by, *, corpus=None, limit=200):
 
     Total and groups come from one statement (a window total over the grouped
     rows): one scan, one snapshot, so they always agree.
+
+    Grouping by `doc_type` needs `corpus` (a code means something only within
+    its corpus): without it, DocTypeNeedsCorpus listing each corpus's codes
+    (one bounded read, after the argument checks).
     """
     if group_by not in GROUPABLE_FIELDS:
         raise InvalidQuery(f"group_by must be one of {sorted(GROUPABLE_FIELDS)}")
     check_int("limit", limit, 1)
     check_text("corpus", corpus)
+    if group_by == "doc_type" and corpus is None:
+        raise doc_type_needs_corpus(conn)
     where, params = "WHERE deleted_at IS NULL", []
     if corpus is not None:
         where += " AND corpus = %s"
