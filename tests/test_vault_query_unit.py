@@ -752,7 +752,7 @@ def test_list_vocabulary_refuses_bad_arguments_before_sql(kwargs, match):
         list_vocabulary(_NoConnection(), **kwargs)
 
 
-def test_package_version_is_0_5_1():
+def test_package_version_is_0_6_0():
     from importlib.metadata import version
 
     assert version("vault-query") == "0.6.0"
