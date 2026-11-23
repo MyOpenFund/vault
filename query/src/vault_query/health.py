@@ -91,7 +91,7 @@ def _offset_fits_postgres(value):
     return abs(offset) <= POSTGRES_MAX_UTC_OFFSET and offset.microseconds == 0
 
 
-def _check_since(since):
+def _check_since(since, name="since"):
     """None, a date or datetime, or a str in the `since` grammar; else InvalidQuery.
 
     A str must match SINCE_GRAMMAR exactly (ASCII digits, upper-case `T` and
@@ -120,7 +120,7 @@ def _check_since(since):
             if _offset_fits_postgres(parsed):
                 return
     raise InvalidQuery(
-        f"since must be an ISO-8601 timestamp {SINCE_GRAMMAR} with a UTC offset of "
+        f"{name} must be an ISO-8601 timestamp {SINCE_GRAMMAR} with a UTC offset of "
         f"at most +-15:59, or a date / datetime"
     )
 
@@ -129,6 +129,12 @@ def _since_clause(clauses, params, since):
     if since is not None:
         clauses.append("finished_at >= %s")
         params.append(since)
+
+
+def _until_clause(clauses, params, until):
+    if until is not None:
+        clauses.append("finished_at <= %s")
+        params.append(until)
 
 
 def _bound_samples(samples, max_samples, max_chars):
@@ -142,7 +148,7 @@ def _bound_samples(samples, max_samples, max_chars):
     return [s[:max_chars] if isinstance(s, str) else s for s in (samples or [])[:max_samples]]
 
 
-def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
+def runs_status(conn, *, corpus=None, source_code=None, since=None, until=None, limit=50,
                 max_error_samples=DEFAULT_MAX_ERROR_SAMPLES, max_text_chars=DEFAULT_MAX_TEXT_CHARS):
     """One row per (run, source), newest first.
 
@@ -151,8 +157,10 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
     naive value is read in the session time zone). Anything else (a week date, a
     space separator, an out-of-range offset, a number) is InvalidQuery before
     SQL; an accepted value reaches SQL unchanged.
+    `until` is the inclusive upper bound of finished_at, same grammar: the newest
+    rows finished at or before it, so a `limit` page can start in the past.
     Runs still in flight (NULL finished_at) are listed last, and excluded
-    whenever `since` is given.
+    whenever `since` or `until` is given.
 
     A run with no source entry (`sources` NULL, empty or not an array) has no
     row here: use recent_runs for the run grain.
@@ -164,8 +172,10 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
     _check_at_least_one(limit=limit, max_error_samples=max_error_samples,
                         max_text_chars=max_text_chars)
     _check_since(since)
+    _check_since(until, "until")
     clauses, params = _where(corpus, source_code)
     _since_clause(clauses, params, since)
+    _until_clause(clauses, params, until)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     rows = _fetch(
         conn,
@@ -178,7 +188,7 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, limit=50,
     return rows
 
 
-def recent_runs(conn, *, corpus=None, since=None, limit=50):
+def recent_runs(conn, *, corpus=None, since=None, until=None, limit=50):
     """One row per run, newest first, straight from `runs`.
 
     Run grain on purpose: a run whose `sources` is NULL, empty or not an array
@@ -187,12 +197,15 @@ def recent_runs(conn, *, corpus=None, since=None, limit=50):
 
     `since` bounds finished_at, same grammar and rules as runs_status (naive =
     session time zone); in-flight runs (NULL finished_at) come last and are
-    excluded when `since` is given.
+    excluded when `since` or `until` is given. `until` is the inclusive upper
+    bound, as in runs_status.
     """
     _check_at_least_one(limit=limit)
     _check_since(since)
+    _check_since(until, "until")
     clauses, params = _where(corpus)
     _since_clause(clauses, params, since)
+    _until_clause(clauses, params, until)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     return _fetch(
         conn,

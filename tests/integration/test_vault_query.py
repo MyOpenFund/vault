@@ -354,6 +354,18 @@ def test_in_flight_runs_come_last_and_drop_out_under_since(conn):
     assert [r["run_id"] for r in vq.recent_runs(conn, since=since)] == ["done"]
 
 
+def test_until_is_inclusive_and_pages_backwards(conn):
+    """`until` keeps the newest rows finished at or before it, so an old night is reachable under `limit`."""
+    for day in (1, 2, 3):
+        _insert_run(conn, f"d{day}", f"2026-10-0{day}T02:00:00Z", [{"source_code": "us"}])
+    _insert_run(conn, "live", None, [{"source_code": "us"}])
+    for fn in (vq.recent_runs, vq.runs_status):
+        assert [r["run_id"] for r in fn(conn, until="2026-10-02T02:00:00Z")] == ["d2", "d1"]
+        assert [r["run_id"] for r in fn(conn, until="2026-10-02T02:00:00Z", limit=1)] == ["d2"]
+        assert [r["run_id"] for r in fn(conn, since="2026-10-02T00:00:00Z", until="2026-10-02T23:00:00Z")] == ["d2"]
+        assert fn(conn, until="2026-09-01T00:00:00Z") == []
+
+
 def test_runs_status_bounds_error_samples(conn):
     """At most `max_error_samples` samples, each string cut to `max_text_chars`.
 
