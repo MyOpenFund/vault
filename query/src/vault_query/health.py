@@ -159,6 +159,7 @@ def runs_status(conn, *, corpus=None, source_code=None, since=None, until=None, 
     SQL; an accepted value reaches SQL unchanged.
     `until` is the inclusive upper bound of finished_at, same grammar: the newest
     rows finished at or before it, so a `limit` page can start in the past.
+    A bare date is its midnight (that day's later runs are excluded).
     Runs still in flight (NULL finished_at) are listed last, and excluded
     whenever `since` or `until` is given.
 

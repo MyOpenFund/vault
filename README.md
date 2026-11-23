@@ -671,7 +671,7 @@ takes an open psycopg2 connection that the caller owns (opens, closes, and choos
 "idle in transaction" holds locks that block the ingester's DDL train.
 
 Changes in 0.6.0: `runs_status` and `recent_runs` take `until`, the inclusive upper bound of
-`finished_at` (same grammar as `since`; runs in flight are excluded when it is given), so an old
+`finished_at` (same grammar as `since`, a bare date is its midnight; runs in flight are excluded when it is given), so an old
 night is reachable under `limit`.
 
 Changes in 0.5.1: `search_documents` breaks sort ties by `doc_id, corpus` (was `doc_id`): two
