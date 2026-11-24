@@ -62,7 +62,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Build
         run: |
-          pip install build==1.6.1 twine==6.2.0
+          pip install build==1.6.1 twine==7.0.0
           python -m build "$PKG_DIR" --outdir dist
           twine check --strict dist/*
       - name: Smoke install in a fresh venv
