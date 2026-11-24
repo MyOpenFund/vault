@@ -1,4 +1,4 @@
-# vault-contract
+# myopenfund-vault-contract
 
 Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
 

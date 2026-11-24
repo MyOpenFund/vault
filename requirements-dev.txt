@@ -1,5 +1,7 @@
 pytest==8.3.3
 pytest-timeout==2.3.1
+# test_packaging.py parses the workflows
+pyyaml==6.0.2
 psycopg2-binary==2.9.10
 fastapi==0.115.0
 httpx==0.27.2
@@ -15,4 +17,3 @@ click==8.1.8
 # The myopenfund-vault-contract package (contract/): the `documents` contract (field table,
 # vocabulary, row validation) and its tests. Same rule: run pip from the repo root.
 -e ./contract
-pyyaml==6.0.2

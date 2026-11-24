@@ -54,3 +54,30 @@ jobs:
         run: python -m pytest -q tests/test_contract_check.py tests/test_contract_fields.py tests/test_contract_package.py tests/test_contract_validate.py
       - name: Checker over the golden rows (Python 3.10)
         run: python .github/scripts/check_golden.py
+
+  # Publication check on every PR and push: build each distribution, run
+  # `twine check --strict`, install the wheel in a fresh venv away from the
+  # checkout and import it (contract: also read a golden file from the wheel).
+  # release.yml repeats this and adds the tag check and the upload.
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [query, contract]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and check the distribution
+        run: |
+          pip install build twine
+          python -m build "${{ matrix.package }}" --outdir dist
+          twine check --strict dist/*
+      - name: Smoke install in a fresh venv
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" "$GITHUB_WORKSPACE/.github/scripts/smoke_wheel.py" "vault_${{ matrix.package }}"
