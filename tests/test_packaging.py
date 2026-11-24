@@ -103,16 +103,19 @@ def test_release_workflow_publishes_through_environment():
 
 
 def test_actions_pinned_by_sha():
-    uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", RELEASE.read_text(), re.M)
-    assert uses
-    for ref in uses:
-        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", ref), ref
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "tests.yml").read_text())
+    texts = [RELEASE.read_text(), yaml.safe_dump(ci["jobs"]["package"])]
+    for text in texts:
+        uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", text, re.M)
+        assert uses
+        for ref in uses:
+            assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", ref), ref
 
 
 def test_tag_check_present():
     steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
     checks = [
-        i for i, s in enumerate(steps) if "GITHUB_REF_NAME" in s.get("run", "") and "exit 1" in s["run"]
+        i for i, s in enumerate(steps) if "tag_version" in s.get("run", "") and "exit 1" in s["run"]
     ]
     assert len(checks) == 1
     assert steps[checks[0]]["if"] == "github.event_name == 'push'"
@@ -136,3 +139,38 @@ def test_ci_has_package_job():
 @pytest.mark.parametrize("directory, dist, version, old", PACKAGES)
 def test_no_git_urls(directory, dist, version, old):
     assert not [d for d in _project(directory)["dependencies"] if "git+" in d]
+
+
+def test_testpypi_publish_skips_existing_but_pypi_does_not():
+    steps = {s["name"]: s for s in _workflow(RELEASE)["jobs"]["publish"]["steps"] if "name" in s}
+    assert steps["Publish to TestPyPI"]["with"]["skip-existing"] is True
+    assert "skip-existing" not in steps["Publish to PyPI"].get("with", {})
+
+
+def test_concurrency_group_is_per_package():
+    group = _workflow(RELEASE)["concurrency"]["group"]
+    assert group == "release-${{ github.ref }}-${{ inputs.package || 'tag' }}"
+
+
+def test_build_checks_tag_is_on_default_branch():
+    steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
+    checks = [i for i, s in enumerate(steps) if "merge-base --is-ancestor" in s.get("run", "")]
+    assert len(checks) == 1
+    assert steps[checks[0]]["if"] == "github.event_name == 'push'"
+    assert steps[0]["with"]["fetch-depth"] == 0
+    upload = [i for i, s in enumerate(steps) if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert upload and checks[0] < upload[0]
+
+
+def test_github_release_is_push_only_and_verifies_tag():
+    job = _workflow(RELEASE)["jobs"]["github-release"]
+    assert job["if"] == "github.event_name == 'push'"
+    assert any("--verify-tag" in s.get("run", "") for s in job["steps"])
+
+
+@pytest.mark.parametrize("directory", ["query", "contract"])
+def test_readme_latest_main_and_cross_repo(directory):
+    text = (ROOT / directory / "README.md").read_text()
+    assert "git+https://github.com/MyOpenFund/vault#subdirectory=" + directory in text
+    assert "Working across repos" in text
+    assert "](#" not in text

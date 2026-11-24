@@ -15,5 +15,17 @@ pip install myopenfund-vault-query
 If this environment installed the old distribution (`vault-query`, from a git URL), run
 `pip uninstall -y vault-query` before installing `myopenfund-vault-query`: both own the same import package.
 
+To try the latest `master` before a release (dependencies still come from PyPI):
+
+```bash
+pip install "myopenfund-vault-query @ git+https://github.com/MyOpenFund/vault#subdirectory=query"
+```
+
+### Working across repos
+
+Clone the repos side by side and install this package editable over the PyPI version in the
+consumer's environment: `pip install -e ../vault/query`. A consumer change that needs an
+unreleased version waits for this package's release before the consumer's PR merges.
+
 Full reference: the "Read queries" section of the
 [vault README](https://github.com/MyOpenFund/vault#read-queries-vault-query).

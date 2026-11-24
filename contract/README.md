@@ -24,6 +24,18 @@ pip install myopenfund-vault-contract
 If this environment installed the old distribution (`vault-contract`, from a git URL), run
 `pip uninstall -y vault-contract` before installing `myopenfund-vault-contract`: both own the same import package.
 
+To try the latest `master` before a release (dependencies still come from PyPI):
+
+```bash
+pip install "myopenfund-vault-contract @ git+https://github.com/MyOpenFund/vault#subdirectory=contract"
+```
+
+### Working across repos
+
+Clone the repos side by side and install this package editable over the PyPI version in the
+consumer's environment: `pip install -e ../vault/contract`. A consumer change that needs an
+unreleased version waits for this package's release before the consumer's PR merges.
+
 Before PyPI it was pinned by commit
 (`vault-contract @ git+https://github.com/MyOpenFund/vault@<commit>#subdirectory=contract`).
 
@@ -50,7 +62,7 @@ checked.accepted    # not checked.refusals
 
 `check_row(row, vocabulary, *, expected_corpus, transition=True) -> CheckedRow` runs the
 three lower-level functions, which stay public for callers that need one step only. Every
-`transition` argument defaults to `True` (see [The `transition` parameter](#the-transition-parameter));
+`transition` argument defaults to `True` (see [The `transition` parameter](https://github.com/MyOpenFund/vault/blob/master/contract/README.md#the-transition-parameter));
 the vault ingests with `transition=False`.
 
 - `split_row(row, *, transition=True) -> (columns, extra)`: never refuses, never mutates
