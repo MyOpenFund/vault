@@ -91,8 +91,15 @@ def test_release_workflow_publishes_through_environment():
     assert workflow["permissions"] == {}
     assert workflow["on"]["push"]["tags"] == ["query-v*", "contract-v*"]
     publish = workflow["jobs"]["publish"]
-    assert "pypi" in publish["environment"] and "testpypi" in publish["environment"]
+    assert publish["environment"] == (
+        "${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}"
+    )
     assert publish["permissions"] == {"id-token": "write"}
+    with_id_token = [
+        name for name, job in workflow["jobs"].items() if "id-token" in job.get("permissions", {})
+    ]
+    assert with_id_token == ["publish"]
+    assert publish["needs"] in ("build", ["build"])
 
 
 def test_actions_pinned_by_sha():
@@ -104,7 +111,13 @@ def test_actions_pinned_by_sha():
 
 def test_tag_check_present():
     steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
-    assert any("GITHUB_REF_NAME" in s.get("run", "") and "exit 1" in s["run"] for s in steps)
+    checks = [
+        i for i, s in enumerate(steps) if "GITHUB_REF_NAME" in s.get("run", "") and "exit 1" in s["run"]
+    ]
+    assert len(checks) == 1
+    assert steps[checks[0]]["if"] == "github.event_name == 'push'"
+    upload = [i for i, s in enumerate(steps) if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert upload and checks[0] < upload[0]
 
 
 def test_dependabot_covers_github_actions_only():
