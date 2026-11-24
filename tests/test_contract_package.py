@@ -48,7 +48,7 @@ def test_contract_name_and_version():
 def test_package_version_is_the_contract_version():
     """One number: the package release IS the contract release (spec §3.3)."""
     project = _project()
-    assert project["name"] == "vault-contract"
+    assert project["name"] == "myopenfund-vault-contract"
     assert project["version"] == vault_contract.CONTRACT_VERSION
 
 

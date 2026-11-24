@@ -3,12 +3,27 @@ requires = ["setuptools>=77"]  # PEP 639 `license = "MIT"` (string form) needs s
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vault-query"
-version = "0.6.0"
+name = "myopenfund-vault-query"
+version = "0.1.0"
 description = "Read-only queries over the MyOpenFund vault: documents, corpus stats, run health."
 requires-python = ">=3.12"
+readme = "README.md"
 license = "MIT"
 dependencies = ["psycopg2-binary>=2.9.10,<3"]
+authors = [{ name = "Marc Jeulin" }]
+maintainers = [{ name = "Marc Jeulin" }]
+keywords = ["myopenfund", "vault", "postgres"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+]
+
+[project.urls]
+Homepage = "https://github.com/MyOpenFund/vault"
+Source = "https://github.com/MyOpenFund/vault"
+Issues = "https://github.com/MyOpenFund/vault/issues"
+Organization = "https://github.com/MyOpenFund"
 
 [tool.setuptools.packages.find]
 where = ["src"]

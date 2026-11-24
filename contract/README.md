@@ -1,5 +1,7 @@
 # vault-contract
 
+Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
+
 The MyOpenFund **`documents` contract**, version **1.1.0**: what a corpus writes on each line
 of its manifests, what its vocabulary file declares, and how the vault checks both.
 
@@ -13,11 +15,17 @@ package's tests and the checker over the golden rows on 3.10, job `contract-py31
 
 ## Install
 
-Pin it by commit, from the `contract/` subdirectory of the vault repo:
+Published on PyPI as `myopenfund-vault-contract` (import name `vault_contract`):
 
 ```
-vault-contract @ git+https://github.com/MyOpenFund/vault@<commit>#subdirectory=contract
+pip install myopenfund-vault-contract
 ```
+
+If this environment installed the old distribution (`vault-contract`, from a git URL), run
+`pip uninstall -y vault-contract` before installing `myopenfund-vault-contract`: both own the same import package.
+
+Before PyPI it was pinned by commit
+(`vault-contract @ git+https://github.com/MyOpenFund/vault@<commit>#subdirectory=contract`).
 
 In this repo, `pip install -r requirements-dev.txt` installs it in editable mode. The vault
 ingestion image does not pip-install it: it copies `src/vault_contract` next to `ingest.py`.
