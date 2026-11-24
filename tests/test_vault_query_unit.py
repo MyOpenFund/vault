@@ -267,6 +267,20 @@ def test_since_reaches_sql_unchanged():
     assert all(since in params for params in executed) and len(executed) == 2
 
 
+@pytest.mark.parametrize("fn", [runs_status, recent_runs])
+@pytest.mark.parametrize("until", REFUSED_SINCE + REFUSED_SINCE_OBJECTS, ids=repr)
+def test_health_reads_refuse_an_until_outside_the_grammar_before_sql(fn, until):
+    with pytest.raises(InvalidQuery, match=r"until must be an ISO-8601 timestamp"):
+        fn(_NoConnection(), until=until)
+
+
+@pytest.mark.parametrize("fn", [runs_status, recent_runs])
+@pytest.mark.parametrize("until", ACCEPTED_SINCE + ACCEPTED_SINCE_OBJECTS, ids=repr)
+def test_health_reads_accept_an_until_inside_the_grammar(fn, until):
+    with pytest.raises(AssertionError, match="before any SQL"):
+        fn(_NoConnection(), until=until)
+
+
 def test_postgres_offset_limit_is_a_named_constant():
     """The +-15:59 bound is Postgres's, kept as one named module constant."""
     from vault_query import health
@@ -738,7 +752,7 @@ def test_list_vocabulary_refuses_bad_arguments_before_sql(kwargs, match):
         list_vocabulary(_NoConnection(), **kwargs)
 
 
-def test_package_version_is_0_5_1():
+def test_package_version_is_0_6_0():
     from importlib.metadata import version
 
-    assert version("vault-query") == "0.5.1"
+    assert version("vault-query") == "0.6.0"
