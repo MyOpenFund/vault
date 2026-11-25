@@ -752,7 +752,11 @@ def test_list_vocabulary_refuses_bad_arguments_before_sql(kwargs, match):
         list_vocabulary(_NoConnection(), **kwargs)
 
 
-def test_package_version_is_0_1_0():
+def test_package_version_matches_pyproject():
+    import tomllib
     from importlib.metadata import version
+    from pathlib import Path
 
-    assert version("myopenfund-vault-query") == "0.1.0"
+    pyproject = Path(__file__).resolve().parent.parent / "query" / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text())["project"]["version"]
+    assert version("myopenfund-vault-query") == declared

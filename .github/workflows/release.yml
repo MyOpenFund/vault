@@ -35,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     outputs:
       tag: ${{ steps.tag.outputs.tag || github.ref_name }}
       sha: ${{ github.sha }}
@@ -48,6 +49,23 @@ jobs:
             echo "run this workflow on master (got $REF): pick the master branch in Run workflow"
             exit 1
           fi
+      - name: Check the approval gate
+        # Fail closed: nothing is built unless the target environment needs a human
+        # approval. A repo without that protection would publish with no reviewer.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENV_NAME: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
+        run: |
+          if ! environment="$(gh api "repos/$GITHUB_REPOSITORY/environments/$ENV_NAME" 2>&1)"; then
+            echo "cannot read the '$ENV_NAME' environment, so the approval gate cannot be checked: $environment"
+            exit 1
+          fi
+          reviewers="$(printf '%s' "$environment" | jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length')"
+          if [ "${reviewers:-0}" -lt 1 ]; then
+            echo "the '$ENV_NAME' environment has no required reviewer: add one in Settings, Environments before releasing"
+            exit 1
+          fi
+          echo "the '$ENV_NAME' environment requires $reviewers reviewer(s)"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
