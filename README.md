@@ -671,9 +671,10 @@ unreleased version waits for this package's release before the consumer's PR mer
 
 **How to release**
 
-Bump `__version__` and `version` in a PR; after it merges, on GitHub go to Releases, Draft a new release, create the new tag `query-v<version>` or `contract-v<version>` on the default branch, Publish, then approve the `pypi` deployment in Actions.
-The workflow checks that the tag equals the package version and that it is on the default branch.
-If `build` rejects the tag (version mismatch, not on the default branch), delete the Release and the tag in the web UI, fix, and release again.
+Bump `__version__` and `version` in a PR. After it merges, go to Actions, then release, then Run workflow: pick the `master` branch, target `pypi`, and the package (`query` or `contract`). Approve the `pypi` deployment. The workflow builds the package, checks it, publishes it, then creates the tag `query-v<version>` or `contract-v<version>` and the GitHub Release itself.
+It fails before publishing if it is not run on the default branch or if that tag already exists. Target `testpypi` is a rehearsal: it publishes to TestPyPI and creates no tag and no release.
+Pushing a tag `query-v<version>` or `contract-v<version>` by hand still works: the workflow checks that the tag equals the package version and is on the default branch, then publishes and attaches the files to the Release.
+If PyPI got the package but the tag or the Release is missing, re-run the failed `github-release` job from Actions; do not push the tag by hand (the re-run would fail at the PyPI upload).
 
 - Vocabulary: `list_vocabulary(conn, corpus=None, *, kind=None, limit=1000)` — the codes each
   corpus declares (`vocabulary` table: corpus, kind, code, label, family).

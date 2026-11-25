@@ -92,7 +92,8 @@ def test_release_workflow_publishes_through_environment():
     assert workflow["on"]["push"]["tags"] == ["query-v*", "contract-v*"]
     publish = workflow["jobs"]["publish"]
     assert publish["environment"] == (
-        "${{ github.event_name == 'workflow_dispatch' && 'testpypi' || 'pypi' }}"
+        "${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
+        " && 'testpypi' || 'pypi' }}"
     )
     assert publish["permissions"] == {"id-token": "write"}
     with_id_token = [
@@ -157,19 +158,108 @@ def test_build_checks_tag_is_on_default_branch():
     checks = [i for i, s in enumerate(steps) if "merge-base --is-ancestor" in s.get("run", "")]
     assert len(checks) == 1
     assert steps[checks[0]]["if"] == "github.event_name == 'push'"
-    assert steps[0]["with"]["fetch-depth"] == 0
+    checkout = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+    assert checkout[0]["with"]["fetch-depth"] == 0
     upload = [i for i, s in enumerate(steps) if s.get("uses", "").startswith("actions/upload-artifact@")]
     assert upload and checks[0] < upload[0]
 
 
-def test_github_release_is_push_only_and_verifies_tag():
+def test_dispatch_inputs():
+    inputs = _workflow(RELEASE)["on"]["workflow_dispatch"]["inputs"]
+    assert inputs["target"]["type"] == "choice"
+    assert inputs["target"]["options"] == ["pypi", "testpypi"]
+    assert inputs["target"]["default"] == "pypi"
+    assert inputs["target"]["required"] is True
+    assert inputs["package"]["options"] == ["query", "contract"]
+
+
+def test_build_dispatch_runs_on_default_branch_only():
+    steps = _workflow(RELEASE)["jobs"]["build"]["steps"]
+    guard = [s for s in steps if "refs/heads/master" in s.get("run", "")]
+    assert len(guard) == 1
+    assert guard[0]["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "exit 1" in guard[0]["run"]
+    assert steps.index(guard[0]) == 0
+
+
+def test_build_computes_tag_and_refuses_an_existing_pypi_tag():
+    job = _workflow(RELEASE)["jobs"]["build"]
+    step = [s for s in job["steps"] if s.get("id") == "tag"]
+    assert len(step) == 1
+    run = step[0]["run"]
+    assert step[0]["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "importlib.metadata" in run
+    assert '"$PKG_DIR-v$version"' in run
+    assert 'git ls-remote --tags origin "refs/tags/$tag"' in run
+    assert '"$INPUT_TARGET" = "pypi"' in run
+    assert "already exists" in run and "exit 1" in run
+    upload = [i for i, s in enumerate(job["steps"]) if s.get("uses", "").startswith("actions/upload-artifact@")]
+    assert job["steps"].index(step[0]) < upload[0]
+    assert job["outputs"]["tag"] == "${{ steps.tag.outputs.tag || github.ref_name }}"
+    assert job["outputs"]["sha"] == "${{ github.sha }}"
+
+
+def _release_job():
     job = _workflow(RELEASE)["jobs"]["github-release"]
-    assert job["if"] == "github.event_name == 'push'"
-    runs = " ".join(s.get("run", "") for s in job["steps"])
-    assert "--verify-tag" in runs
-    assert "gh release view" in runs
-    assert "gh release upload" in runs
-    assert "--clobber" in runs
+    assert job["if"] == (
+        "github.event_name == 'push' || "
+        "(github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
+    )
+    assert job["permissions"] == {"contents": "write"}
+    assert set(job["needs"]) == {"build", "publish"}
+    return job
+
+
+def _assert_tag_created_and_pushed(run):
+    # no personal address in a public workflow: the tagger email is the actor's noreply one
+    assert 'user.name="Marc Jeulin"' in run
+    assert 'user.email="${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"' in run
+    assert 'tag -a "$TAG"' in run and '"$SHA"' in run
+    assert 'git push origin "refs/tags/$TAG"' in run
+
+
+def test_github_release_creates_and_pushes_the_tag_on_dispatch_not_testpypi():
+    job = _release_job()
+    checkout = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkout) == 1
+    assert checkout[0]["if"] == "github.event_name == 'workflow_dispatch'"
+    assert checkout[0]["with"]["persist-credentials"] is True
+    assert checkout[0]["with"]["ref"] == "${{ needs.build.outputs.sha }}"
+    tag = [s for s in job["steps"] if "git push" in s.get("run", "")]
+    assert len(tag) == 1
+    assert tag[0]["if"] == "github.event_name == 'workflow_dispatch'"
+    _assert_tag_created_and_pushed(tag[0]["run"])
+
+
+def test_dispatch_tag_step_is_idempotent():
+    run = next(s for s in _release_job()["steps"] if "git push" in s.get("run", ""))["run"]
+    lookup = run.index('git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}"')
+    assert lookup < run.index("git push")
+    assert '"$remote_sha" = "$SHA"' in run  # already there at the built commit: skip
+    assert "already exists" in run and "exit 1" in run  # there, but elsewhere: fail
+    assert '[ -z "$remote_sha" ]' in run  # absent: create
+
+
+def test_github_release_is_created_or_completed_on_both_paths():
+    job = _release_job()
+    release = [s for s in job["steps"] if "gh release create" in s.get("run", "")]
+    assert len(release) == 1
+    assert "if" not in release[0]
+    run = release[0]["run"]
+    assert 'gh release view "$TAG"' in run
+    assert 'gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber' in run
+    assert '--target "$SHA"' in run and '--title "$TAG"' in run
+    assert "--verify-tag" in run
+    assert "--generate-notes" in run
+
+
+
+
+def test_testpypi_only_for_testpypi_target():
+    steps = {s["name"]: s for s in _workflow(RELEASE)["jobs"]["publish"]["steps"] if "name" in s}
+    assert "inputs.target == 'testpypi'" in steps["Publish to TestPyPI"]["if"]
+    assert "inputs.target == 'testpypi'" in steps["Publish to PyPI"]["if"]
+    assert steps["Publish to PyPI"]["if"].startswith("${{ !(")
 
 
 @pytest.mark.parametrize("directory", ["query", "contract"])
