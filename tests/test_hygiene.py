@@ -98,29 +98,47 @@ def test_bad_range_fails_closed(repo):
     assert "checked" not in result.stdout
 
 
+MARC = "Co-authored-by: Marc Jeulin <jeulinmarc@gmail.com>"
+
+
 @needs_tools
 @pytest.mark.parametrize(
-    "trailer",
+    "trailers",
     [
-        "Co-authored-by: Marc Jeulin <whatever@example.com>",
-        "Co-authored-by: M <jeulinmarc@gmail.com>",
-        "Co-authored-by: M <12345+jeulinmarc@users.noreply.github.com>",
+        [MARC],
+        ["Co-authored-by: Marc Jeulin <12345+jeulinmarc@users.noreply.github.com>"],
+        ["co-authored-by:  Marc Jeulin  <jeulinmarc@users.noreply.github.com>  "],
+        [MARC, "Co-authored-by: Marc Jeulin <12345+jeulinmarc@users.noreply.github.com>"],
     ],
 )
-def test_marc_as_coauthor_passes(repo, trailer):
-    sha = _commit(repo, f"squash\n\n{trailer}")
+def test_marc_as_sole_coauthor_passes(repo, trailers):
+    sha = _commit(repo, "squash\n\n" + "\n".join(trailers))
     result = _check(repo, f"{sha}^!")
     assert result.returncode == 0, result.stdout
 
 
 @needs_tools
 @pytest.mark.parametrize(
-    "trailer",
-    ["Co-authored-by: Claude <noreply@anthropic.com>", "Co-authored-by: Someone Else <else@example.com>"],
+    "trailers",
+    [
+        ["Co-authored-by: Claude <noreply@anthropic.com>"],
+        ["Co-authored-by: Someone Else <else@example.com>"],
+        [MARC, "Co-authored-by: Someone Else <else@example.com>"],
+        ["Co-authored-by: Someone Else <else@example.com>", MARC],
+        ["Co-authored-by: Claude <jeulinmarc@gmail.com>"],
+        ["Co-authored-by: Claude <c@x.io>, Marc Jeulin <jeulinmarc@gmail.com>"],
+        ["Co-authored-by: Bob <notjeulinmarc@users.noreply.github.com>"],
+        ["Co-authored-by: Marc Jeulin <whatever@example.com>"],
+        ["Co-authored-by: M <jeulinmarc@gmail.com>"],
+        ["Co-authored-by: Marc Jeulin <jeulinmarc@gmail.com> generated with a tool"],
+    ],
 )
-def test_other_coauthor_fails(repo, trailer):
-    sha = _commit(repo, f"squash\n\n{trailer}")
-    assert _check(repo, f"{sha}^!").returncode == 1
+def test_other_coauthor_fails(repo, trailers):
+    sha = _commit(repo, "squash\n\n" + "\n".join(trailers))
+    result = _check(repo, f"{sha}^!")
+    assert result.returncode == 1, result.stdout
+    assert sha[:7] in result.stdout
+    assert "o-authored-by" in result.stdout
 
 
 @needs_tools
