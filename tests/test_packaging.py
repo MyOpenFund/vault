@@ -165,7 +165,11 @@ def test_build_checks_tag_is_on_default_branch():
 def test_github_release_is_push_only_and_verifies_tag():
     job = _workflow(RELEASE)["jobs"]["github-release"]
     assert job["if"] == "github.event_name == 'push'"
-    assert any("--verify-tag" in s.get("run", "") for s in job["steps"])
+    runs = " ".join(s.get("run", "") for s in job["steps"])
+    assert "--verify-tag" in runs
+    assert "gh release view" in runs
+    assert "gh release upload" in runs
+    assert "--clobber" in runs
 
 
 @pytest.mark.parametrize("directory", ["query", "contract"])

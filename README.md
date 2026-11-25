@@ -669,6 +669,11 @@ Clone the repos side by side and install this package editable over the PyPI ver
 consumer's environment: `pip install -e ../vault/query`. A consumer change that needs an
 unreleased version waits for this package's release before the consumer's PR merges.
 
+**How to release**
+
+Bump ``__version__`/`version`` in a PR; after it merges, on GitHub go to Releases, Draft a new release, create the new tag `v<version>` (`query-v<version>` / `contract-v<version>`) on the default branch, Publish, then approve the `pypi` deployment in Actions.
+The workflow checks that the tag equals the package version and that it is on the default branch.
+
 - Vocabulary: `list_vocabulary(conn, corpus=None, *, kind=None, limit=1000)` — the codes each
   corpus declares (`vocabulary` table: corpus, kind, code, label, family).
 - Documents: `search_documents` (filters, sort, paging, total; optional column projection —
