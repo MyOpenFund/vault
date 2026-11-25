@@ -1,5 +1,7 @@
 # vault
 
+Created and maintained by [Marc Jeulin](https://github.com/jeulinmarc), part of [MyOpenFund](https://github.com/MyOpenFund).
+
 Central metadata database for [MyOpenFund](https://github.com/MyOpenFund) corpora —
 a PostgreSQL vault that indexes what each corpus holds, without touching or
 duplicating the documents themselves.
@@ -645,14 +647,27 @@ the same checkout, which is why `api`'s build context is the repo root (`api/Doc
 ## Read queries (`vault-query`)
 
 [`query/`](query/) is a small Python package holding the vault's read queries once, shared by
-the API and the MyOpenFund MCP server. Install it pinned to a commit of this repo:
+the API and the MyOpenFund MCP server. It is published on PyPI as `myopenfund-vault-query`
+(import name `vault_query`):
 
 ```bash
-pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdirectory=query"
+pip install myopenfund-vault-query
 ```
 
-`<sha>` is the commit to pin (a merge commit on `master`); pin a SHA rather than a branch so a
-consumer's queries only change when it bumps the pin.
+If this environment installed the old distribution (`vault-query`, from a git URL), run
+`pip uninstall -y vault-query` before installing `myopenfund-vault-query`: both own the same import package.
+
+To try the latest `master` before a release (dependencies still come from PyPI):
+
+```bash
+pip install "myopenfund-vault-query @ git+https://github.com/MyOpenFund/vault#subdirectory=query"
+```
+
+**Working across repos**
+
+Clone the repos side by side and install this package editable over the PyPI version in the
+consumer's environment: `pip install -e ../vault/query`. A consumer change that needs an
+unreleased version waits for this package's release before the consumer's PR merges.
 
 - Vocabulary: `list_vocabulary(conn, corpus=None, *, kind=None, limit=1000)` — the codes each
   corpus declares (`vocabulary` table: corpus, kind, code, label, family).
@@ -669,6 +684,13 @@ Guarantees: read-only — no function writes or commits the caller's transaction
 takes an open psycopg2 connection that the caller owns (opens, closes, and chooses the role —
 `vault_readonly`). Use an autocommit connection (or roll back after each call): a read left
 "idle in transaction" holds locks that block the ingester's DDL train.
+
+### Before PyPI (git versions)
+
+Until the first PyPI release the package was installed pinned to a commit of this repo
+(`pip install "vault-query @ git+https://github.com/MyOpenFund/vault@<sha>#subdirectory=query"`),
+as `vault-query`, up to 0.6.0. The PyPI line restarts at 0.1.0 under the new name; these notes
+describe the git versions.
 
 Changes in 0.6.0: `runs_status` and `recent_runs` take `until`, the inclusive upper bound of
 `finished_at` (same grammar as `since`, a bare date is its midnight; runs in flight are excluded when it is given), so an old
